@@ -3,7 +3,9 @@ import {
   formatHandicap,
   formatTotal,
   hkToDecimal,
+  handicapRoadKey,
   isQuarterStep,
+  isSameHandicapRoad,
   lineKeyOf,
   parsePinnacleHandicap,
   parsePinnacleTotal,
@@ -65,6 +67,19 @@ describe("line normalization", () => {
     expect(formatTotal(2.5)).toBe("2.5");
     expect(formatTotal(2.75)).toBe("2.5/3");
     expect(formatTotal(3)).toBe("3");
+  });
+
+  it("treats Pinnacle decimal quarter lines as the same HKJC split-ball road", () => {
+    // Pinnacle -0.25 = 馬會主隊讓平半 (0/-0.5)
+    expect(isSameHandicapRoad(-0.25, parseHkjcHandicap("0.0/-0.5")!)).toBe(true);
+    // Pinnacle -0.75 = 馬會主隊讓半一 (-0.5/-1.0)
+    expect(isSameHandicapRoad(-0.75, parseHkjcHandicap("-0.5/-1.0")!)).toBe(true);
+    // The same rule continues for deeper quarter lines.
+    expect(isSameHandicapRoad(-1.25, parseHkjcHandicap("-1.0/-1.5")!)).toBe(true);
+    expect(isSameHandicapRoad(0.25, parseHkjcHandicap("0.0/+0.5")!)).toBe(true);
+    expect(isSameHandicapRoad(0.75, parseHkjcHandicap("+0.5/+1.0")!)).toBe(true);
+    expect(handicapRoadKey(-0.75)).toBe(-3);
+    expect(isSameHandicapRoad(-0.25, 0.25)).toBe(false);
   });
 
   it("splits quarter lines and converts HK odds", () => {

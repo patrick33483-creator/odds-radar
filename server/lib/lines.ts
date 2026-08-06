@@ -93,6 +93,23 @@ export function lineKeyOf(market: "1X2" | "AH" | "OU", value: number | null): st
   return value.toFixed(2);
 }
 
+/**
+ * Canonical Asian-handicap road key in quarter-goal units, always from the
+ * HOME-team perspective. This makes display-equivalent forms compare equal:
+ * Pinnacle -0.25 = HKJC 讓平半 (0/-0.5), -0.75 = 讓半一 (-0.5/-1), etc.
+ */
+export function handicapRoadKey(homeHandicap: number): number | null {
+  if (!isQuarterStep(homeHandicap)) return null;
+  return Math.round(homeHandicap * 4);
+}
+
+/** Compare two already-normalized Asian lines by betting road, not text form. */
+export function isSameHandicapRoad(a: number, b: number): boolean {
+  const ak = handicapRoadKey(a);
+  const bk = handicapRoadKey(b);
+  return ak !== null && bk !== null && ak === bk;
+}
+
 function fmt(n: number): string {
   const s = n.toFixed(2).replace(/\.?0+$/, "");
   return s === "-0" ? "0" : s;

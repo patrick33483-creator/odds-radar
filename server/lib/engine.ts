@@ -26,7 +26,7 @@
 import { PinnacleProvider } from "../providers/pinnacle";
 import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
-import { formatLine, lineKeyOf } from "./lines";
+import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { findThreeWayArb, findTwoWayArb, PINNACLE_FIXED_STAKE } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, STALE_MS } from "./ev";
@@ -606,8 +606,16 @@ export class RadarEngine {
       const prices = byMatch.get(m.id) ?? [];
       const matchLabel = `${m.homeTeam} vs ${m.awayTeam}`;
       const cell = (provider: string, market: Market, lineKey: string, selection: Selection): PriceCell | undefined => {
+        const requestedLine = Number(lineKey);
         const r = prices.find(
-          (p) => p.provider === provider && p.market === market && p.lineKey === lineKey && p.selection === selection,
+          (p) =>
+            p.provider === provider &&
+            p.market === market &&
+            p.selection === selection &&
+            (market === "AH"
+              ? Number.isFinite(requestedLine) &&
+                isSameHandicapRoad(Number(p.lineKey), requestedLine)
+              : p.lineKey === lineKey),
         );
         if (!r) return undefined;
         return {
