@@ -36,6 +36,25 @@ const DROP_WORDS = [
   "u19",
 ];
 
+/**
+ * Reviewed competition aliases. These only improve the league component after
+ * the hard kickoff window and both-team name floor have already passed.
+ */
+const LEAGUE_ALIAS_GROUPS: ReadonlyArray<ReadonlyArray<string>> = [
+  ["女子南韓職業聯賽", "韩女联"],
+  ["東南亞錦標賽", "东南锦"],
+  ["芬蘭超級聯賽", "芬超"],
+  ["挪威超級聯賽", "挪超"],
+  ["荷蘭乙組聯賽", "荷乙"],
+  ["比利時甲組聯賽", "比甲"],
+  ["北美聯賽盃", "中北美杯"],
+  ["澳洲全國聯賽 - 昆士蘭", "澳昆超"],
+  ["澳洲全國聯賽 - 新南威爾斯", "澳威超"],
+  ["日本職業聯賽", "日职联"],
+  ["日本乙組聯賽", "日职乙"],
+  ["荷蘭甲組聯賽", "荷甲"],
+];
+
 /** Provider-agnostic canonical key for a team or league name. */
 export function normalizeName(raw: string): string {
   if (!raw) return "";
@@ -44,6 +63,21 @@ export function normalizeName(raw: string): string {
   s = s.replace(NOISE, "");
   for (const w of DROP_WORDS) s = s.split(w).join("");
   return s;
+}
+
+const LEAGUE_CANONICAL = new Map<string, string>();
+for (const [canonical, ...aliases] of LEAGUE_ALIAS_GROUPS) {
+  const key = normalizeName(canonical);
+  LEAGUE_CANONICAL.set(key, key);
+  for (const alias of aliases) LEAGUE_CANONICAL.set(normalizeName(alias), key);
+}
+
+export function leagueSimilarity(a: string, b: string): number {
+  const x = normalizeName(a);
+  const y = normalizeName(b);
+  const cx = LEAGUE_CANONICAL.get(x);
+  const cy = LEAGUE_CANONICAL.get(y);
+  return cx && cy && cx === cy ? 1 : similarity(a, b);
 }
 
 function bigrams(s: string): string[] {
@@ -120,7 +154,7 @@ export function scoreCandidate(
   const home = homeAliasHit ? 1 : similarity(target.homeTeam, cand.homeTeam);
   const away = awayAliasHit ? 1 : similarity(target.awayTeam, cand.awayTeam);
   const nameScore = (home + away) / 2;
-  const leagueScore = similarity(target.league, cand.league);
+  const leagueScore = leagueSimilarity(target.league, cand.league);
 
   const score = 0.25 * timeScore + 0.6 * nameScore + 0.15 * leagueScore;
   return { score, nameScore, leagueScore, timeScore };

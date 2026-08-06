@@ -16,7 +16,7 @@ import {
 import { findThreeWayArb, findTwoWayArb, planStakes, totalProbability } from "../server/lib/arb";
 import { evaluateEv, margin, noVigProbs } from "../server/lib/ev";
 import { buildSynthetic, syntheticCoversPinnacle } from "../server/lib/synthetic";
-import { matchEvent, normalizeName, similarity } from "../server/lib/matching";
+import { leagueSimilarity, matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
 import { teamAliasSeedRows, TEAM_ALIAS_SEED_PAIRS } from "../server/lib/team-alias-seeds";
 import { legReturn, settle1X2, settleHandicap, settleTotal } from "../server/lib/settlement";
@@ -301,6 +301,24 @@ describe("event matching", () => {
   it("normalizes traditional and simplified names to the same key", () => {
     expect(normalizeName("格拉斯哥流浪")).toBe(normalizeName("格拉斯哥流浪"));
     expect(similarity("曼徹斯特聯", "曼彻斯特联")).toBeGreaterThan(0.8);
+  });
+
+  it("recognizes reviewed HKJC and Pinnacle competition aliases", () => {
+    expect(leagueSimilarity("荷蘭乙組聯賽", "荷乙")).toBe(1);
+    expect(leagueSimilarity("日本職業聯賽", "日职联")).toBe(1);
+    expect(leagueSimilarity("澳洲全國聯賽 - 昆士蘭", "澳昆超")).toBe(1);
+    expect(leagueSimilarity("北美聯賽盃", "中北美杯")).toBe(1);
+    expect(leagueSimilarity("荷蘭乙組聯賽", "德乙")).toBeLessThan(1);
+  });
+
+  it("accepts a unique same-time event when reviewed league aliases lift confidence", () => {
+    const d = matchEvent(
+      { id: "hkjc:oss", league: "荷蘭乙組聯賽", homeTeam: "奧斯", awayTeam: "NAC", kickoffUtc: ko },
+      [{ id: "2996406", league: "荷乙", homeTeam: "奥斯", awayTeam: "NAC", kickoffUtc: ko }],
+    );
+    expect(d.pinnacleMatchId).toBe("2996406");
+    expect(d.unmatchedReason).toBeNull();
+    expect(d.confidence).toBeGreaterThanOrEqual(0.7);
   });
 
   it("matches on kickoff + league + aliases", () => {

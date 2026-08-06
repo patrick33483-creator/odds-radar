@@ -8,6 +8,8 @@ import { PinnacleProvider } from "../server/providers/pinnacle";
 
 const provider = new PinnacleProvider();
 const fixtures = await provider.fetchFixtures([0, 1, 2]);
+const targetReason =
+  process.env.MATCH_GAP_REASON ?? "team_name_similarity_below_floor";
 const candidates: CandidateEvent[] = fixtures.map((f) => ({
   id: f.providerMatchId,
   league: f.league,
@@ -23,7 +25,7 @@ const gaps = db
   .select()
   .from(matches)
   .all()
-  .filter((m) => reasons.get(m.id) === "team_name_similarity_below_floor");
+  .filter((m) => reasons.get(m.id) === targetReason);
 
 const rows = gaps.map((m) => {
   const target = {
