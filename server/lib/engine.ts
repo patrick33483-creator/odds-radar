@@ -1,26 +1,38 @@
 /**
  * Refresh orchestration, opportunity detection and simulation placement.
  *
- * Freshness policy
- *   frontend poll                 20 s   (client)
- *   backend refresh throttle      30 s
- *   titan007 fixture-list cache   10 min
- *   Crown detail cache            <=1h -> 60 s | 1-3h -> 180 s | >3h -> 600 s
+ * SCAN POLICY (latest correction)
+ *   - The only automated scanning path is the dense pre-kickoff window scan in
+ *     lib/scan.ts: events with 0 < minutes_to_kickoff <= 30 only.
+ *   - Recurring / automated refreshes are LIGHTWEIGHT: HKJC's single pre-match
+ *     GraphQL call plus the cached titan007 fixture list and event mapping.
+ *     They never issue per-match Pinnacle odds-detail requests.
+ *   - A full all-match detail scan exists only as an explicit human action
+ *     (POST /api/refresh?scope=full) and is never used by any recurring path.
+ *   - NO SCHEDULE / CRON IS CREATED. Frequency is intentionally undecided.
  *
- * Cold start is two-stage: a quick <=3h scan publishes partial data immediately,
- * then a full refresh runs in the background. Last-good data is always retained;
- * a provider failure never clears the previous snapshot and never invents prices.
+ * Freshness policy
+ *   frontend poll                    20 s   (client, read-only)
+ *   backend lightweight throttle     30 s
+ *   titan007 fixture-list cache      10 min
+ *   Pinnacle detail cache            <=1h -> 60 s | 1-3h -> 180 s | >3h -> 600 s
+ *                                    (bypassed inside the dense window)
+ *
+ * Last-good data is always retained; a provider failure never clears the
+ * previous snapshot, never invents prices, and never substitutes another
+ * bookmaker for Pinnacle.
  */
 
-import { CrownProvider } from "../providers/crown";
+import { PinnacleProvider } from "../providers/pinnacle";
 import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
 import { formatLine, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
-import { findThreeWayArb, findTwoWayArb, CROWN_FIXED_STAKE } from "./arb";
+import { findThreeWayArb, findTwoWayArb, PINNACLE_FIXED_STAKE } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, STALE_MS } from "./ev";
-import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
+import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversPinnacle, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
+import { runWindowScan, scanConfig, selectWindowEvents, type ScanCandidate, type ScanConfig } from "./scan";
 import { aggregateBetStatus, isSettleEligible, legReturn, round2, settleLeg, type LegStatus } from "./settlement";
 import {
   countSnapshots,
@@ -45,6 +57,7 @@ import {
 import { DEMO_FIXTURE } from "./demo-data";
 import type {
   ArbOpportunity,
+  ScanOutcome,
   DashboardResponse,
   EvOpportunity,
   LineRow,
@@ -59,9 +72,12 @@ import type {
 
 export const REFRESH_THROTTLE_MS = 30_000;
 export const FIXTURE_CACHE_MS = 10 * 60_000;
-export const QUICK_WINDOW_MIN = 180;
-/** Any dense helper loop must stay under this budget. */
+/** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
+
+/** lightweight = fixtures + HKJC prices only; window = dense pre-kickoff scan;
+ *  full = explicit manual all-match detail scan (never automated). */
+export type RefreshMode = "lightweight" | "window" | "full";
 
 const DEMO = process.env.RADAR_DEMO === "1";
 
@@ -70,13 +86,13 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify(payload));
 }
 
-function crownCacheTtl(minutesToKickoff: number): number {
+function pinnacleCacheTtl(minutesToKickoff: number): number {
   if (minutesToKickoff <= 60) return 60_000;
   if (minutesToKickoff <= 180) return 180_000;
   return 600_000;
 }
 
-interface CrownDetailCacheEntry {
+interface PinnacleDetailCacheEntry {
   at: number;
   prices: ProviderPrice[];
 }
@@ -91,7 +107,7 @@ interface HealthPatch {
 
 export class RadarEngine {
   private readonly hkjc = new HkjcProvider();
-  private readonly crown = new CrownProvider();
+  private readonly pinnacle = new PinnacleProvider();
 
   private refreshing = false;
   private inflight: Promise<void> | null = null;
@@ -100,13 +116,24 @@ export class RadarEngine {
   private coldStartStage: StatusResponse["coldStartStage"] = "idle";
   private degradedReason: string | null = null;
 
-  private fixtureCache: { at: number; rows: Awaited<ReturnType<CrownProvider["fetchFixtures"]>> } | null = null;
-  private crownDetail = new Map<string, CrownDetailCacheEntry>();
+  private fixtureCache: { at: number; rows: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>> } | null = null;
+  private pinnacleDetail = new Map<string, PinnacleDetailCacheEntry>();
+  private pinnacleRowsSeen = 0;
+  private lastScan: ScanOutcome | null = null;
+  private scanning = false;
 
   constructor() {
     const stored = getState("lastGoodAt");
     if (stored) this.lastGoodAt = Number(stored);
     if (this.lastGoodAt) this.coldStartStage = "done";
+    const scan = getState("lastScan");
+    if (scan) {
+      try {
+        this.lastScan = JSON.parse(scan) as ScanOutcome;
+      } catch {
+        this.lastScan = null;
+      }
+    }
   }
 
   /* ------------------------------- refresh ------------------------------- */
@@ -122,44 +149,38 @@ export class RadarEngine {
   /**
    * Single-flight refresh. Concurrent callers await the in-flight run instead of
    * starting a second upstream storm. Returns immediately when throttled.
+   *
+   * `mode` defaults to "lightweight": no per-match Pinnacle detail calls, so the
+   * dashboard's automated polling can never trigger an all-match detail scan.
    */
-  async refresh(opts: { force?: boolean; windowMinutes?: number } = {}): Promise<{ started: boolean; throttled: boolean }> {
+  async refresh(
+    opts: { force?: boolean; mode?: RefreshMode } = {},
+  ): Promise<{ started: boolean; throttled: boolean; mode: RefreshMode }> {
+    const mode = opts.mode ?? "lightweight";
     if (this.inflight) {
       await this.inflight;
-      return { started: false, throttled: false };
+      return { started: false, throttled: false, mode };
     }
     const now = Date.now();
     if (!opts.force && this.lastRefreshAt && now - this.lastRefreshAt < REFRESH_THROTTLE_MS) {
-      return { started: false, throttled: true };
+      return { started: false, throttled: true, mode };
     }
     const cold = this.isColdStart();
-    const windowMinutes = opts.windowMinutes ?? (cold ? QUICK_WINDOW_MIN : undefined);
     this.refreshing = true;
-    this.coldStartStage = cold ? "quick" : this.coldStartStage;
-    this.inflight = this.runRefresh(windowMinutes)
-      .catch((err) => log("refresh_failed", { error: (err as Error).message }))
+    if (cold) this.coldStartStage = "quick";
+    this.inflight = this.runRefresh(mode)
+      .catch((err) => log("refresh_failed", { error: (err as Error).message, mode }))
       .finally(() => {
         this.refreshing = false;
         this.inflight = null;
         this.lastRefreshAt = Date.now();
+        this.coldStartStage = "done";
       });
     await this.inflight;
-
-    if (cold && windowMinutes) {
-      // Stage two: fill in the remaining fixtures in the background.
-      this.coldStartStage = "full";
-      void (async () => {
-        try {
-          await this.refresh({ force: true, windowMinutes: undefined });
-        } finally {
-          this.coldStartStage = "done";
-        }
-      })();
-    }
-    return { started: true, throttled: false };
+    return { started: true, throttled: false, mode };
   }
 
-  private setHealth(provider: "hkjc" | "crown", patch: HealthPatch): void {
+  private setHealth(provider: "hkjc" | "pinnacle", patch: HealthPatch): void {
     const now = Date.now();
     const prev = db.select().from(providerHealth).where(eq(providerHealth.provider, provider)).get();
     const failures = patch.ok ? 0 : (prev?.consecutiveFailures ?? 0) + 1;
@@ -193,24 +214,22 @@ export class RadarEngine {
     return { get: (provider, alias) => map.get(`${provider}:${alias}`) };
   }
 
-  private async runRefresh(windowMinutes?: number): Promise<void> {
-    const deadline = Date.now() + MAX_LOOP_MS;
-    const now = Date.now();
-    let hkjcOk = false;
+  /* --------------------------- refresh stages --------------------------- */
 
-    /* ---- 1. HKJC ---- */
+  /** HKJC pre-match snapshot. ONE upstream GraphQL call for every match. */
+  private async refreshHkjc(): Promise<boolean> {
+    const now = Date.now();
     try {
       const res = DEMO
         ? { events: DEMO_FIXTURE.hkjc, latencyMs: 1, partial: false, warnings: ["DEMO"] }
-        : await this.hkjc.fetchPreMatch({ windowMinutes });
-      hkjcOk = true;
+        : await this.hkjc.fetchPreMatch({});
       this.setHealth("hkjc", { ok: true, latencyMs: res.latencyMs, itemCount: res.events.length, mode: DEMO ? "demo" : "live" });
       const tx = rawDb.transaction(() => {
         for (const ev of res.events) {
           const id = `hkjc:${ev.providerMatchId}`;
           rawDb
             .prepare(
-              `INSERT INTO matches(id,hkjc_id,crown_match_id,league,league_en,home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at)
+              `INSERT INTO matches(id,hkjc_id,pinnacle_match_id,league,league_en,home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at)
                VALUES(?,?,NULL,?,?,?,?,?,?,?,?,0,?)
                ON CONFLICT(id) DO UPDATE SET league=excluded.league, league_en=excluded.league_en,
                  home_team=excluded.home_team, away_team=excluded.away_team, kickoff_utc=excluded.kickoff_utc,
@@ -233,115 +252,164 @@ export class RadarEngine {
         }
       });
       tx();
-      log("hkjc_refresh", { matches: res.events.length, latencyMs: res.latencyMs, windowMinutes: windowMinutes ?? null });
+      log("hkjc_refresh", { matches: res.events.length, latencyMs: res.latencyMs });
+      return true;
     } catch (err) {
       const message = (err as Error).message;
       this.setHealth("hkjc", { ok: false, error: message });
       log("hkjc_error", { error: message });
+      return false;
     }
+  }
 
-    /* ---- 2. Crown fixtures + mapping ---- */
-    let crownOk = false;
-    try {
-      if (!this.fixtureCache || Date.now() - this.fixtureCache.at > FIXTURE_CACHE_MS) {
-        const rows = DEMO ? DEMO_FIXTURE.crownFixtures : await this.crown.fetchFixtures([0, 1]);
-        this.fixtureCache = { at: Date.now(), rows };
-      }
-      const fixtures = this.fixtureCache.rows;
-      crownOk = fixtures.length > 0;
-      const aliases = this.aliasIndex();
-      const candidates: CandidateEvent[] = fixtures.map((f) => ({
-        id: f.providerMatchId,
-        league: f.league,
-        homeTeam: f.homeTeam,
-        awayTeam: f.awayTeam,
-        kickoffUtc: f.kickoffUtc,
-      }));
+  /**
+   * Pinnacle FIXTURE list + HKJC<->Pinnacle event mapping. Lightweight: at most a
+   * couple of cached schedule-page requests, never per-match odds detail.
+   */
+  private async refreshPinnacleFixtures(): Promise<number> {
+    const now = Date.now();
+    if (!this.fixtureCache || Date.now() - this.fixtureCache.at > FIXTURE_CACHE_MS) {
+      const rows = DEMO ? DEMO_FIXTURE.pinnacleFixtures : await this.pinnacle.fetchFixtures([0, 1]);
+      this.fixtureCache = { at: Date.now(), rows };
+    }
+    const fixtures = this.fixtureCache.rows;
+    const aliases = this.aliasIndex();
+    const candidates: CandidateEvent[] = fixtures.map((f) => ({
+      id: f.providerMatchId,
+      league: f.league,
+      homeTeam: f.homeTeam,
+      awayTeam: f.awayTeam,
+      kickoffUtc: f.kickoffUtc,
+    }));
 
-      const pending = db.select().from(matches).all().filter((m) => m.kickoffUtc > now - 5 * 60_000);
-      const mapTx = rawDb.transaction(() => {
-        for (const m of pending) {
-          const decision = matchEvent(
-            { id: m.id, league: m.league, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoffUtc: m.kickoffUtc },
-            candidates,
-            aliases,
-          );
+    const pending = db.select().from(matches).all().filter((m) => m.kickoffUtc > now - 5 * 60_000);
+    const mapTx = rawDb.transaction(() => {
+      for (const m of pending) {
+        const decision = matchEvent(
+          { id: m.id, league: m.league, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoffUtc: m.kickoffUtc },
+          candidates,
+          aliases,
+        );
+        rawDb
+          .prepare(
+            `INSERT INTO match_mapping(match_id,pinnacle_match_id,confidence,method,kickoff_delta_sec,unmatched_reason,updated_at)
+             VALUES(?,?,?,?,?,?,?)
+             ON CONFLICT(match_id) DO UPDATE SET pinnacle_match_id=excluded.pinnacle_match_id,
+               confidence=excluded.confidence, method=excluded.method,
+               kickoff_delta_sec=excluded.kickoff_delta_sec, unmatched_reason=excluded.unmatched_reason,
+               updated_at=excluded.updated_at`,
+          )
+          .run(m.id, decision.pinnacleMatchId, decision.confidence, decision.method, decision.kickoffDeltaSec, decision.unmatchedReason, now);
+        rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?").run(decision.pinnacleMatchId, m.id);
+        for (const a of decision.learnedAliases) {
+          if (!a.alias) continue;
           rawDb
             .prepare(
-              `INSERT INTO match_mapping(match_id,crown_match_id,confidence,method,kickoff_delta_sec,unmatched_reason,updated_at)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(match_id) DO UPDATE SET crown_match_id=excluded.crown_match_id,
-                 confidence=excluded.confidence, method=excluded.method,
-                 kickoff_delta_sec=excluded.kickoff_delta_sec, unmatched_reason=excluded.unmatched_reason,
-                 updated_at=excluded.updated_at`,
+              "INSERT INTO team_aliases(canonical,alias,provider,confirmed_at) VALUES(?,?,?,?) ON CONFLICT(provider,alias) DO UPDATE SET canonical=excluded.canonical, confirmed_at=excluded.confirmed_at",
             )
-            .run(m.id, decision.crownMatchId, decision.confidence, decision.method, decision.kickoffDeltaSec, decision.unmatchedReason, now);
-          rawDb.prepare("UPDATE matches SET crown_match_id=? WHERE id=?").run(decision.crownMatchId, m.id);
-          for (const a of decision.learnedAliases) {
-            if (!a.alias) continue;
-            rawDb
-              .prepare(
-                "INSERT INTO team_aliases(canonical,alias,provider,confirmed_at) VALUES(?,?,?,?) ON CONFLICT(provider,alias) DO UPDATE SET canonical=excluded.canonical, confirmed_at=excluded.confirmed_at",
-              )
-              .run(a.canonical, a.alias, a.provider, now);
+            .run(a.canonical, a.alias, a.provider, now);
+        }
+      }
+    });
+    mapTx();
+    log("pinnacle_fixtures", { fixtures: fixtures.length, mapped: pending.length });
+    return fixtures.length;
+  }
+
+  /**
+   * Per-match Pinnacle odds detail for an EXPLICIT list of matches only.
+   * `bypassCache` is used by the dense pre-kickoff window scan.
+   */
+  private async pollPinnacleDetail(
+    targets: Array<{ id: string; pinnacleMatchId: string | null; kickoffUtc: number }>,
+    deadline: number,
+    bypassCache = false,
+  ): Promise<{ fetched: number; failed: number; rows: number }> {
+    let fetched = 0;
+    let failed = 0;
+    let rows = 0;
+    const queue = [...targets];
+    const workers = Array.from({ length: 4 }, async () => {
+      while (queue.length) {
+        if (Date.now() > deadline) return;
+        const m = queue.shift();
+        if (!m?.pinnacleMatchId) continue;
+        const minutes = (m.kickoffUtc - Date.now()) / 60_000;
+        const ttl = bypassCache ? 0 : pinnacleCacheTtl(minutes);
+        const cached = this.pinnacleDetail.get(m.pinnacleMatchId);
+        let prices = !bypassCache && cached && Date.now() - cached.at < ttl ? cached.prices : null;
+        if (!prices) {
+          try {
+            prices = DEMO
+              ? (DEMO_FIXTURE.pinnaclePrices[m.pinnacleMatchId] ?? [])
+              : await this.pinnacle.fetchMatchPrices(m.pinnacleMatchId);
+            this.pinnacleDetail.set(m.pinnacleMatchId, { at: Date.now(), prices });
+            fetched++;
+          } catch (err) {
+            failed++;
+            log("pinnacle_detail_error", { pinnacleMatchId: m.pinnacleMatchId, error: (err as Error).message });
+            continue;
           }
         }
-      });
-      mapTx();
-
-      /* ---- 3. Crown detail prices (tiered cache, bounded concurrency) ---- */
-      const targets = db
-        .select()
-        .from(matches)
-        .all()
-        .filter((m) => m.crownMatchId && m.kickoffUtc > now)
-        .filter((m) => (windowMinutes ? m.kickoffUtc - now <= windowMinutes * 60_000 : true))
-        .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
-
-      let fetched = 0;
-      let failed = 0;
-      const queue = [...targets];
-      const workers = Array.from({ length: 4 }, async () => {
-        while (queue.length) {
-          if (Date.now() > deadline) return;
-          const m = queue.shift();
-          if (!m?.crownMatchId) continue;
-          const minutes = (m.kickoffUtc - Date.now()) / 60_000;
-          const ttl = crownCacheTtl(minutes);
-          const cached = this.crownDetail.get(m.crownMatchId);
-          let prices = cached && Date.now() - cached.at < ttl ? cached.prices : null;
-          if (!prices) {
-            try {
-              prices = DEMO
-                ? (DEMO_FIXTURE.crownPrices[m.crownMatchId] ?? [])
-                : await this.crown.fetchMatchPrices(m.crownMatchId);
-              this.crownDetail.set(m.crownMatchId, { at: Date.now(), prices });
-              fetched++;
-            } catch (err) {
-              failed++;
-              log("crown_detail_error", { crownMatchId: m.crownMatchId, error: (err as Error).message });
-              continue;
-            }
-          }
-          if (prices.length) this.persistPrices(m.id, "crown", prices, Date.now());
+        if (prices.length) {
+          rows++;
+          this.persistPrices(m.id, "pinnacle", prices, Date.now());
         }
+      }
+    });
+    await Promise.all(workers);
+    this.pinnacleRowsSeen = rows;
+    return { fetched, failed, rows };
+  }
+
+  /** Matches eligible for detail polling in the given mode. */
+  private detailTargets(mode: RefreshMode, cfg: ScanConfig) {
+    const now = Date.now();
+    const all = db
+      .select()
+      .from(matches)
+      .all()
+      .filter((m) => m.pinnacleMatchId && m.kickoffUtc > now)
+      .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
+    if (mode === "full") return all;
+    if (mode === "window") return all.filter((m) => m.kickoffUtc - now <= cfg.windowMinutes * 60_000);
+    return [];
+  }
+
+  private async runRefresh(mode: RefreshMode): Promise<void> {
+    const deadline = Date.now() + MAX_LOOP_MS;
+    const now = Date.now();
+    const cfg = scanConfig();
+
+    const hkjcOk = await this.refreshHkjc();
+
+    let fixtures = 0;
+    let pinnacleOk = false;
+    let failed = 0;
+    try {
+      fixtures = await this.refreshPinnacleFixtures();
+      pinnacleOk = fixtures > 0;
+      if (mode !== "lightweight") {
+        const targets = this.detailTargets(mode, cfg);
+        const res = await this.pollPinnacleDetail(targets, deadline, mode === "window");
+        failed = res.failed;
+        pinnacleOk = pinnacleOk && (targets.length === 0 || res.rows > 0);
+        log("pinnacle_detail_scan", { mode, targets: targets.length, ...res });
+      }
+      this.setHealth("pinnacle", {
+        ok: pinnacleOk,
+        itemCount: fixtures,
+        error: pinnacleOk
+          ? null
+          : `未能從 Pinnacle 來源取得資料（賽程 ${fixtures} 場、明細失敗 ${failed} 次）`,
+        mode: DEMO ? "demo" : pinnacleOk ? "live" : "degraded",
       });
-      await Promise.all(workers);
-      crownOk = crownOk && (fetched > 0 || failed === 0);
-      this.setHealth("crown", {
-        ok: crownOk,
-        itemCount: fixtures.length,
-        error: crownOk ? null : `crown detail failures: ${failed}`,
-        mode: DEMO ? "demo" : crownOk ? "live" : "degraded",
-      });
-      log("crown_refresh", { fixtures: fixtures.length, targets: targets.length, fetched, failed });
     } catch (err) {
       const message = (err as Error).message;
-      this.setHealth("crown", { ok: false, error: message });
-      log("crown_error", { error: message });
+      this.setHealth("pinnacle", { ok: false, error: message });
+      log("pinnacle_error", { error: message });
     }
 
-    /* ---- 4. Opportunities + simulations + settlement ---- */
     const dash = this.buildDashboardData();
     this.recordOpportunities(dash, now);
     this.placeSimulations(dash, now);
@@ -351,18 +419,132 @@ export class RadarEngine {
     if (hkjcOk) {
       this.lastGoodAt = Date.now();
       setState("lastGoodAt", String(this.lastGoodAt));
-      if (this.coldStartStage === "idle") this.coldStartStage = "done";
     }
+    this.recomputeDegradedReason();
+  }
+
+  private recomputeDegradedReason(): void {
     const health = db.select().from(providerHealth).all();
     const bad = health.filter((h) => !h.ok);
+    const src = this.pinnacle.status();
+    const srcNote = src.warnings.length ? `（Pinnacle 來源提示：${src.warnings[src.warnings.length - 1]}）` : "";
     this.degradedReason = DEMO
       ? "示範資料模式（DEMO）：畫面數字為樣本，並非真實賠率。"
       : bad.length
-        ? `${bad.map((b) => (b.provider === "hkjc" ? "馬會" : "皇冠")).join("、")}資料來源暫時無法連接（${bad[0].lastError ?? "未知錯誤"}），現時顯示最後一次成功取得的快照。`
+        ? `${bad.map((b) => (b.provider === "hkjc" ? "馬會" : "平博（Pinnacle）")).join("、")} 資料來源暫時無法連接（${bad[0].lastError ?? "未知錯誤"}），現時顯示最後一次成功取得的快照。${srcNote}`
         : null;
   }
 
-  private persistPrices(matchId: string, provider: "hkjc" | "crown", prices: ProviderPrice[], now: number): void {
+  /* ------------------------ dense pre-kickoff scan ---------------------- */
+
+  scanConfigInfo(): StatusResponse["scan"] {
+    const cfg = scanConfig();
+    return { ...cfg, scheduleConfigured: false, lastScan: this.lastScan };
+  }
+
+  /** Lightweight candidate list for the window scan: fixtures + mapping only. */
+  private async loadScanCandidates(): Promise<ScanCandidate[]> {
+    await this.refreshHkjc();
+    await this.refreshPinnacleFixtures();
+    return db
+      .select()
+      .from(matches)
+      .all()
+      .map((m) => ({
+        matchId: m.id,
+        matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
+        kickoffUtc: m.kickoffUtc,
+        inplay: !!m.inplay,
+        status: m.status,
+        pinnacleMatchId: m.pinnacleMatchId,
+      }));
+  }
+
+  /** One dense pass: refresh HKJC (1 call) + Pinnacle detail for the window only. */
+  private async densePass(events: ScanCandidate[]): Promise<{ detailCalls: number; newOpportunityKeys: string[] }> {
+    const now = Date.now();
+    await this.refreshHkjc();
+    const res = await this.pollPinnacleDetail(
+      events.map((e) => ({ id: e.matchId, pinnacleMatchId: e.pinnacleMatchId, kickoffUtc: e.kickoffUtc })),
+      Date.now() + MAX_LOOP_MS,
+      true,
+    );
+    const dash = this.buildDashboardData();
+    const fresh = this.recordOpportunities(dash, now);
+    this.placeSimulations(dash, now);
+    this.recomputeDegradedReason();
+    // Only a NEW arbitrage (direct or synthetic) stops the loop; EV does not.
+    const newArbs = fresh.filter((k) => k.startsWith("arb|") || k.startsWith("synth|"));
+    return { detailCalls: res.fetched, newOpportunityKeys: newArbs };
+  }
+
+  /**
+   * Trigger one dense pre-kickoff window scan. Safe to call from a CLI, an HTTP
+   * helper endpoint, or (later) an external scheduler. No schedule is created.
+   */
+  async runScan(): Promise<ScanOutcome> {
+    if (this.scanning) {
+      const cfg = scanConfig();
+      const at = Date.now();
+      return {
+        result: "ERROR",
+        startedAt: at,
+        finishedAt: at,
+        runtimeMs: 0,
+        windowMinutes: cfg.windowMinutes,
+        intervalSec: cfg.intervalSec,
+        maxRuntimeSec: cfg.maxRuntimeSec,
+        selected: [],
+        passes: 0,
+        detailCalls: 0,
+        newOpportunityKeys: [],
+        message: "已有掃描進行中，本次請求已略過。",
+      };
+    }
+    this.scanning = true;
+    try {
+      const outcome = await runWindowScan({
+        now: () => Date.now(),
+        loadCandidates: () => this.loadScanCandidates(),
+        pollPass: (events) => this.densePass(events),
+        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+        config: scanConfig(),
+      });
+      this.lastScan = outcome;
+      setState("lastScan", JSON.stringify(outcome));
+      await this.settleDue(false);
+      log("window_scan", {
+        result: outcome.result,
+        selected: outcome.selected.length,
+        passes: outcome.passes,
+        detailCalls: outcome.detailCalls,
+        runtimeMs: outcome.runtimeMs,
+      });
+      return outcome;
+    } finally {
+      this.scanning = false;
+    }
+  }
+
+  /** Events currently inside the dense window (used by the helper endpoint). */
+  windowPreview(): ReturnType<typeof selectWindowEvents> {
+    const cfg = scanConfig();
+    const candidates: ScanCandidate[] = db
+      .select()
+      .from(matches)
+      .all()
+      .map((m) => ({
+        matchId: m.id,
+        matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
+        kickoffUtc: m.kickoffUtc,
+        inplay: !!m.inplay,
+        status: m.status,
+        pinnacleMatchId: m.pinnacleMatchId,
+      }));
+    return selectWindowEvents(candidates, Date.now(), cfg);
+  }
+
+  private persistPrices(matchId: string, provider: "hkjc" | "pinnacle", prices: ProviderPrice[], now: number): void {
     const insertSnap = rawDb.prepare(
       "INSERT INTO odds_snapshots(match_id,provider,market,line_key,selection,decimal_odds,source_updated_at,fetched_at,phase) VALUES(?,?,?,?,?,?,?,?,'prematch')",
     );
@@ -449,7 +631,7 @@ export class RadarEngine {
         const cr: Partial<Record<Selection, PriceCell>> = {};
         for (const s of sels) {
           const a = cell("hkjc", market, l.lineKey, s);
-          const b = cell("crown", market, l.lineKey, s);
+          const b = cell("pinnacle", market, l.lineKey, s);
           if (a) hk[s] = a;
           if (b) cr[s] = b;
         }
@@ -475,7 +657,7 @@ export class RadarEngine {
               league: m.league,
               kickoffUtc: m.kickoffUtc,
               hkjc: { H: hk.H?.decimalOdds, D: hk.D?.decimalOdds, A: hk.A?.decimalOdds },
-              crown: { H: cr.H?.decimalOdds, D: cr.D?.decimalOdds, A: cr.A?.decimalOdds },
+              pinnacle: { H: cr.H?.decimalOdds, D: cr.D?.decimalOdds, A: cr.A?.decimalOdds },
             });
           }
         } else if (exactLine) {
@@ -494,8 +676,8 @@ export class RadarEngine {
             lineDisplay: formatLine(market, l.lineValue),
           };
           arb =
-            findTwoWayArb({ ...base, hkjc: { selection: s1, decimalOdds: hk[s1]!.decimalOdds }, crown: { selection: s2, decimalOdds: cr[s2]!.decimalOdds } }) ??
-            findTwoWayArb({ ...base, hkjc: { selection: s2, decimalOdds: hk[s2]!.decimalOdds }, crown: { selection: s1, decimalOdds: cr[s1]!.decimalOdds } });
+            findTwoWayArb({ ...base, hkjc: { selection: s1, decimalOdds: hk[s1]!.decimalOdds }, pinnacle: { selection: s2, decimalOdds: cr[s2]!.decimalOdds } }) ??
+            findTwoWayArb({ ...base, hkjc: { selection: s2, decimalOdds: hk[s2]!.decimalOdds }, pinnacle: { selection: s1, decimalOdds: cr[s1]!.decimalOdds } });
         }
 
         let lineEv: EvOpportunity[] = [];
@@ -508,7 +690,7 @@ export class RadarEngine {
             market,
             lineKey: l.lineKey,
             lineDisplay: formatLine(market, l.lineValue),
-            crown: sels.filter((s) => cr[s]).map((s) => ({ selection: s, decimalOdds: cr[s]!.decimalOdds })),
+            pinnacle: sels.filter((s) => cr[s]).map((s) => ({ selection: s, decimalOdds: cr[s]!.decimalOdds })),
             hkjc: sels.filter((s) => hk[s]).map((s) => ({ selection: s, decimalOdds: hk[s]!.decimalOdds, fetchedAt: hk[s]!.fetchedAt })),
             now,
             mappingConfidence: mapping?.confidence ?? 0,
@@ -525,7 +707,7 @@ export class RadarEngine {
           lineDisplay: formatLine(market, l.lineValue),
           isMain: !!l.isMain,
           hkjc: hk,
-          crown: cr,
+          pinnacle: cr,
           exactLine,
           totalProbability: totalProbability === null ? null : Math.round(totalProbability * 1e6) / 1e6,
           bestQ: bestQ === null ? null : Math.round(bestQ * 1e6) / 1e6,
@@ -535,7 +717,7 @@ export class RadarEngine {
         });
       }
 
-      /* synthetic quotes from HKJC 1X2 vs Crown handicap singles */
+      /* synthetic quotes from HKJC 1X2 vs Pinnacle handicap singles */
       const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices);
       synthetics.push(...syn);
 
@@ -546,8 +728,8 @@ export class RadarEngine {
         awayTeam: m.awayTeam,
         kickoffUtc: m.kickoffUtc,
         minutesToKickoff: Math.round((m.kickoffUtc - now) / 60_000),
-        matched: !!m.crownMatchId,
-        crownMatchId: m.crownMatchId,
+        matched: !!m.pinnacleMatchId,
+        pinnacleMatchId: m.pinnacleMatchId,
         mappingConfidence: mapping?.confidence ?? 0,
         unmatchedReason: mapping?.unmatchedReason ?? null,
         lines: lineRows,
@@ -585,28 +767,28 @@ export class RadarEngine {
     for (const side of ["away", "home"] as SynSide[]) {
       const official1 = officialFor(side);
       for (const target of SYNTHETIC_TARGETS) {
-        // Crown must quote the mirrored opposite leg on the exact same line.
-        const crownHomeHandicap = side === "away" ? -target : target;
-        const crownSelection: Selection = side === "away" ? "H" : "A";
-        const crownRow = prices.find(
+        // Pinnacle must quote the mirrored opposite leg on the exact same line.
+        const pinnacleHomeHandicap = side === "away" ? -target : target;
+        const pinnacleSelection: Selection = side === "away" ? "H" : "A";
+        const pinnacleRow = prices.find(
           (p) =>
-            p.provider === "crown" &&
+            p.provider === "pinnacle" &&
             p.market === "AH" &&
-            p.lineKey === crownHomeHandicap.toFixed(2) &&
-            p.selection === crownSelection,
+            p.lineKey === pinnacleHomeHandicap.toFixed(2) &&
+            p.selection === pinnacleSelection,
         );
-        if (!crownRow) continue;
-        const crownOdds = crownRow.decimalOdds;
-        // Crown leg anchored at HK$5,000 -> target payout -> synthetic outlay.
-        const payout = CROWN_FIXED_STAKE * crownOdds;
+        if (!pinnacleRow) continue;
+        const pinnacleOdds = pinnacleRow.decimalOdds;
+        // Pinnacle leg anchored at HK$5,000 -> target payout -> synthetic outlay.
+        const payout = PINNACLE_FIXED_STAKE * pinnacleOdds;
         const probe = buildSynthetic(side, target, { oddsHome, oddsDraw, oddsAway, official1 }, 1000);
         if (!probe) continue;
         const W = payout / probe.odds;
         const quote = buildSynthetic(side, target, { oddsHome, oddsDraw, oddsAway, official1 }, W);
         if (!quote) continue;
-        if (!syntheticCoversCrown(quote, crownHomeHandicap, crownSelection)) continue;
-        const q = 1 / quote.odds + 1 / crownOdds;
-        const totalStake = round2(W + CROWN_FIXED_STAKE);
+        if (!syntheticCoversPinnacle(quote, pinnacleHomeHandicap, pinnacleSelection)) continue;
+        const q = 1 / quote.odds + 1 / pinnacleOdds;
+        const totalStake = round2(W + PINNACLE_FIXED_STAKE);
         const profit = round2(payout - totalStake);
         out.push({
           key: `synth|${matchId}|${side}|${target}`,
@@ -620,8 +802,8 @@ export class RadarEngine {
           syntheticOdds: quote.odds,
           formula: quote.formula,
           components: quote.components,
-          crownOdds,
-          crownSelection,
+          pinnacleOdds,
+          pinnacleSelection,
           q: Math.round(q * 1e6) / 1e6,
           isArb: q < 1,
           totalStake,
@@ -636,7 +818,7 @@ export class RadarEngine {
 
   buildStatus(rows: MatchRow[], arbs: ArbOpportunity[], evs: EvOpportunity[], syn: SyntheticOpportunity[]): StatusResponse {
     const health = db.select().from(providerHealth).all();
-    const providers: ProviderStatus[] = (["hkjc", "crown"] as const).map((p) => {
+    const providers: ProviderStatus[] = (["hkjc", "pinnacle"] as const).map((p) => {
       const h = health.find((x) => x.provider === p);
       return {
         provider: p,
@@ -662,6 +844,8 @@ export class RadarEngine {
       nextRefreshEligibleAt: this.nextRefreshEligibleAt(),
       degradedReason: this.degradedReason,
       providers,
+      pinnacleSource: this.pinnacle.status(),
+      scan: this.scanConfigInfo(),
       counts: {
         matches: rows.length,
         matched: rows.filter((r) => r.matched).length,
@@ -675,7 +859,7 @@ export class RadarEngine {
 
   /* -------------------------- opportunity state ------------------------- */
 
-  private recordOpportunities(dash: DashboardResponse, now: number): void {
+  private recordOpportunities(dash: DashboardResponse, now: number): string[] {
     const existing: DedupeEntry[] = db
       .select()
       .from(opportunities)
@@ -713,6 +897,7 @@ export class RadarEngine {
     });
     tx();
     if (merged.fresh.length) log("opportunities_new", { count: merged.fresh.length });
+    return merged.fresh.map((f) => f.key);
   }
 
   /* ----------------------------- simulations ---------------------------- */
@@ -728,7 +913,7 @@ export class RadarEngine {
        VALUES(?,?,?,?,?,?,?,?,?)`,
     );
     const tx = rawDb.transaction(() => {
-      /* 情況一 — arb, Crown fixed 5,000, HKJC back-calculated */
+      /* 情況一 — arb, Pinnacle fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
         const key = `case1_arb|${a.matchId}|${a.lineKey}|${a.market}:${a.legs.map((l) => l.selection).join("")}`;
         const res = insertBet.run(
@@ -754,9 +939,9 @@ export class RadarEngine {
           insertLeg.run(betId, "hkjc", e.market, e.lineKey, e.selection, e.hkjcOdds, HKJC_FIXED_STAKE, 0, null);
         }
       }
-      /* 合成賠率 — Crown fixed 5,000, HKJC split by the synthetic formula */
+      /* 合成賠率 — Pinnacle fixed 5,000, HKJC split by the synthetic formula */
       for (const s of dash.synthetics) {
-        if (!s.isArb || !s.crownOdds || !s.crownSelection) continue;
+        if (!s.isArb || !s.pinnacleOdds || !s.pinnacleSelection) continue;
         const key = `synth_arb|${s.matchId}|${s.targetHandicap}|${s.side}`;
         const res = insertBet.run(
           key, "synth_arb", s.matchId, "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
@@ -766,8 +951,8 @@ export class RadarEngine {
         if (res.changes) {
           const betId = Number(res.lastInsertRowid);
           insertLeg.run(
-            betId, "crown", "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
-            s.crownSelection, s.crownOdds, CROWN_FIXED_STAKE, 0, null,
+            betId, "pinnacle", "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
+            s.pinnacleSelection, s.pinnacleOdds, PINNACLE_FIXED_STAKE, 0, null,
           );
           for (const c of s.components) {
             insertLeg.run(betId, "hkjc", c.market, c.lineKey, c.selection, c.decimalOdds, c.stake, 1, c.syntheticDetail ?? s.formula);
@@ -789,11 +974,11 @@ export class RadarEngine {
 
     let resultsFetched = 0;
     try {
-      const fetched = DEMO ? DEMO_FIXTURE.results : await this.crown.fetchResults([0, -1, -2, -3]);
+      const fetched = DEMO ? DEMO_FIXTURE.results : await this.pinnacle.fetchResults([0, -1, -2, -3]);
       resultsFetched = fetched.length;
-      const byCrownId = new Map(fetched.map((r) => [r.providerMatchId, r]));
+      const byPinnacleId = new Map(fetched.map((r) => [r.providerMatchId, r]));
       const stmt = rawDb.prepare(
-        `INSERT INTO results(match_id,crown_match_id,home_score,away_score,half_home,half_away,source,fetched_at)
+        `INSERT INTO results(match_id,pinnacle_match_id,home_score,away_score,half_home,half_away,source,fetched_at)
          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
          away_score=excluded.away_score, half_home=excluded.half_home, half_away=excluded.half_away,
          source=excluded.source, fetched_at=excluded.fetched_at`,
@@ -801,10 +986,10 @@ export class RadarEngine {
       const tx = rawDb.transaction(() => {
         for (const b of due) {
           const m = db.select().from(matches).where(eq(matches.id, b.matchId)).get();
-          if (!m?.crownMatchId) continue;
-          const r = byCrownId.get(m.crownMatchId);
+          if (!m?.pinnacleMatchId) continue;
+          const r = byPinnacleId.get(m.pinnacleMatchId);
           if (!r) continue;
-          stmt.run(b.matchId, m.crownMatchId, r.homeScore, r.awayScore, r.halfHome ?? null, r.halfAway ?? null, r.source, now);
+          stmt.run(b.matchId, m.pinnacleMatchId, r.homeScore, r.awayScore, r.halfHome ?? null, r.halfAway ?? null, r.source, now);
         }
       });
       tx();

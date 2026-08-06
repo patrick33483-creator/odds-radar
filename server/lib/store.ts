@@ -31,13 +31,13 @@ export const SNAPSHOT_RETENTION_MS = 120 * 24 * 60 * 60 * 1000;
 export function migrate(): void {
   sqlite.exec(`
 CREATE TABLE IF NOT EXISTS matches (
-  id TEXT PRIMARY KEY, hkjc_id TEXT NOT NULL, crown_match_id TEXT,
+  id TEXT PRIMARY KEY, hkjc_id TEXT NOT NULL, pinnacle_match_id TEXT,
   league TEXT NOT NULL, league_en TEXT, home_team TEXT NOT NULL, away_team TEXT NOT NULL,
   home_team_en TEXT, away_team_en TEXT, kickoff_utc INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'PREEVENT', inplay INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS matches_kickoff_idx ON matches(kickoff_utc);
-CREATE INDEX IF NOT EXISTS matches_crown_idx ON matches(crown_match_id);
+CREATE INDEX IF NOT EXISTS matches_pinnacle_idx ON matches(pinnacle_match_id);
 
 CREATE TABLE IF NOT EXISTS market_lines (
   id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT NOT NULL, market TEXT NOT NULL,
@@ -66,10 +66,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS team_aliases_uniq ON team_aliases(provider, al
 CREATE INDEX IF NOT EXISTS team_aliases_canonical_idx ON team_aliases(canonical);
 
 CREATE TABLE IF NOT EXISTS match_mapping (
-  match_id TEXT PRIMARY KEY, crown_match_id TEXT, confidence REAL NOT NULL DEFAULT 0,
+  match_id TEXT PRIMARY KEY, pinnacle_match_id TEXT, confidence REAL NOT NULL DEFAULT 0,
   method TEXT NOT NULL, kickoff_delta_sec INTEGER, unmatched_reason TEXT,
   updated_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS match_mapping_crown_idx ON match_mapping(crown_match_id);
+CREATE INDEX IF NOT EXISTS match_mapping_pinnacle_idx ON match_mapping(pinnacle_match_id);
 
 CREATE TABLE IF NOT EXISTS opportunities (
   key TEXT PRIMARY KEY, category TEXT NOT NULL, match_id TEXT NOT NULL, market TEXT NOT NULL,
@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS simulation_legs (
 CREATE INDEX IF NOT EXISTS simulation_legs_bet_idx ON simulation_legs(bet_id);
 
 CREATE TABLE IF NOT EXISTS results (
-  match_id TEXT PRIMARY KEY, crown_match_id TEXT, home_score INTEGER NOT NULL,
+  match_id TEXT PRIMARY KEY, pinnacle_match_id TEXT, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, half_home INTEGER, half_away INTEGER,
   source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 

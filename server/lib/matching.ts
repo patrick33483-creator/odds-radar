@@ -1,5 +1,5 @@
 /**
- * Event matching between HKJC (traditional Chinese) and titan007/Crown
+ * Event matching between HKJC (traditional Chinese) and titan007/Pinnacle
  * (simplified Chinese).
  *
  * Matching NEVER relies on names alone. A candidate must satisfy:
@@ -87,18 +87,18 @@ export interface CandidateEvent {
 }
 
 export interface MatchDecision {
-  crownMatchId: string | null;
+  pinnacleMatchId: string | null;
   confidence: number;
   method: string;
   kickoffDeltaSec: number | null;
   unmatchedReason: string | null;
   /** Alias pairs worth persisting once a match is accepted. */
-  learnedAliases: Array<{ canonical: string; alias: string; provider: "hkjc" | "crown" }>;
+  learnedAliases: Array<{ canonical: string; alias: string; provider: "hkjc" | "pinnacle" }>;
 }
 
 export interface AliasIndex {
   /** provider alias -> canonical key */
-  get(provider: "hkjc" | "crown", alias: string): string | undefined;
+  get(provider: "hkjc" | "pinnacle", alias: string): string | undefined;
 }
 
 export function scoreCandidate(
@@ -110,9 +110,9 @@ export function scoreCandidate(
   const timeScore = Math.max(0, 1 - dt / KICKOFF_TOLERANCE_MS);
 
   const canonTargetHome = aliases?.get("hkjc", normalizeName(target.homeTeam));
-  const canonCandHome = aliases?.get("crown", normalizeName(cand.homeTeam));
+  const canonCandHome = aliases?.get("pinnacle", normalizeName(cand.homeTeam));
   const canonTargetAway = aliases?.get("hkjc", normalizeName(target.awayTeam));
-  const canonCandAway = aliases?.get("crown", normalizeName(cand.awayTeam));
+  const canonCandAway = aliases?.get("pinnacle", normalizeName(cand.awayTeam));
 
   const homeAliasHit = !!canonTargetHome && canonTargetHome === canonCandHome;
   const awayAliasHit = !!canonTargetAway && canonTargetAway === canonCandAway;
@@ -127,7 +127,7 @@ export function scoreCandidate(
 }
 
 /**
- * Pick the best Crown candidate for one HKJC match.
+ * Pick the best Pinnacle candidate for one HKJC match.
  * Names alone can never produce a match: the kickoff window is a hard gate.
  */
 export function matchEvent(
@@ -140,7 +140,7 @@ export function matchEvent(
   );
   if (inWindow.length === 0) {
     return {
-      crownMatchId: null,
+      pinnacleMatchId: null,
       confidence: 0,
       method: "time+league+alias",
       kickoffDeltaSec: null,
@@ -155,7 +155,7 @@ export function matchEvent(
   }
   if (!best) {
     return {
-      crownMatchId: null,
+      pinnacleMatchId: null,
       confidence: 0,
       method: "time+league+alias",
       kickoffDeltaSec: null,
@@ -168,7 +168,7 @@ export function matchEvent(
 
   if (parts.nameScore < NAME_FLOOR) {
     return {
-      crownMatchId: null,
+      pinnacleMatchId: null,
       confidence: Math.round(parts.score * 1000) / 1000,
       method: "time+league+alias",
       kickoffDeltaSec: deltaSec,
@@ -178,7 +178,7 @@ export function matchEvent(
   }
   if (parts.score < ACCEPT_CONFIDENCE) {
     return {
-      crownMatchId: null,
+      pinnacleMatchId: null,
       confidence: Math.round(parts.score * 1000) / 1000,
       method: "time+league+alias",
       kickoffDeltaSec: deltaSec,
@@ -189,16 +189,16 @@ export function matchEvent(
   const canonHome = normalizeName(target.homeTeam);
   const canonAway = normalizeName(target.awayTeam);
   return {
-    crownMatchId: cand.id,
+    pinnacleMatchId: cand.id,
     confidence: Math.round(parts.score * 1000) / 1000,
     method: "time+league+alias",
     kickoffDeltaSec: deltaSec,
     unmatchedReason: null,
     learnedAliases: [
       { canonical: canonHome, alias: normalizeName(target.homeTeam), provider: "hkjc" },
-      { canonical: canonHome, alias: normalizeName(cand.homeTeam), provider: "crown" },
+      { canonical: canonHome, alias: normalizeName(cand.homeTeam), provider: "pinnacle" },
       { canonical: canonAway, alias: normalizeName(target.awayTeam), provider: "hkjc" },
-      { canonical: canonAway, alias: normalizeName(cand.awayTeam), provider: "crown" },
+      { canonical: canonAway, alias: normalizeName(cand.awayTeam), provider: "pinnacle" },
     ],
   };
 }

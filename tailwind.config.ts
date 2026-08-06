@@ -11,6 +11,13 @@ export default {
         sm: ".1875rem", /* 3px */
       },
       colors: {
+        hkjc: "hsl(var(--hkjc) / <alpha-value>)",
+        pinnacle: "hsl(var(--pinnacle) / <alpha-value>)",
+        positive: "hsl(var(--positive) / <alpha-value>)",
+        negative: "hsl(var(--negative) / <alpha-value>)",
+        warning: "hsl(var(--warning) / <alpha-value>)",
+        synthetic: "hsl(var(--synthetic) / <alpha-value>)",
+        grid: "hsl(var(--grid) / <alpha-value>)",
         // Flat / base colors (regular buttons)
         background: "hsl(var(--background) / <alpha-value>)",
         foreground: "hsl(var(--foreground) / <alpha-value>)",

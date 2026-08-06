@@ -9,12 +9,12 @@
   --opaque-button-border-intensity: -8;
   --elevate-1: rgba(0, 0, 0, 0.03);
   --elevate-2: rgba(0, 0, 0, 0.08);
-  --background: 0 0% 100%;
-  --foreground: 0 0% 9%;
-  --border: 0 0% 91%;
-  --card: 0 0% 98%;
-  --card-foreground: 0 0% 9%;
-  --card-border: 0 0% 94%;
+  --background: 210 20% 98%;
+  --foreground: 222 30% 12%;
+  --border: 214 18% 86%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 30% 12%;
+  --card-border: 214 18% 89%;
   --sidebar: 0 0% 96%;
   --sidebar-foreground: 0 0% 9%;
   --sidebar-border: 0 0% 92%;
@@ -23,30 +23,40 @@
   --sidebar-accent: 0 0% 89%;
   --sidebar-accent-foreground: 0 0% 9%;
   --sidebar-ring: 221 83% 53%;
-  --popover: 0 0% 95%;
-  --popover-foreground: 0 0% 9%;
-  --popover-border: 0 0% 91%;
-  --primary: 221 83% 53%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 30% 12%;
+  --popover-border: 214 18% 86%;
+  --primary: 190 92% 34%;
   --primary-foreground: 0 0% 98%;
-  --secondary: 0 0% 92%;
-  --secondary-foreground: 0 0% 9%;
-  --muted: 0 0% 93%;
-  --muted-foreground: 0 0% 40%;
-  --accent: 220 14% 92%;
-  --accent-foreground: 0 0% 9%;
-  --destructive: 0 84% 42%;
+  --secondary: 214 20% 93%;
+  --secondary-foreground: 222 30% 12%;
+  --muted: 214 20% 94%;
+  --muted-foreground: 217 12% 42%;
+  --accent: 199 60% 92%;
+  --accent-foreground: 222 30% 12%;
+  --destructive: 0 74% 45%;
   --destructive-foreground: 0 0% 98%;
-  --input: 0 0% 75%;
-  --ring: 221 83% 53%;
+  --input: 214 18% 80%;
+  --ring: 190 92% 34%;
   --chart-1: 221 83% 45%;
   --chart-2: 262 83% 48%;
   --chart-3: 173 58% 39%;
   --chart-4: 43 74% 49%;
   --chart-5: 27 87% 55%;
-  --font-sans: Open Sans, sans-serif;
+  --font-sans: "Inter", "Noto Sans TC", system-ui, sans-serif;
   --font-serif: Georgia, serif;
-  --font-mono: Menlo, monospace;
-  --radius: 0.5rem;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
+  --radius: 0.375rem;
+  /* Brand / semantic tokens — 盤路雷達 */
+  --hkjc: 36 96% 44%;          /* 馬會 amber */
+  --hkjc-foreground: 36 96% 26%;
+  --pinnacle: 214 88% 46%;        /* Pinnacle 平博 blue */
+  --pinnacle-foreground: 214 88% 30%;
+  --positive: 152 62% 34%;     /* 鎖利 / 正回報 */
+  --negative: 0 74% 45%;
+  --warning: 40 92% 46%;       /* 冷啟動 */
+  --synthetic: 265 60% 52%;    /* 合成賠率 */
+  --grid: 214 18% 88%;
   --shadow-2xs: 0px 2px 0px 0px hsl(0 0% 0% / 0);
   --shadow-xs: 0px 2px 0px 0px hsl(0 0% 0% / 0);
   --shadow-sm: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 1px 2px -1px hsl(0 0% 0% / 0);
@@ -107,12 +117,12 @@
   --opaque-button-border-intensity: 9;
   --elevate-1: rgba(255, 255, 255, 0.04);
   --elevate-2: rgba(255, 255, 255, 0.09);
-  --background: 0 0% 7%;
-  --foreground: 0 0% 98%;
-  --border: 0 0% 16%;
-  --card: 0 0% 9%;
-  --card-foreground: 0 0% 98%;
-  --card-border: 0 0% 13%;
+  --background: 222 32% 7%;
+  --foreground: 210 30% 96%;
+  --border: 220 20% 18%;
+  --card: 222 28% 10%;
+  --card-foreground: 210 30% 96%;
+  --card-border: 220 20% 16%;
   --sidebar: 0 0% 11%;
   --sidebar-foreground: 0 0% 98%;
   --sidebar-border: 0 0% 15%;
@@ -121,21 +131,30 @@
   --sidebar-accent: 0 0% 16%;
   --sidebar-accent-foreground: 0 0% 98%;
   --sidebar-ring: 221 83% 53%;
-  --popover: 0 0% 13%;
-  --popover-foreground: 0 0% 98%;
-  --popover-border: 0 0% 17%;
-  --primary: 221 83% 53%;
-  --primary-foreground: 0 0% 98%;
-  --secondary: 0 0% 18%;
-  --secondary-foreground: 0 0% 98%;
-  --muted: 0 0% 19%;
-  --muted-foreground: 0 0% 65%;
-  --accent: 220 9% 17%;
-  --accent-foreground: 0 0% 98%;
-  --destructive: 0 84% 42%;
+  --popover: 222 28% 12%;
+  --popover-foreground: 210 30% 96%;
+  --popover-border: 220 20% 20%;
+  --primary: 188 86% 46%;
+  --primary-foreground: 222 40% 8%;
+  --secondary: 220 20% 17%;
+  --secondary-foreground: 210 30% 96%;
+  --muted: 220 18% 16%;
+  --muted-foreground: 215 16% 62%;
+  --accent: 200 30% 18%;
+  --accent-foreground: 210 30% 96%;
+  --destructive: 0 72% 52%;
   --destructive-foreground: 0 0% 98%;
-  --input: 0 0% 30%;
-  --ring: 221 83% 53%;
+  --input: 220 18% 28%;
+  --hkjc: 38 96% 58%;
+  --hkjc-foreground: 38 96% 70%;
+  --pinnacle: 212 92% 66%;
+  --pinnacle-foreground: 212 92% 76%;
+  --positive: 150 62% 48%;
+  --negative: 0 72% 58%;
+  --warning: 42 94% 58%;
+  --synthetic: 265 70% 68%;
+  --grid: 220 20% 16%;
+  --ring: 188 86% 46%;
   --chart-1: 221 83% 65%;
   --chart-2: 262 83% 68%;
   --chart-3: 173 58% 55%;
@@ -313,4 +332,31 @@
   .border.hover-elevate:not(.no-hover-interaction-elevate)::after {
     inset: -1px;
   }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply antialiased bg-background text-foreground;
+    font-feature-settings: "tnum" 1, "cv05" 1;
+  }
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+}
+
+@layer utilities {
+  .text-hkjc { color: hsl(var(--hkjc)); }
+  .text-pinnacle { color: hsl(var(--pinnacle)); }
+  .text-positive { color: hsl(var(--positive)); }
+  .text-negative { color: hsl(var(--negative)); }
+  .text-synthetic { color: hsl(var(--synthetic)); }
+  .bg-hkjc\/10 { background-color: hsl(var(--hkjc) / 0.1); }
+  .bg-pinnacle\/10 { background-color: hsl(var(--pinnacle) / 0.1); }
+  .data-grid { border-color: hsl(var(--grid)); }
 }

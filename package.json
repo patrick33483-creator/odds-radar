@@ -10,7 +10,8 @@
     "check": "tsc",
     "db:push": "drizzle-kit push",
     "test": "vitest run",
-    "backup": "tsx scripts/backup.ts"
+    "backup": "tsx scripts/backup.ts",
+    "scan": "tsx scripts/scan-window.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.4.0",

@@ -89,23 +89,52 @@ function buildSimulations(): SimulationsResponse {
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  // Kick off the two-stage cold start without blocking the first request.
-  void engine.refresh().catch(() => undefined);
+  // Boot warm-up is LIGHTWEIGHT ONLY (HKJC single call + cached fixture list).
+  // It never polls per-match Pinnacle odds detail. Set RADAR_BOOTSTRAP=0 to skip.
+  if (process.env.RADAR_BOOTSTRAP !== "0") {
+    void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
+  }
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.buildDashboardData();
     res.json(dash.status);
   });
 
+  // Read-only: the dashboard's automated 20 s polling must never trigger an
+  // all-match Pinnacle detail scan. A throttled lightweight fixture/HKJC
+  // refresh is allowed because it makes zero per-match detail requests.
   app.get("/api/dashboard", async (_req, res) => {
-    // Opportunistic refresh, guarded by the 30 s throttle + single-flight mutex.
-    void engine.refresh().catch(() => undefined);
+    void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
     res.json(engine.buildDashboardData());
   });
 
-  app.post("/api/refresh", async (_req, res) => {
-    const r = await engine.refresh({ force: true });
+  /**
+   * Manual refresh (human action).
+   *   default        -> dense window scope (<=30 min to kickoff) detail refresh
+   *   ?scope=full    -> explicit all-match detail scan; NOT used by any
+   *                     recurring/automated path
+   *   ?scope=light   -> fixtures + HKJC only
+   */
+  app.post("/api/refresh", async (req, res) => {
+    const scope = String(req.query.scope ?? "window");
+    const mode = scope === "full" ? "full" : scope === "light" ? "lightweight" : "window";
+    const r = await engine.refresh({ force: true, mode });
     res.json({ ...r, status: engine.buildDashboardData().status });
+  });
+
+  /**
+   * Dense pre-kickoff window scan helper — the only automated scan path.
+   * Suitable for later scheduling (cron / external trigger). NO SCHEDULE EXISTS.
+   * Returns NO_WINDOW immediately, with zero provider detail calls, when no
+   * match is within the window.
+   */
+  app.post("/api/scan/window", async (_req, res) => {
+    const outcome = await engine.runScan();
+    res.json(outcome);
+  });
+
+  app.get("/api/scan/window", (_req, res) => {
+    res.json({ config: engine.scanConfigInfo(), inWindow: engine.windowPreview() });
   });
 
   app.get("/api/opportunities", (_req, res) => {

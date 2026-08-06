@@ -33,7 +33,7 @@ export interface ProviderFetchResult {
 
 /** Every provider adapter is isolated behind this interface and is replaceable. */
 export interface OddsProvider {
-  readonly name: "hkjc" | "crown";
+  readonly name: "hkjc" | "pinnacle";
   /** Pre-match events with raw tradeable decimal prices. Never in-play. */
   fetchPreMatch(opts?: { windowMinutes?: number; matchIds?: string[] }): Promise<ProviderFetchResult>;
 }

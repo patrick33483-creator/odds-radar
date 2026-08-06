@@ -5,8 +5,8 @@
  *  - Asian handicap is stored as `homeHandicap`: the goal adjustment applied to the
  *    HOME team. Negative = home gives (主讓). Positive = home receives (受讓).
  *    HKJC's `HDC.condition` already uses this convention ("0.0/-0.5" => -0.25).
- *    titan007/Crown's `goals` attribute uses the OPPOSITE sign (positive = home
- *    gives), so Crown values must be negated on ingest.
+ *    titan007/Pinnacle's `goals` attribute uses the OPPOSITE sign (positive = home
+ *    gives), so Pinnacle values must be negated on ingest.
  *  - Totals are stored as a positive `total`.
  *  - Both are snapped to quarter (0.25) increments. Anything that does not land on
  *    a quarter increment is rejected rather than silently rounded away.
@@ -67,10 +67,10 @@ export function parseHkjcTotal(condition: string): number | null {
 }
 
 /**
- * Crown/titan007 `goals` attribute -> normalized home handicap.
+ * Pinnacle/titan007 `goals` attribute -> normalized home handicap.
  * titan007: positive = home gives. Ours: negative = home gives.
  */
-export function parseCrownHandicap(goals: string | number): number | null {
+export function parsePinnacleHandicap(goals: string | number): number | null {
   const n = typeof goals === "number" ? goals : Number(String(goals).trim());
   if (!Number.isFinite(n)) return null;
   const v = snapToQuarter(-n) || 0; // normalize -0 to 0
@@ -78,7 +78,7 @@ export function parseCrownHandicap(goals: string | number): number | null {
   return v;
 }
 
-export function parseCrownTotal(goals: string | number): number | null {
+export function parsePinnacleTotal(goals: string | number): number | null {
   const n = typeof goals === "number" ? goals : Number(String(goals).trim());
   if (!Number.isFinite(n) || n < 0) return null;
   const v = snapToQuarter(n);

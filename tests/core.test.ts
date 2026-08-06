@@ -5,15 +5,15 @@ import {
   hkToDecimal,
   isQuarterStep,
   lineKeyOf,
-  parseCrownHandicap,
-  parseCrownTotal,
+  parsePinnacleHandicap,
+  parsePinnacleTotal,
   parseHkjcHandicap,
   parseHkjcTotal,
   splitLine,
 } from "../server/lib/lines";
 import { findThreeWayArb, findTwoWayArb, planStakes, totalProbability } from "../server/lib/arb";
 import { evaluateEv, margin, noVigProbs } from "../server/lib/ev";
-import { buildSynthetic, syntheticCoversCrown } from "../server/lib/synthetic";
+import { buildSynthetic, syntheticCoversPinnacle } from "../server/lib/synthetic";
 import { matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
 import { legReturn, settle1X2, settleHandicap, settleTotal } from "../server/lib/settlement";
@@ -44,13 +44,13 @@ describe("line normalization", () => {
     expect(parseHkjcTotal("3.0")).toBe(3);
   });
 
-  it("flips the Crown handicap sign (titan007 positive = home gives)", () => {
-    expect(parseCrownHandicap("1.5")).toBe(-1.5);
-    expect(parseCrownHandicap("0.25")).toBe(-0.25);
-    expect(parseCrownHandicap("-0.75")).toBe(0.75);
-    expect(parseCrownHandicap("0")).toBe(0);
-    expect(parseCrownTotal("2.25")).toBe(2.25);
-    expect(parseCrownHandicap("x")).toBeNull();
+  it("flips the Pinnacle handicap sign (titan007 positive = home gives)", () => {
+    expect(parsePinnacleHandicap("1.5")).toBe(-1.5);
+    expect(parsePinnacleHandicap("0.25")).toBe(-0.25);
+    expect(parsePinnacleHandicap("-0.75")).toBe(0.75);
+    expect(parsePinnacleHandicap("0")).toBe(0);
+    expect(parsePinnacleTotal("2.25")).toBe(2.25);
+    expect(parsePinnacleHandicap("x")).toBeNull();
   });
 
   it("keeps a stable comparison key and display form", () => {
@@ -93,13 +93,13 @@ describe("arbitrage stake math", () => {
     const arb = findTwoWayArb({
       ...base,
       hkjc: { selection: "H", decimalOdds: 2.2 },
-      crown: { selection: "A", decimalOdds: 2.1 },
+      pinnacle: { selection: "A", decimalOdds: 2.1 },
     });
     expect(arb).not.toBeNull();
     expect(arb!.q).toBeCloseTo(1 / 2.2 + 1 / 2.1, 6);
-    const crownLeg = arb!.legs.find((l) => l.provider === "crown")!;
+    const pinnacleLeg = arb!.legs.find((l) => l.provider === "pinnacle")!;
     const hkjcLeg = arb!.legs.find((l) => l.provider === "hkjc")!;
-    expect(crownLeg.stake).toBe(5000);
+    expect(pinnacleLeg.stake).toBe(5000);
     expect(hkjcLeg.stake).toBeCloseTo((5000 * 2.1) / 2.2, 1);
     expect(arb!.payout).toBeCloseTo(10500, 2);
     expect(arb!.profit).toBeCloseTo(arb!.payout - arb!.totalStake, 2);
@@ -108,13 +108,13 @@ describe("arbitrage stake math", () => {
 
   it("returns null when there is no edge", () => {
     expect(
-      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 1.9 }, crown: { selection: "A", decimalOdds: 1.95 } }),
+      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 1.9 }, pinnacle: { selection: "A", decimalOdds: 1.95 } }),
     ).toBeNull();
   });
 
   it("refuses non-complementary pairs", () => {
     expect(
-      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 2.2 }, crown: { selection: "H", decimalOdds: 2.2 } }),
+      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 2.2 }, pinnacle: { selection: "H", decimalOdds: 2.2 } }),
     ).toBeNull();
   });
 
@@ -125,19 +125,19 @@ describe("arbitrage stake math", () => {
       league: "L",
       kickoffUtc: 0,
       hkjc: { H: 3.5, A: 3.6 },
-      crown: { H: 3.4 },
+      pinnacle: { H: 3.4 },
     });
     expect(partial).toBeNull();
   });
 
-  it("accepts a genuine three-way cover with a Crown leg", () => {
+  it("accepts a genuine three-way cover with a Pinnacle leg", () => {
     const arb = findThreeWayArb({
       matchId: "m1",
       matchLabel: "A vs B",
       league: "L",
       kickoffUtc: 0,
       hkjc: { H: 3.6, D: 3.9, A: 3.8 },
-      crown: { H: 3.4, D: 4.2, A: 3.5 },
+      pinnacle: { H: 3.4, D: 4.2, A: 3.5 },
     });
     expect(arb).not.toBeNull();
     expect(arb!.legs).toHaveLength(3);
@@ -146,7 +146,7 @@ describe("arbitrage stake math", () => {
     for (const p of payouts) expect(p).toBeCloseTo(payouts[0], 0);
   });
 
-  it("requires a Crown leg to anchor the plan", () => {
+  it("requires a Pinnacle leg to anchor the plan", () => {
     expect(
       planStakes([
         { provider: "hkjc", selection: "H", decimalOdds: 2.2, label: "馬會", market: "AH", lineKey: "0.00", lineDisplay: "0" },
@@ -166,7 +166,7 @@ describe("no-vig EV", () => {
     expect(margin([1.96, 1.98])).toBeCloseTo(1 / 1.96 + 1 / 1.98 - 1, 12);
   });
 
-  it("flags an HKJC price above the Crown fair price", () => {
+  it("flags an HKJC price above the Pinnacle fair price", () => {
     const now = Date.now();
     const ops = evaluateEv({
       matchId: "m1",
@@ -176,7 +176,7 @@ describe("no-vig EV", () => {
       market: "AH",
       lineKey: "-0.50",
       lineDisplay: "-0.5",
-      crown: [
+      pinnacle: [
         { selection: "H", decimalOdds: 1.96 },
         { selection: "A", decimalOdds: 1.98 },
       ],
@@ -204,7 +204,7 @@ describe("no-vig EV", () => {
       market: "AH",
       lineKey: "-0.50",
       lineDisplay: "-0.5",
-      crown: [
+      pinnacle: [
         { selection: "H", decimalOdds: 1.96 },
         { selection: "A", decimalOdds: 1.98 },
       ],
@@ -268,11 +268,11 @@ describe("synthetic odds formulas", () => {
     expect(q.homeHandicap).toBe(0.5);
   });
 
-  it("only compares against a Crown leg that is fully covered", () => {
+  it("only compares against a Pinnacle leg that is fully covered", () => {
     const q = buildSynthetic("away", 0.5, inputs, 1000)!;
-    expect(syntheticCoversCrown(q, -0.5, "H")).toBe(true);
-    expect(syntheticCoversCrown(q, -0.5, "A")).toBe(false); // same-side, not a cover
-    expect(syntheticCoversCrown(q, -0.75, "H")).toBe(false); // different line
+    expect(syntheticCoversPinnacle(q, -0.5, "H")).toBe(true);
+    expect(syntheticCoversPinnacle(q, -0.5, "A")).toBe(false); // same-side, not a cover
+    expect(syntheticCoversPinnacle(q, -0.75, "H")).toBe(false); // different line
   });
 });
 
@@ -292,7 +292,7 @@ describe("event matching", () => {
       { id: "9001", league: "欧罗巴杯", homeTeam: "格拉斯哥流浪", awayTeam: "积基朗尼亚", kickoffUtc: ko + 5 * 60_000 },
       { id: "9002", league: "欧罗巴杯", homeTeam: "别的队", awayTeam: "另一队", kickoffUtc: ko },
     ]);
-    expect(d.crownMatchId).toBe("9001");
+    expect(d.pinnacleMatchId).toBe("9001");
     expect(d.confidence).toBeGreaterThan(0.6);
     expect(d.kickoffDeltaSec).toBe(300);
     expect(d.unmatchedReason).toBeNull();
@@ -302,7 +302,7 @@ describe("event matching", () => {
     const d = matchEvent(target, [
       { id: "9001", league: "欧罗巴杯", homeTeam: "格拉斯哥流浪", awayTeam: "積基朗尼亞", kickoffUtc: ko + 20 * 60_000 },
     ]);
-    expect(d.crownMatchId).toBeNull();
+    expect(d.pinnacleMatchId).toBeNull();
     expect(d.unmatchedReason).toBe("no_candidate_in_kickoff_window");
   });
 
@@ -310,7 +310,7 @@ describe("event matching", () => {
     const d = matchEvent(target, [
       { id: "9003", league: "西甲", homeTeam: "皇家馬德里", awayTeam: "巴塞隆拿", kickoffUtc: ko },
     ]);
-    expect(d.crownMatchId).toBeNull();
+    expect(d.pinnacleMatchId).toBeNull();
     expect(d.unmatchedReason).toBe("team_name_similarity_below_floor");
   });
 });
@@ -388,13 +388,13 @@ describe("settlement scenarios", () => {
   }
 
   it("reproduces the recovered end-to-end example (Vancouver 0-1 Atlante)", () => {
-    // Crown away -0.5 @ HK$5,000 wins; HKJC home +0.5 loses.
-    const crown = settleHandicap(0.5, "A", { homeScore: 0, awayScore: 1 });
+    // Pinnacle away -0.5 @ HK$5,000 wins; HKJC home +0.5 loses.
+    const pinnacle = settleHandicap(0.5, "A", { homeScore: 0, awayScore: 1 });
     const hkjc = settleHandicap(0.5, "H", { homeScore: 0, awayScore: 1 });
-    expect(crown).toBe("win");
+    expect(pinnacle).toBe("win");
     expect(hkjc).toBe("loss");
-    const crownReturn = legReturn(crown, 5000, 1.9);
-    expect(crownReturn).toBe(9500);
+    const pinnacleReturn = legReturn(pinnacle, 5000, 1.9);
+    expect(pinnacleReturn).toBe(9500);
     expect(legReturn(hkjc, 4524, 2.1)).toBe(0);
   });
 

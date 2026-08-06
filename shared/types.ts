@@ -1,7 +1,7 @@
 /* Shared DTO / domain types used by both server and client. */
 
 export type Market = "1X2" | "AH" | "OU";
-export type Provider = "hkjc" | "crown";
+export type Provider = "hkjc" | "pinnacle";
 export type Selection = "H" | "D" | "A" | "O" | "U";
 export type AppMode = "live" | "degraded" | "demo";
 
@@ -36,7 +36,7 @@ export interface LineRow {
   lineDisplay: string;
   isMain: boolean;
   hkjc: Partial<Record<Selection, PriceCell>>;
-  crown: Partial<Record<Selection, PriceCell>>;
+  pinnacle: Partial<Record<Selection, PriceCell>>;
   exactLine: boolean; // both books quote this exact normalized line
   totalProbability: number | null; // q for the complementary pair (or 3-way)
   bestQ: number | null;
@@ -53,7 +53,7 @@ export interface MatchRow {
   kickoffUtc: number;
   minutesToKickoff: number;
   matched: boolean;
-  crownMatchId: string | null;
+  pinnacleMatchId: string | null;
   mappingConfidence: number;
   unmatchedReason: string | null;
   lines: LineRow[];
@@ -125,8 +125,8 @@ export interface SyntheticOpportunity {
   syntheticOdds: number;
   formula: string;
   components: BetLeg[];
-  crownOdds: number | null;
-  crownSelection: Selection | null;
+  pinnacleOdds: number | null;
+  pinnacleSelection: Selection | null;
   q: number | null;
   isArb: boolean;
   totalStake: number;
@@ -147,6 +147,43 @@ export interface ProviderStatus {
   itemCount: number;
 }
 
+/** How the replaceable Pinnacle adapter is currently sourcing prices. */
+export interface PinnacleSourceInfo {
+  strategy: "official-api" | "titan007";
+  officialConfigured: boolean;
+  lastRowMatchedBy: "name" | "id-hint" | null;
+  lastRowCompanyId: string | null;
+  warnings: string[];
+}
+
+export type ScanResultCode = "NO_WINDOW" | "NO_ALERT" | "ALERT" | "ERROR";
+
+export interface ScanOutcome {
+  result: ScanResultCode;
+  startedAt: number;
+  finishedAt: number;
+  runtimeMs: number;
+  windowMinutes: number;
+  intervalSec: number;
+  maxRuntimeSec: number;
+  /** Events selected because 0 < minutes_to_kickoff <= windowMinutes. */
+  selected: Array<{ matchId: string; matchLabel: string; minutesToKickoff: number }>;
+  passes: number;
+  detailCalls: number;
+  newOpportunityKeys: string[];
+  message: string;
+}
+
+export interface ScanConfigInfo {
+  windowMinutes: number;
+  intervalSec: number;
+  maxRuntimeSec: number;
+  /** No cron/scheduled task exists — the helper is triggered manually or by a
+   *  scheduler the operator adds later. */
+  scheduleConfigured: false;
+  lastScan: ScanOutcome | null;
+}
+
 export interface StatusResponse {
   now: number;
   mode: AppMode;
@@ -158,6 +195,8 @@ export interface StatusResponse {
   nextRefreshEligibleAt: number;
   degradedReason: string | null;
   providers: ProviderStatus[];
+  pinnacleSource: PinnacleSourceInfo;
+  scan: ScanConfigInfo;
   counts: {
     matches: number;
     matched: number;

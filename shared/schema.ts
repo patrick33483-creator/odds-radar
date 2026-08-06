@@ -15,7 +15,7 @@ export const matches = sqliteTable(
   {
     id: text("id").primaryKey(), // canonical id = "hkjc:<hkjcId>"
     hkjcId: text("hkjc_id").notNull(),
-    crownMatchId: text("crown_match_id"), // titan007 sId once mapped
+    pinnacleMatchId: text("pinnacle_match_id"), // titan007 sId once mapped
     league: text("league").notNull(),
     leagueEn: text("league_en"),
     homeTeam: text("home_team").notNull(),
@@ -29,7 +29,7 @@ export const matches = sqliteTable(
   },
   (t) => ({
     koIdx: index("matches_kickoff_idx").on(t.kickoffUtc),
-    crownIdx: index("matches_crown_idx").on(t.crownMatchId),
+    pinnacleIdx: index("matches_pinnacle_idx").on(t.pinnacleMatchId),
   }),
 );
 
@@ -56,7 +56,7 @@ export const oddsSnapshots = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     matchId: text("match_id").notNull(),
-    provider: text("provider").notNull(), // 'hkjc' | 'crown'
+    provider: text("provider").notNull(), // 'hkjc' | 'pinnacle'
     market: text("market").notNull(),
     lineKey: text("line_key").notNull(),
     selection: text("selection").notNull(), // H/D/A | O/U
@@ -98,7 +98,7 @@ export const teamAliases = sqliteTable(
     id: integer("id").primaryKey({ autoIncrement: true }),
     canonical: text("canonical").notNull(), // normalized simplified-Chinese key
     alias: text("alias").notNull(),
-    provider: text("provider").notNull(), // 'hkjc' | 'crown'
+    provider: text("provider").notNull(), // 'hkjc' | 'pinnacle'
     confirmedAt: integer("confirmed_at").notNull(),
   },
   (t) => ({
@@ -107,12 +107,12 @@ export const teamAliases = sqliteTable(
   }),
 );
 
-/** Persistent HKJC <-> Crown event mapping with confidence + reason. */
+/** Persistent HKJC <-> Pinnacle event mapping with confidence + reason. */
 export const matchMapping = sqliteTable(
   "match_mapping",
   {
     matchId: text("match_id").primaryKey(),
-    crownMatchId: text("crown_match_id"),
+    pinnacleMatchId: text("pinnacle_match_id"),
     confidence: real("confidence").notNull().default(0),
     method: text("method").notNull(), // 'time+league+alias' | 'manual' | 'cached'
     kickoffDeltaSec: integer("kickoff_delta_sec"),
@@ -120,7 +120,7 @@ export const matchMapping = sqliteTable(
     updatedAt: integer("updated_at").notNull(),
   },
   (t) => ({
-    crown: index("match_mapping_crown_idx").on(t.crownMatchId),
+    pinnacle: index("match_mapping_pinnacle_idx").on(t.pinnacleMatchId),
   }),
 );
 
@@ -185,7 +185,7 @@ export const simulationLegs = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     betId: integer("bet_id").notNull(),
-    provider: text("provider").notNull(), // 'hkjc' | 'crown'
+    provider: text("provider").notNull(), // 'hkjc' | 'pinnacle'
     market: text("market").notNull(),
     lineKey: text("line_key").notNull(),
     selection: text("selection").notNull(),
@@ -206,7 +206,7 @@ export const results = sqliteTable(
   "results",
   {
     matchId: text("match_id").primaryKey(),
-    crownMatchId: text("crown_match_id"),
+    pinnacleMatchId: text("pinnacle_match_id"),
     homeScore: integer("home_score").notNull(),
     awayScore: integer("away_score").notNull(),
     halfHome: integer("half_home"),

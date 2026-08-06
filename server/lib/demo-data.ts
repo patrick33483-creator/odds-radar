@@ -5,10 +5,12 @@
  */
 
 import type { ProviderEvent, ProviderPrice, FinalResult } from "../providers/types";
-import type { CrownFixture } from "../providers/crown";
+import type { PinnacleFixture } from "../providers/pinnacle";
 
-const HOUR = 3_600_000;
-const base = () => Date.now() + 2 * HOUR;
+const MINUTE = 60_000;
+/** Demo kickoff sits INSIDE the 30-minute dense-scan window on purpose, so the
+ *  window scanner can be exercised end-to-end without waiting for real fixtures. */
+const base = () => Date.now() + 20 * MINUTE;
 
 const hkjcPrices = (): ProviderPrice[] => [
   { market: "1X2", lineValue: null, isMain: true, selection: "H", decimalOdds: 2.1, sourceUpdatedAt: Date.now() },
@@ -22,11 +24,11 @@ const hkjcPrices = (): ProviderPrice[] => [
   { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 1.78, sourceUpdatedAt: Date.now() },
 ];
 
-const crownPricesFor = (): ProviderPrice[] => [
+const pinnaclePricesFor = (): ProviderPrice[] => [
   { market: "AH", lineValue: -0.5, isMain: true, selection: "H", decimalOdds: 1.96, sourceUpdatedAt: Date.now() },
-  { market: "AH", lineValue: -0.5, isMain: true, selection: "A", decimalOdds: 1.98, sourceUpdatedAt: Date.now() },
+  { market: "AH", lineValue: -0.5, isMain: true, selection: "A", decimalOdds: 2.1, sourceUpdatedAt: Date.now() },
   { market: "OU", lineValue: 2.5, isMain: true, selection: "O", decimalOdds: 1.94, sourceUpdatedAt: Date.now() },
-  { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 1.96, sourceUpdatedAt: Date.now() },
+  { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 2.05, sourceUpdatedAt: Date.now() },
 ];
 
 const hkjcEvents = (): ProviderEvent[] => [
@@ -45,12 +47,12 @@ const hkjcEvents = (): ProviderEvent[] => [
 
 export const DEMO_FIXTURE: {
   hkjc: ProviderEvent[];
-  crownFixtures: CrownFixture[];
-  crownPrices: Record<string, ProviderPrice[]>;
+  pinnacleFixtures: PinnacleFixture[];
+  pinnaclePrices: Record<string, ProviderPrice[]>;
   results: FinalResult[];
 } = {
   hkjc: hkjcEvents(),
-  crownFixtures: [
+  pinnacleFixtures: [
     {
       providerMatchId: "demo-c1",
       league: "示範聯賽",
@@ -66,6 +68,6 @@ export const DEMO_FIXTURE: {
       totalVal: 2.5,
     },
   ],
-  crownPrices: { "demo-c1": crownPricesFor() },
+  pinnaclePrices: { "demo-c1": pinnaclePricesFor() },
   results: [],
 };
