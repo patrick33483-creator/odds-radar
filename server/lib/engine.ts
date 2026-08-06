@@ -32,7 +32,14 @@ import { findThreeWayArb, findTwoWayArb, PINNACLE_FIXED_STAKE } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, STALE_MS } from "./ev";
 import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversPinnacle, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
-import { runWindowScan, scanConfig, selectWindowEvents, type ScanCandidate, type ScanConfig } from "./scan";
+import {
+  isSimulationPurchaseWindow,
+  runWindowScan,
+  scanConfig,
+  selectWindowEvents,
+  type ScanCandidate,
+  type ScanConfig,
+} from "./scan";
 import { aggregateBetStatus, isSettleEligible, legReturn, round2, settleLeg, type LegStatus } from "./settlement";
 import {
   countSnapshots,
@@ -412,7 +419,6 @@ export class RadarEngine {
 
     const dash = this.buildDashboardData();
     this.recordOpportunities(dash, now);
-    this.placeSimulations(dash, now);
     await this.settleDue(false);
     pruneSnapshots(now);
 
@@ -471,7 +477,9 @@ export class RadarEngine {
     );
     const dash = this.buildDashboardData();
     const fresh = this.recordOpportunities(dash, now);
-    this.placeSimulations(dash, now);
+    // Simulation purchases are exclusive to this dense-scan path and to the
+    // events selected for this pass. General/manual refreshes never buy.
+    this.placeSimulations(dash, now, new Set(events.map((e) => e.matchId)));
     this.recomputeDegradedReason();
     // Only a NEW arbitrage (direct or synthetic) stops the loop; EV does not.
     const newArbs = fresh.filter((k) => k.startsWith("arb|") || k.startsWith("synth|"));
@@ -910,7 +918,11 @@ export class RadarEngine {
 
   /* ----------------------------- simulations ---------------------------- */
 
-  private placeSimulations(dash: DashboardResponse, now: number): void {
+  private placeSimulations(dash: DashboardResponse, now: number, scannedMatchIds: ReadonlySet<string>): void {
+    const windowMinutes = scanConfig().windowMinutes;
+    const eligible = (matchId: string, kickoffUtc: number) =>
+      scannedMatchIds.has(matchId) &&
+      isSimulationPurchaseWindow(kickoffUtc, now, windowMinutes);
     const insertBet = rawDb.prepare(
       `INSERT OR IGNORE INTO simulation_bets(unique_key,category,match_id,market,line_key,selection,match_label,league,kickoff_utc,
         total_stake,expected_payout,expected_profit,roi,ev_pct,q_total,placed_at)
@@ -923,6 +935,7 @@ export class RadarEngine {
     const tx = rawDb.transaction(() => {
       /* 情況一 — arb, Pinnacle fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
+        if (!eligible(a.matchId, a.kickoffUtc)) continue;
         const key = `case1_arb|${a.matchId}|${a.lineKey}|${a.market}:${a.legs.map((l) => l.selection).join("")}`;
         const res = insertBet.run(
           key, "case1_arb", a.matchId, a.market, a.lineKey, a.legs[0]?.selection ?? "", a.matchLabel, a.league,
@@ -935,6 +948,7 @@ export class RadarEngine {
       }
       /* 情況二 — EV >= 3%, HKJC fixed 10,000 */
       for (const e of dash.ev) {
+        if (!eligible(e.matchId, e.kickoffUtc)) continue;
         if (!isSafe(e) || e.edge < EV_THRESHOLD) continue;
         const key = `case2_ev|${e.matchId}|${e.lineKey}|${e.market}:${e.selection}`;
         const payout = round2(HKJC_FIXED_STAKE * e.hkjcOdds);
@@ -949,6 +963,7 @@ export class RadarEngine {
       }
       /* 合成賠率 — Pinnacle fixed 5,000, HKJC split by the synthetic formula */
       for (const s of dash.synthetics) {
+        if (!eligible(s.matchId, s.kickoffUtc)) continue;
         if (!s.isArb || !s.pinnacleOdds || !s.pinnacleSelection) continue;
         const key = `synth_arb|${s.matchId}|${s.targetHandicap}|${s.side}`;
         const res = insertBet.run(

@@ -79,6 +79,20 @@ export function selectWindowEvents(
     .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
 }
 
+/**
+ * Final safety gate for simulated purchases. A simulation may only be created
+ * after an opportunity is observed while the match is strictly inside the
+ * pre-kickoff scan window.
+ */
+export function isSimulationPurchaseWindow(
+  kickoffUtc: number,
+  now: number,
+  windowMinutes = 30,
+): boolean {
+  const remaining = kickoffUtc - now;
+  return remaining > 0 && remaining <= windowMinutes * 60_000;
+}
+
 export interface ScanDeps {
   now(): number;
   /** Lightweight fixtures + mapping. MUST NOT make per-match odds detail calls. */

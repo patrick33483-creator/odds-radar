@@ -12,6 +12,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  isSimulationPurchaseWindow,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -72,6 +73,14 @@ describe("window selection", () => {
 
   it("excludes events without a Pinnacle mapping", () => {
     expect(selectWindowEvents([cand({ minutes: 10, pinnacleMatchId: null })], NOW, CFG)).toHaveLength(0);
+  });
+
+  it("allows simulated purchases only strictly before kickoff and within 30 minutes", () => {
+    expect(isSimulationPurchaseWindow(NOW + 30 * 60_000, NOW)).toBe(true);
+    expect(isSimulationPurchaseWindow(NOW + 1, NOW)).toBe(true);
+    expect(isSimulationPurchaseWindow(NOW + 30 * 60_000 + 1, NOW)).toBe(false);
+    expect(isSimulationPurchaseWindow(NOW, NOW)).toBe(false);
+    expect(isSimulationPurchaseWindow(NOW - 1, NOW)).toBe(false);
   });
 });
 
