@@ -1,0 +1,107 @@
+import { normalizeName } from "./matching";
+
+/**
+ * Human-reviewed HKJC Traditional-Chinese -> titan007/Pinnacle Simplified-
+ * Chinese team aliases. Every pair below was verified against an event with
+ * the same kickoff and the same home/away orientation.
+ *
+ * Deliberately excluded: 明尼蘇達聯 vs 堤格雷斯. The source lists that event
+ * with reversed home/away order, so aliasing it without an orientation-aware
+ * price transform would invert the Asian-handicap meaning.
+ */
+export const TEAM_ALIAS_SEED_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ["FC獅子", "昆士兰狮队"],
+  ["布里斯班獅吼B隊", "布里斯班狮吼青年队"],
+  ["華川FC女足", "华川KSPO女足"],
+  ["慶州FC女足", "庆州FC女足"],
+  ["水原藍翼", "水原三星"],
+  ["金海FC", "金海"],
+  ["金浦FC", "金浦市民"],
+  ["忠北清州", "忠北清州"],
+  ["FC慶南", "庆南FC"],
+  ["FC大邱", "大邱FC"],
+  ["FC華城", "华城FC"],
+  ["首爾衣戀", "首尔衣恋"],
+  ["龍仁FC", "龙仁FC"],
+  ["釜山偶像", "釜山偶像"],
+  ["艾達治", "阿尔塔奇"],
+  ["堤洛爾", "WSG蒂罗尔"],
+  ["甘堡爾", "坎布尔"],
+  ["精英隊", "SBV精英"],
+  ["安曼", "埃门"],
+  ["洛達", "罗达JC"],
+  ["維迪斯", "维特斯"],
+  ["華域克", "瓦尔韦克"],
+  ["波琴", "波鸿"],
+  ["哈化柏林", "柏林赫塔"],
+  ["韋甘比", "韦康比流浪者"],
+  ["史提芬納治", "斯蒂文尼奇"],
+  ["米杜士堡", "米德尔斯堡"],
+  ["域斯咸", "雷克瑟姆"],
+  ["艾斯杜尼", "埃斯托里尔"],
+  ["法馬利卡奧", "法马利康"],
+  ["切洛拉高", "塞罗拉尔戈"],
+  ["拿斯派達斯青年", "尤文提度"],
+  ["羅沙里奧中央", "罗萨里奥中央"],
+  ["阿度斯維", "阿尔多斯维"],
+  ["奧柏拉里奧", "欧帕尔利奥"],
+  ["聖貝拿度", "圣贝纳多"],
+  ["施亞拉", "塞阿拉"],
+  ["邦迪比達", "庞特普雷塔"],
+  ["利華達維亞獨立", "门多萨独立"],
+  ["里奧古亞圖學生隊", "里奥夸尔托学生队"],
+  ["杜蘭高蠍子", "杜兰戈"],
+  ["派拉達斯FC", "皮拉塔斯"],
+  ["特帕蒂特蘭", "帕蒂特兰德莫雷洛斯"],
+  ["拉巴斯體育會", "拉巴斯竞技"],
+  ["曼利聯", "曼立联队"],
+  ["馬可尼駿馬", "马可尼"],
+  ["南區奇兵", "SD公鹿FC"],
+  ["西悉尼流浪者B隊", "西悉尼流浪者青年队"],
+  ["NWS精神", "北部精神"],
+  ["黑鎮城", "黑镇市足球俱乐部"],
+  ["魔術聯", "魔法联合TFA"],
+  ["羅奇代爾流浪", "罗切达尔流浪"],
+  ["聖佐治FC", "FC圣乔治"],
+  ["萊卡特", "莱卡特老虎"],
+  ["達斯泰特", "达姆施塔特"],
+  ["基爾", "荷尔斯泰因"],
+  ["海登咸", "海登海姆"],
+  ["奧斯納貝克", "奥斯纳布鲁克"],
+  ["華拉倫加", "瓦勒伦加"],
+  ["波杜基林特", "博德闪耀"],
+  ["奧基迪", "奥尔格里特"],
+  ["AIK蘇納", "索尔纳"],
+  ["登地", "邓迪FC"],
+  ["鴨巴甸", "阿伯丁"],
+  ["聖美倫", "圣米伦"],
+  ["聖莊士東", "圣约翰斯通"],
+  ["丹保殊", "邓伯什"],
+  ["阿梅爾城", "阿尔梅勒城"],
+  ["格拉茨體育會", "格拉茨AK"],
+  ["奧地利路斯登洛", "奥地利卢斯特瑙"],
+  ["米贊比", "米亚尔比"],
+  ["艾夫斯堡", "埃尔夫斯堡"],
+  ["史達", "斯达"],
+  ["費德列斯達", "腓特烈斯塔"],
+  ["甘馬雷斯", "吉马良斯"],
+  ["阿洛卡", "阿罗卡"],
+  ["燕豪芬", "埃因霍温"],
+  ["幸運薛達", "福图纳锡塔德"],
+  ["禾夫斯堡", "沃尔夫斯堡"],
+  ["凱沙羅頓", "凯泽斯劳滕"],
+  ["艾馬多拉", "阿马多拉"],
+  ["士砵亭", "葡萄牙体育"],
+];
+
+export function teamAliasSeedRows(): Array<{
+  canonical: string;
+  hkjcAlias: string;
+  pinnacleAlias: string;
+}> {
+  return TEAM_ALIAS_SEED_PAIRS.map(([hkjc, pinnacle]) => ({
+    canonical: `seed:${normalizeName(hkjc)}`,
+    hkjcAlias: normalizeName(hkjc),
+    pinnacleAlias: normalizeName(pinnacle),
+  }));
+}

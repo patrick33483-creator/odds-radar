@@ -32,6 +32,7 @@ import { findThreeWayArb, findTwoWayArb, PINNACLE_FIXED_STAKE } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, STALE_MS } from "./ev";
 import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversPinnacle, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
+import { teamAliasSeedRows } from "./team-alias-seeds";
 import {
   isSimulationPurchaseWindow,
   runWindowScan,
@@ -221,6 +222,20 @@ export class RadarEngine {
     return { get: (provider, alias) => map.get(`${provider}:${alias}`) };
   }
 
+  /** Persist reviewed aliases without overwriting aliases learned from live matches. */
+  private seedTeamAliases(now: number): void {
+    const stmt = rawDb.prepare(
+      "INSERT OR IGNORE INTO team_aliases(canonical,alias,provider,confirmed_at) VALUES(?,?,?,?)",
+    );
+    const tx = rawDb.transaction(() => {
+      for (const seed of teamAliasSeedRows()) {
+        stmt.run(seed.canonical, seed.hkjcAlias, "hkjc", now);
+        stmt.run(seed.canonical, seed.pinnacleAlias, "pinnacle", now);
+      }
+    });
+    tx();
+  }
+
   /* --------------------------- refresh stages --------------------------- */
 
   /** HKJC pre-match snapshot. ONE upstream GraphQL call for every match. */
@@ -280,6 +295,7 @@ export class RadarEngine {
       this.fixtureCache = { at: Date.now(), rows };
     }
     const fixtures = this.fixtureCache.rows;
+    this.seedTeamAliases(now);
     const aliases = this.aliasIndex();
     const candidates: CandidateEvent[] = fixtures.map((f) => ({
       id: f.providerMatchId,

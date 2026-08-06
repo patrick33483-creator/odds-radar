@@ -18,6 +18,7 @@ import { evaluateEv, margin, noVigProbs } from "../server/lib/ev";
 import { buildSynthetic, syntheticCoversPinnacle } from "../server/lib/synthetic";
 import { matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
+import { teamAliasSeedRows, TEAM_ALIAS_SEED_PAIRS } from "../server/lib/team-alias-seeds";
 import { legReturn, settle1X2, settleHandicap, settleTotal } from "../server/lib/settlement";
 
 /* ----------------------------- normalization ----------------------------- */
@@ -327,6 +328,28 @@ describe("event matching", () => {
     ]);
     expect(d.pinnacleMatchId).toBeNull();
     expect(d.unmatchedReason).toBe("team_name_similarity_below_floor");
+  });
+
+  it("uses reviewed team aliases without lowering the global similarity floor", () => {
+    const rows = teamAliasSeedRows();
+    const aliasMap = new Map<string, string>();
+    for (const r of rows) {
+      aliasMap.set(`hkjc:${r.hkjcAlias}`, r.canonical);
+      aliasMap.set(`pinnacle:${r.pinnacleAlias}`, r.canonical);
+    }
+    const aliases = {
+      get: (provider: "hkjc" | "pinnacle", alias: string) =>
+        aliasMap.get(`${provider}:${alias}`),
+    };
+    const d = matchEvent(
+      { id: "hkjc:altach", league: "奧地利甲組聯賽", homeTeam: "艾達治", awayTeam: "堤洛爾", kickoffUtc: ko },
+      [{ id: "3010606", league: "奥甲", homeTeam: "阿尔塔奇", awayTeam: "WSG蒂罗尔", kickoffUtc: ko }],
+      aliases,
+    );
+    expect(d.pinnacleMatchId).toBe("3010606");
+    expect(d.unmatchedReason).toBeNull();
+    expect(d.confidence).toBeGreaterThanOrEqual(0.85);
+    expect(TEAM_ALIAS_SEED_PAIRS.some(([h]) => h === "明尼蘇達聯")).toBe(false);
   });
 });
 
