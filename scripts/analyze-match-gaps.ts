@@ -1,13 +1,15 @@
 import { db, matchMapping, matches } from "../server/lib/store";
 import {
   KICKOFF_TOLERANCE_MS,
+  leagueSimilarity,
   scoreCandidate,
+  similarity,
   type CandidateEvent,
 } from "../server/lib/matching";
 import { PinnacleProvider } from "../server/providers/pinnacle";
 
 const provider = new PinnacleProvider();
-const fixtures = await provider.fetchFixtures([0, 1, 2]);
+const fixtures = await provider.fetchFixtures([0, 1, 2, 3, 4]);
 const targetReason =
   process.env.MATCH_GAP_REASON ?? "team_name_similarity_below_floor";
 const candidates: CandidateEvent[] = fixtures.map((f) => ({
@@ -40,6 +42,24 @@ const rows = gaps.map((m) => {
     .map((c) => ({ c, score: scoreCandidate(target, c) }))
     .sort((a, b) => b.score.score - a.score.score)
     .slice(0, 4);
+  const nearestByIdentity = candidates
+    .map((c) => {
+      const homeScore = similarity(m.homeTeam, c.homeTeam);
+      const awayScore = similarity(m.awayTeam, c.awayTeam);
+      const leagueScore = leagueSimilarity(m.league, c.league);
+      const identityScore = 0.425 * homeScore + 0.425 * awayScore + 0.15 * leagueScore;
+      return {
+        ...c,
+        deltaMin: Math.round((c.kickoffUtc - m.kickoffUtc) / 60_000),
+        homeScore,
+        awayScore,
+        leagueScore,
+        identityScore,
+      };
+    })
+    .filter((c) => c.homeScore >= 0.35 || c.awayScore >= 0.35)
+    .sort((a, b) => b.identityScore - a.identityScore)
+    .slice(0, 5);
   return {
     hkjc: {
       id: m.id,
@@ -55,6 +75,7 @@ const rows = gaps.map((m) => {
       deltaSec: Math.round((c.kickoffUtc - m.kickoffUtc) / 1000),
       ...score,
     })),
+    nearestByIdentity,
   };
 });
 

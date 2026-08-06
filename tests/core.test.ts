@@ -308,6 +308,10 @@ describe("event matching", () => {
     expect(leagueSimilarity("日本職業聯賽", "日职联")).toBe(1);
     expect(leagueSimilarity("澳洲全國聯賽 - 昆士蘭", "澳昆超")).toBe(1);
     expect(leagueSimilarity("北美聯賽盃", "中北美杯")).toBe(1);
+    expect(leagueSimilarity("瑞典超級聯賽", "瑞典超")).toBe(1);
+    expect(leagueSimilarity("丹麥超級聯賽", "丹麦超")).toBe(1);
+    expect(leagueSimilarity("葡萄牙超級聯賽", "葡超")).toBe(1);
+    expect(leagueSimilarity("德國乙組聯賽", "德乙")).toBe(1);
     expect(leagueSimilarity("荷蘭乙組聯賽", "德乙")).toBeLessThan(1);
   });
 
@@ -368,6 +372,15 @@ describe("event matching", () => {
     expect(d.unmatchedReason).toBeNull();
     expect(d.confidence).toBeGreaterThanOrEqual(0.85);
     expect(TEAM_ALIAS_SEED_PAIRS.some(([h]) => h === "明尼蘇達聯")).toBe(false);
+
+    const helmond = matchEvent(
+      { id: "hkjc:helmond", league: "荷蘭乙組聯賽", homeTeam: "靴蒙特", awayTeam: "迪加史卓普", kickoffUtc: ko },
+      [{ id: "helmond", league: "荷乙", homeTeam: "赫尔蒙德", awayTeam: "格拉夫夏普", kickoffUtc: ko }],
+      aliases,
+    );
+    expect(helmond.pinnacleMatchId).toBe("helmond");
+    expect(helmond.unmatchedReason).toBeNull();
+    expect(helmond.confidence).toBe(1);
   });
 });
 

@@ -53,6 +53,10 @@ const LEAGUE_ALIAS_GROUPS: ReadonlyArray<ReadonlyArray<string>> = [
   ["日本職業聯賽", "日职联"],
   ["日本乙組聯賽", "日职乙"],
   ["荷蘭甲組聯賽", "荷甲"],
+  ["瑞典超級聯賽", "瑞典超"],
+  ["丹麥超級聯賽", "丹麦超"],
+  ["葡萄牙超級聯賽", "葡超"],
+  ["德國乙組聯賽", "德乙"],
 ];
 
 /** Provider-agnostic canonical key for a team or league name. */

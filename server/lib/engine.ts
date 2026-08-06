@@ -291,7 +291,13 @@ export class RadarEngine {
   private async refreshPinnacleFixtures(): Promise<number> {
     const now = Date.now();
     if (!this.fixtureCache || Date.now() - this.fixtureCache.at > FIXTURE_CACHE_MS) {
-      const rows = DEMO ? DEMO_FIXTURE.pinnacleFixtures : await this.pinnacle.fetchFixtures([0, 1]);
+      // HKJC regularly publishes fixtures several days ahead. Load only the
+      // lightweight Pinnacle schedule index for the same practical horizon so
+      // future events enter the candidate pool; this does NOT request any
+      // per-match odds detail outside the dense pre-kickoff scan window.
+      const rows = DEMO
+        ? DEMO_FIXTURE.pinnacleFixtures
+        : await this.pinnacle.fetchFixtures([0, 1, 2, 3, 4]);
       this.fixtureCache = { at: Date.now(), rows };
     }
     const fixtures = this.fixtureCache.rows;
