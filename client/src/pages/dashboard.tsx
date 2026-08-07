@@ -443,8 +443,8 @@ export default function Dashboard() {
                                     <div className="space-y-0.5 text-[11px]" data-testid={`detail-synthetic-${m.id}`}>
                                       {m.synthetics.map((s) => (
                                         <p key={s.key} className={cn("tnum", s.isArb ? "text-positive" : "text-muted-foreground")}>
-                                          {s.side === "away" ? "客" : "主"}受讓 {s.lineDisplay} 合成 {fmtOdds(s.syntheticOdds)} · 平博對立{" "}
-                                          {fmtOdds(s.pinnacleOdds)} · 總機率 {fmtPct(s.q)}
+                                          {s.side === "away" ? "客" : "主"}受讓 {s.lineDisplay} 合成 {fmtOdds(s.syntheticOdds)} · 皇冠對立{" "}
+                                          {fmtOdds(s.crownOdds)} · 總機率 {fmtPct(s.q)}
                                           {s.isArb ? " · 鎖利" : " · 溢價（唔落飛）"}
                                         </p>
                                       ))}
@@ -452,7 +452,7 @@ export default function Dashboard() {
                                     </div>
                                   ) : (
                                     <p className="text-[11px] text-muted-foreground">
-                                      未能砌出合成盤（需要馬會主客和，以及平博同盤路的對立單注）。
+                                      未能砌出合成盤（需要馬會主客和，以及皇冠同盤路的對立單注）。
                                     </p>
                                   )}
                                 </div>
@@ -485,7 +485,7 @@ export default function Dashboard() {
           鎖利（總機率 &lt; 100%）
         </span>
         <span>
-          只做賽前盤 · 原始可交易十進制賠率 · 平博（Pinnacle）無抽水機率為期望值基準 · 鎖利模擬平博一邊固定 HK$5,000、馬會一邊不設上限
+          只做賽前盤 · Pinnacle 無抽水機率只作 EV 基準 · 鎖利及合成鎖利使用皇冠盤，皇冠一邊固定 HK$5,000、馬會一邊反推
         </span>
         <Button
           variant="ghost"

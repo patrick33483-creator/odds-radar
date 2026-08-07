@@ -197,16 +197,16 @@ export function buildSynthetic(
 }
 
 /**
- * Structural validity of comparing a synthetic quote against a Pinnacle single.
- * The Pinnacle leg must be the exact opposite leg on the exact mirrored line, so
+ * Structural validity of comparing a synthetic quote against a Crown single.
+ * The Crown leg must be the exact opposite leg on the exact mirrored line, so
  * that the pair fully covers every outcome.
  */
-export function syntheticCoversPinnacle(
+export function syntheticCoversCrown(
   quote: SyntheticQuote,
-  pinnacleHomeHandicap: number,
-  pinnacleSelection: Selection,
+  crownHomeHandicap: number,
+  crownSelection: Selection,
 ): boolean {
   const needSelection: Selection = quote.side === "away" ? "H" : "A";
-  if (pinnacleSelection !== needSelection) return false;
-  return Math.abs(pinnacleHomeHandicap - quote.homeHandicap) < 1e-9;
+  if (crownSelection !== needSelection) return false;
+  return Math.abs(crownHomeHandicap - quote.homeHandicap) < 1e-9;
 }

@@ -28,9 +28,9 @@ import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
-import { findThreeWayArb, findTwoWayArb, PINNACLE_FIXED_STAKE } from "./arb";
+import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, STALE_MS } from "./ev";
-import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversPinnacle, type SynSide } from "./synthetic";
+import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import {
@@ -134,6 +134,7 @@ export class RadarEngine {
     titan: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>>;
   } | null = null;
   private pinnacleDetail = new Map<string, PinnacleDetailCacheEntry>();
+  private crownDetail = new Map<string, PinnacleDetailCacheEntry>();
   private pinnacleRowsSeen = 0;
   private lastScan: ScanOutcome | null = null;
   private scanning = false;
@@ -497,6 +498,7 @@ export class RadarEngine {
         if (!m?.pinnacleMatchId) continue;
         const minutes = (m.kickoffUtc - Date.now()) / 60_000;
         const ttl = bypassCache ? 0 : pinnacleCacheTtl(minutes);
+        const source = this.sourceMap(m.id);
         const cached = this.pinnacleDetail.get(m.pinnacleMatchId);
         let prices = !bypassCache && cached && Date.now() - cached.at < ttl ? cached.prices : null;
         if (!prices) {
@@ -504,7 +506,6 @@ export class RadarEngine {
             if (DEMO) {
               prices = DEMO_FIXTURE.pinnaclePrices[m.pinnacleMatchId] ?? [];
             } else {
-              const source = this.sourceMap(m.id);
               let opticPrices: ProviderPrice[] = [];
               let titanPrices: ProviderPrice[] = [];
               if (source?.optic_id) {
@@ -537,13 +538,45 @@ export class RadarEngine {
           } catch (err) {
             failed++;
             log("pinnacle_detail_error", { pinnacleMatchId: m.pinnacleMatchId, error: (err as Error).message });
-            continue;
+            prices = [];
           }
         }
         if (prices.length) {
           rows++;
           rawDb.prepare("DELETE FROM odds_latest WHERE match_id=? AND provider='pinnacle'").run(m.id);
           this.persistPrices(m.id, "pinnacle", prices, Date.now());
+        }
+
+        if (!DEMO && source?.titan_id) {
+          const cachedCrown = this.crownDetail.get(source.titan_id);
+          let crownPrices =
+            !bypassCache && cachedCrown && Date.now() - cachedCrown.at < ttl ? cachedCrown.prices : null;
+          if (!crownPrices) {
+            try {
+              crownPrices = await this.pinnacle.fetchCrownMatchPrices(source.titan_id);
+              if (source.titan_reversed) {
+                crownPrices = crownPrices.map((p) =>
+                  p.market === "AH"
+                    ? {
+                        ...p,
+                        lineValue: p.lineValue === null ? null : -p.lineValue,
+                        selection: p.selection === "H" ? "A" : p.selection === "A" ? "H" : p.selection,
+                      }
+                    : p.market === "1X2"
+                      ? { ...p, selection: p.selection === "H" ? "A" : p.selection === "A" ? "H" : p.selection }
+                      : p,
+                );
+              }
+              this.crownDetail.set(source.titan_id, { at: Date.now(), prices: crownPrices });
+            } catch (err) {
+              log("crown_detail_error", { titanId: source.titan_id, error: (err as Error).message });
+              crownPrices = [];
+            }
+          }
+          if (crownPrices.length) {
+            rawDb.prepare("DELETE FROM odds_latest WHERE match_id=? AND provider='crown'").run(m.id);
+            this.persistPrices(m.id, "crown", crownPrices, Date.now());
+          }
         }
       }
     });
@@ -736,7 +769,7 @@ export class RadarEngine {
     return selectWindowEvents(candidates, Date.now(), cfg);
   }
 
-  private persistPrices(matchId: string, provider: "hkjc" | "pinnacle", prices: ProviderPrice[], now: number): void {
+  private persistPrices(matchId: string, provider: "hkjc" | "pinnacle" | "crown", prices: ProviderPrice[], now: number): void {
     const insertSnap = rawDb.prepare(
       "INSERT INTO odds_snapshots(match_id,provider,market,line_key,selection,decimal_odds,source_updated_at,fetched_at,phase) VALUES(?,?,?,?,?,?,?,?,'prematch')",
     );
@@ -828,19 +861,23 @@ export class RadarEngine {
         const market = l.market as Market;
         const sels: Selection[] = market === "1X2" ? ["H", "D", "A"] : market === "AH" ? ["H", "A"] : ["O", "U"];
         const hk: Partial<Record<Selection, PriceCell>> = {};
-        const cr: Partial<Record<Selection, PriceCell>> = {};
+        const pin: Partial<Record<Selection, PriceCell>> = {};
+        const crown: Partial<Record<Selection, PriceCell>> = {};
         for (const s of sels) {
           const a = cell("hkjc", market, l.lineKey, s);
           const b = cell("pinnacle", market, l.lineKey, s);
+          const c = cell("crown", market, l.lineKey, s);
           if (a) hk[s] = a;
-          if (b) cr[s] = b;
+          if (b) pin[s] = b;
+          if (c) crown[s] = c;
         }
         const hasHk = Object.keys(hk).length === sels.length;
-        const hasCr = Object.keys(cr).length === sels.length;
-        const exactLine = hasHk && hasCr;
+        const hasPin = Object.keys(pin).length === sels.length;
+        const hasCrown = Object.keys(crown).length === sels.length;
+        const exactLine = hasHk && hasPin;
         const deltas: Partial<Record<Selection, number>> = {};
         for (const s of sels) {
-          if (hk[s] && cr[s]) deltas[s] = Math.round((hk[s]!.decimalOdds - cr[s]!.decimalOdds) * 1000) / 1000;
+          if (hk[s] && pin[s]) deltas[s] = Math.round((hk[s]!.decimalOdds - pin[s]!.decimalOdds) * 1000) / 1000;
         }
 
         let totalProbability: number | null = null;
@@ -848,40 +885,44 @@ export class RadarEngine {
         let arb: ArbOpportunity | null = null;
 
         if (market === "1X2") {
-          if (hasHk && hasCr) {
-            totalProbability = sels.reduce((acc, s) => acc + 1 / cr[s]!.decimalOdds, 0);
-            bestQ = sels.reduce((acc, s) => acc + 1 / Math.max(hk[s]!.decimalOdds, cr[s]!.decimalOdds), 0);
+          if (hasPin) {
+            totalProbability = sels.reduce((acc, s) => acc + 1 / pin[s]!.decimalOdds, 0);
+          }
+          if (hasHk && hasCrown) {
+            bestQ = sels.reduce((acc, s) => acc + 1 / Math.max(hk[s]!.decimalOdds, crown[s]!.decimalOdds), 0);
             arb = findThreeWayArb({
               matchId: m.id,
               matchLabel,
               league: m.league,
               kickoffUtc: m.kickoffUtc,
               hkjc: { H: hk.H?.decimalOdds, D: hk.D?.decimalOdds, A: hk.A?.decimalOdds },
-              pinnacle: { H: cr.H?.decimalOdds, D: cr.D?.decimalOdds, A: cr.A?.decimalOdds },
+              crown: { H: crown.H?.decimalOdds, D: crown.D?.decimalOdds, A: crown.A?.decimalOdds },
             });
           }
-        } else if (exactLine) {
+        } else {
           const [s1, s2] = sels;
-          const q1 = 1 / hk[s1]!.decimalOdds + 1 / cr[s2]!.decimalOdds;
-          const q2 = 1 / hk[s2]!.decimalOdds + 1 / cr[s1]!.decimalOdds;
-          bestQ = Math.min(q1, q2);
-          totalProbability = 1 / cr[s1]!.decimalOdds + 1 / cr[s2]!.decimalOdds;
-          const base = {
-            matchId: m.id,
-            matchLabel,
-            league: m.league,
-            kickoffUtc: m.kickoffUtc,
-            market: market as "AH" | "OU",
-            lineKey: l.lineKey,
-            lineDisplay: formatLine(market, l.lineValue),
-          };
-          arb =
-            findTwoWayArb({ ...base, hkjc: { selection: s1, decimalOdds: hk[s1]!.decimalOdds }, pinnacle: { selection: s2, decimalOdds: cr[s2]!.decimalOdds } }) ??
-            findTwoWayArb({ ...base, hkjc: { selection: s2, decimalOdds: hk[s2]!.decimalOdds }, pinnacle: { selection: s1, decimalOdds: cr[s1]!.decimalOdds } });
+          if (hasPin) totalProbability = 1 / pin[s1]!.decimalOdds + 1 / pin[s2]!.decimalOdds;
+          if (hasHk && hasCrown) {
+            const q1 = 1 / hk[s1]!.decimalOdds + 1 / crown[s2]!.decimalOdds;
+            const q2 = 1 / hk[s2]!.decimalOdds + 1 / crown[s1]!.decimalOdds;
+            bestQ = Math.min(q1, q2);
+            const base = {
+              matchId: m.id,
+              matchLabel,
+              league: m.league,
+              kickoffUtc: m.kickoffUtc,
+              market: market as "AH" | "OU",
+              lineKey: l.lineKey,
+              lineDisplay: formatLine(market, l.lineValue),
+            };
+            arb =
+              findTwoWayArb({ ...base, hkjc: { selection: s1, decimalOdds: hk[s1]!.decimalOdds }, crown: { selection: s2, decimalOdds: crown[s2]!.decimalOdds } }) ??
+              findTwoWayArb({ ...base, hkjc: { selection: s2, decimalOdds: hk[s2]!.decimalOdds }, crown: { selection: s1, decimalOdds: crown[s1]!.decimalOdds } });
+          }
         }
 
         let lineEv: EvOpportunity[] = [];
-        if (hasCr && Object.keys(hk).length > 0) {
+        if (hasPin && Object.keys(hk).length > 0) {
           lineEv = evaluateEv({
             matchId: m.id,
             matchLabel,
@@ -890,7 +931,7 @@ export class RadarEngine {
             market,
             lineKey: l.lineKey,
             lineDisplay: formatLine(market, l.lineValue),
-            pinnacle: sels.filter((s) => cr[s]).map((s) => ({ selection: s, decimalOdds: cr[s]!.decimalOdds })),
+            pinnacle: sels.filter((s) => pin[s]).map((s) => ({ selection: s, decimalOdds: pin[s]!.decimalOdds })),
             hkjc: sels.filter((s) => hk[s]).map((s) => ({ selection: s, decimalOdds: hk[s]!.decimalOdds, fetchedAt: hk[s]!.fetchedAt })),
             now,
             mappingConfidence: mapping?.confidence ?? 0,
@@ -907,7 +948,7 @@ export class RadarEngine {
           lineDisplay: formatLine(market, l.lineValue),
           isMain: !!l.isMain,
           hkjc: hk,
-          pinnacle: cr,
+          pinnacle: pin,
           exactLine,
           totalProbability: totalProbability === null ? null : Math.round(totalProbability * 1e6) / 1e6,
           bestQ: bestQ === null ? null : Math.round(bestQ * 1e6) / 1e6,
@@ -917,7 +958,7 @@ export class RadarEngine {
         });
       }
 
-      /* synthetic quotes from HKJC 1X2 vs Pinnacle handicap singles */
+      /* synthetic quotes from HKJC 1X2 vs Crown handicap singles */
       const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices);
       synthetics.push(...syn);
 
@@ -967,28 +1008,28 @@ export class RadarEngine {
     for (const side of ["away", "home"] as SynSide[]) {
       const official1 = officialFor(side);
       for (const target of SYNTHETIC_TARGETS) {
-        // Pinnacle must quote the mirrored opposite leg on the exact same line.
-        const pinnacleHomeHandicap = side === "away" ? -target : target;
-        const pinnacleSelection: Selection = side === "away" ? "H" : "A";
-        const pinnacleRow = prices.find(
+        // Crown must quote the mirrored opposite leg on the exact same line.
+        const crownHomeHandicap = side === "away" ? -target : target;
+        const crownSelection: Selection = side === "away" ? "H" : "A";
+        const crownRow = prices.find(
           (p) =>
-            p.provider === "pinnacle" &&
+            p.provider === "crown" &&
             p.market === "AH" &&
-            p.lineKey === pinnacleHomeHandicap.toFixed(2) &&
-            p.selection === pinnacleSelection,
+            p.lineKey === crownHomeHandicap.toFixed(2) &&
+            p.selection === crownSelection,
         );
-        if (!pinnacleRow) continue;
-        const pinnacleOdds = pinnacleRow.decimalOdds;
-        // Pinnacle leg anchored at HK$5,000 -> target payout -> synthetic outlay.
-        const payout = PINNACLE_FIXED_STAKE * pinnacleOdds;
+        if (!crownRow) continue;
+        const crownOdds = crownRow.decimalOdds;
+        // Crown leg anchored at HK$5,000 -> target payout -> synthetic outlay.
+        const payout = CROWN_FIXED_STAKE * crownOdds;
         const probe = buildSynthetic(side, target, { oddsHome, oddsDraw, oddsAway, official1 }, 1000);
         if (!probe) continue;
         const W = payout / probe.odds;
         const quote = buildSynthetic(side, target, { oddsHome, oddsDraw, oddsAway, official1 }, W);
         if (!quote) continue;
-        if (!syntheticCoversPinnacle(quote, pinnacleHomeHandicap, pinnacleSelection)) continue;
-        const q = 1 / quote.odds + 1 / pinnacleOdds;
-        const totalStake = round2(W + PINNACLE_FIXED_STAKE);
+        if (!syntheticCoversCrown(quote, crownHomeHandicap, crownSelection)) continue;
+        const q = 1 / quote.odds + 1 / crownOdds;
+        const totalStake = round2(W + CROWN_FIXED_STAKE);
         const profit = round2(payout - totalStake);
         out.push({
           key: `synth|${matchId}|${side}|${target}`,
@@ -1002,8 +1043,8 @@ export class RadarEngine {
           syntheticOdds: quote.odds,
           formula: quote.formula,
           components: quote.components,
-          pinnacleOdds,
-          pinnacleSelection,
+          crownOdds,
+          crownSelection,
           q: Math.round(q * 1e6) / 1e6,
           isArb: q < 1,
           totalStake,
@@ -1132,7 +1173,7 @@ export class RadarEngine {
        VALUES(?,?,?,?,?,?,?,?,?)`,
     );
     const tx = rawDb.transaction(() => {
-      /* 情況一 — arb, Pinnacle fixed 5,000, HKJC back-calculated */
+      /* 情況一 — arb, Crown fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
         if (!eligible(a.matchId, a.kickoffUtc)) continue;
         const key = `case1_arb|${a.matchId}|${a.lineKey}|${a.market}:${a.legs.map((l) => l.selection).join("")}`;
@@ -1160,10 +1201,10 @@ export class RadarEngine {
           insertLeg.run(betId, "hkjc", e.market, e.lineKey, e.selection, e.hkjcOdds, HKJC_FIXED_STAKE, 0, null);
         }
       }
-      /* 合成賠率 — Pinnacle fixed 5,000, HKJC split by the synthetic formula */
+      /* 合成賠率 — Crown fixed 5,000, HKJC split by the synthetic formula */
       for (const s of dash.synthetics) {
         if (!eligible(s.matchId, s.kickoffUtc)) continue;
-        if (!s.isArb || !s.pinnacleOdds || !s.pinnacleSelection) continue;
+        if (!s.isArb || !s.crownOdds || !s.crownSelection) continue;
         const key = `synth_arb|${s.matchId}|${s.targetHandicap}|${s.side}`;
         const res = insertBet.run(
           key, "synth_arb", s.matchId, "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
@@ -1173,8 +1214,8 @@ export class RadarEngine {
         if (res.changes) {
           const betId = Number(res.lastInsertRowid);
           insertLeg.run(
-            betId, "pinnacle", "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
-            s.pinnacleSelection, s.pinnacleOdds, PINNACLE_FIXED_STAKE, 0, null,
+            betId, "crown", "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
+            s.crownSelection, s.crownOdds, CROWN_FIXED_STAKE, 0, null,
           );
           for (const c of s.components) {
             insertLeg.run(betId, "hkjc", c.market, c.lineKey, c.selection, c.decimalOdds, c.stake, 1, c.syntheticDetail ?? s.formula);

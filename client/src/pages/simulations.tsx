@@ -77,7 +77,7 @@ export default function Simulations() {
               模擬投注紀錄
             </h1>
             <p className="truncate text-[10px] text-muted-foreground">
-              情況一 平博固定 $5,000 · 情況二 馬會固定 $10,000（EV ≥ 3%）· 合成賠率 平博固定 $5,000
+              情況一 皇冠固定 $5,000 · 情況二 馬會固定 $10,000（Pinnacle EV ≥ 3%）· 合成鎖利 皇冠固定 $5,000
             </p>
           </div>
           <div className="ml-auto flex items-center gap-1">
@@ -241,8 +241,8 @@ export default function Simulations() {
                     <div className="space-y-0.5">
                       {b.legs.map((l) => (
                         <p key={l.id} className="tnum text-[10px]">
-                          <span className={l.provider === "pinnacle" ? "text-pinnacle" : l.synthetic ? "text-synthetic" : "text-hkjc"}>
-                            {l.provider === "pinnacle" ? "平博" : l.synthetic ? "馬會合成" : "馬會"}
+                          <span className={l.provider === "crown" ? "text-positive" : l.provider === "pinnacle" ? "text-pinnacle" : l.synthetic ? "text-synthetic" : "text-hkjc"}>
+                            {l.provider === "crown" ? "皇冠" : l.provider === "pinnacle" ? "平博" : l.synthetic ? "馬會合成" : "馬會"}
                           </span>{" "}
                           {SELECTION_LABEL[l.selection]} {l.lineDisplay} @ {fmtOdds(l.decimalOdds)} · HK${fmtMoney(l.stake)}
                           {l.legStatus ? (

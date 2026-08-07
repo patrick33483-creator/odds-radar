@@ -1,7 +1,7 @@
 /* Shared DTO / domain types used by both server and client. */
 
 export type Market = "1X2" | "AH" | "OU";
-export type Provider = "hkjc" | "pinnacle";
+export type Provider = "hkjc" | "pinnacle" | "crown";
 export type Selection = "H" | "D" | "A" | "O" | "U";
 export type AppMode = "live" | "degraded" | "demo";
 
@@ -125,8 +125,8 @@ export interface SyntheticOpportunity {
   syntheticOdds: number;
   formula: string;
   components: BetLeg[];
-  pinnacleOdds: number | null;
-  pinnacleSelection: Selection | null;
+  crownOdds: number | null;
+  crownSelection: Selection | null;
   q: number | null;
   isArb: boolean;
   totalStake: number;

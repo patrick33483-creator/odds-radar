@@ -28,7 +28,13 @@ import {
   selectPinnacleRow,
   BLOCKED_COMPANY_IDS,
 } from "../server/providers/pinnacle-names";
-import { parsePinnacleAsianTriple, parsePinnacle1X2, listBookmakerRows } from "../server/providers/pinnacle";
+import {
+  listBookmakerRows,
+  parseCrown1X2,
+  parseCrownAsianTriple,
+  parsePinnacle1X2,
+  parsePinnacleAsianTriple,
+} from "../server/providers/pinnacle";
 import { parseOpticPrices } from "../server/providers/opticodds";
 
 const NOW = 1_800_000_000_000;
@@ -288,6 +294,20 @@ describe("Pinnacle bookmaker-row identification", () => {
     const js = 'var game = Array("545|1|Crown|1.83|4.05|3.45|50|22|26|92|1.56|4.65|4.50|59|20|20","177|2|Pinnacle|1.78|3.93|3.95|52|23|23|93|1.61|4.63|4.81|59|20|19");';
     const out = parsePinnacle1X2(js);
     expect(out).toEqual({ h: 1.61, d: 4.63, a: 4.81, companyId: "177" });
+  });
+
+  it("selects the Crown row for lock calculations", () => {
+    expect(parseCrownAsianTriple(ASIAN_PAGE)).toEqual({
+      home: 0.97,
+      goals: 1,
+      away: 0.92,
+      companyId: "3",
+    });
+  });
+
+  it("selects Crown by name in the 1X2 feed", () => {
+    const js = 'var game = Array("545|1|Crown|1.83|4.05|3.45|50|22|26|92|1.56|4.65|4.50|59|20|20","177|2|Pinnacle|1.78|3.93|3.95|52|23|23|93|1.61|4.63|4.81|59|20|19");';
+    expect(parseCrown1X2(js)).toEqual({ h: 1.56, d: 4.65, a: 4.5, companyId: "545" });
   });
 });
 

@@ -203,6 +203,21 @@ export function parsePinnacleAsianTriple(html: string): PinnacleRowTriple | null
   return { ...triple, companyId: picked.row.companyId, matchedBy: picked.matchedBy };
 }
 
+function isCrownName(name: string): boolean {
+  const normalized = normalizeBookmakerName(name);
+  return normalized === "crown" || normalized === "crow" || normalized === "皇冠";
+}
+
+/** Crown's current full-time Asian-odds triple from titan007. */
+export function parseCrownAsianTriple(
+  html: string,
+): { home: number; goals: number; away: number; companyId: string } | null {
+  const row = listBookmakerRows(html).find((candidate) => candidate.companyId === "3" || isCrownName(candidate.rawName));
+  if (!row) return null;
+  const triple = rowTriple(row.html);
+  return triple ? { ...triple, companyId: row.companyId } : null;
+}
+
 /**
  * Pinnacle 1X2 from titan007's European-odds JS. That feed carries FULL
  * bookmaker names, so selection is purely name-based.
@@ -216,6 +231,22 @@ export function parsePinnacle1X2(js: string): { h: number; d: number; a: number;
     const name = p[2] ?? "";
     if (!(isPinnacleName(name) || normalizeBookmakerName(name) === "pinnacle")) continue;
     // Field layout: id|oddsId|name|open H|open D|open A|probs...|payout|CURRENT H|CURRENT D|CURRENT A|...
+    const h = Number(p[10]);
+    const d = Number(p[11]);
+    const a = Number(p[12]);
+    if ([h, d, a].every((v) => Number.isFinite(v) && v > 1)) return { h, d, a, companyId: p[0] };
+  }
+  return null;
+}
+
+/** Crown 1X2 from titan007's European-odds JS feed. */
+export function parseCrown1X2(js: string): { h: number; d: number; a: number; companyId: string } | null {
+  const m = js.match(/var\s+game\s*=\s*Array\(([\s\S]*?)\);/);
+  if (!m) return null;
+  const items = Array.from(m[1].matchAll(/"([^"]*)"/g)).map((x) => x[1]);
+  for (const it of items) {
+    const p = it.split("|");
+    if (!isCrownName(p[2] ?? "")) continue;
     const h = Number(p[10]);
     const d = Number(p[11]);
     const a = Number(p[12]);
@@ -349,6 +380,45 @@ export class PinnacleProvider {
       }
     }
     return this.fetchTitanPrices(providerMatchId);
+  }
+
+  /** Crown prices for lock calculations only. Pinnacle remains the EV source. */
+  async fetchCrownMatchPrices(sId: string): Promise<ProviderPrice[]> {
+    const prices: ProviderPrice[] = [];
+    const now = Date.now();
+    const [ah, ou, x2] = await Promise.allSettled([
+      fetchText(`${VIP}/AsianOdds_n.aspx?id=${sId}`, { timeoutMs: 30_000, retries: 1 }),
+      fetchText(`${VIP}/OverDown_n.aspx?id=${sId}`, { timeoutMs: 30_000, retries: 1 }),
+      fetchText(`${X2}/${sId}.js`, { timeoutMs: 20_000, retries: 0 }),
+    ]);
+    if (ah.status === "fulfilled") {
+      const row = parseCrownAsianTriple(ah.value);
+      const lineValue = row ? parsePinnacleHandicap(row.goals) : null;
+      if (row && lineValue !== null) {
+        prices.push({ market: "AH", lineValue, isMain: true, selection: "H", decimalOdds: hkToDecimal(row.home), sourceUpdatedAt: now });
+        prices.push({ market: "AH", lineValue, isMain: true, selection: "A", decimalOdds: hkToDecimal(row.away), sourceUpdatedAt: now });
+      }
+    }
+    if (ou.status === "fulfilled") {
+      const row = parseCrownAsianTriple(ou.value);
+      const lineValue = row ? parsePinnacleTotal(Math.abs(row.goals)) : null;
+      if (row && lineValue !== null) {
+        prices.push({ market: "OU", lineValue, isMain: true, selection: "O", decimalOdds: hkToDecimal(row.home), sourceUpdatedAt: now });
+        prices.push({ market: "OU", lineValue, isMain: true, selection: "U", decimalOdds: hkToDecimal(row.away), sourceUpdatedAt: now });
+      }
+    }
+    if (x2.status === "fulfilled") {
+      const row = parseCrown1X2(x2.value);
+      if (row) {
+        prices.push({ market: "1X2", lineValue: null, isMain: true, selection: "H", decimalOdds: row.h, sourceUpdatedAt: now });
+        prices.push({ market: "1X2", lineValue: null, isMain: true, selection: "D", decimalOdds: row.d, sourceUpdatedAt: now });
+        prices.push({ market: "1X2", lineValue: null, isMain: true, selection: "A", decimalOdds: row.a, sourceUpdatedAt: now });
+      }
+    }
+    if (ah.status === "rejected" && ou.status === "rejected" && x2.status === "rejected") {
+      throw new Error(`Crown detail unavailable for ${sId}: ${(ah.reason as Error)?.message ?? "unknown"}`);
+    }
+    return prices;
   }
 
   private async fetchTitanPrices(sId: string): Promise<ProviderPrice[]> {

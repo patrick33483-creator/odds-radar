@@ -8,13 +8,13 @@
  *  - 1X2 requires ALL THREE outcomes to be covered. Two of three is never
  *    treated as full coverage.
  *  - q = Σ 1/O. Arbitrage only when q < 1.
- *  - Pinnacle leg is fixed at HK$5,000 (user preference); the HKJC stake is
+ *  - Crown leg is fixed at HK$5,000 (user preference); the HKJC stake is
  *    back-calculated for equal payout and is uncapped.
  */
 
 import type { ArbOpportunity, BetLeg, Market, Provider, Selection } from "@shared/types";
 
-export const PINNACLE_FIXED_STAKE = 5000;
+export const CROWN_FIXED_STAKE = 5000;
 
 export function impliedProb(decimalOdds: number): number {
   if (!(decimalOdds > 1)) return Number.POSITIVE_INFINITY;
@@ -48,18 +48,18 @@ export interface StakePlan {
 }
 
 /**
- * Size all legs for an equal payout, anchoring the Pinnacle leg at HK$5,000.
- * When several Pinnacle legs exist (only possible in the 3-way structure) the
- * highest-priced Pinnacle leg is the anchor.
+ * Size all legs for an equal payout, anchoring the Crown leg at HK$5,000.
+ * When several Crown legs exist (only possible in the 3-way structure) the
+ * highest-priced Crown leg is the anchor.
  */
-export function planStakes(legs: LegInput[], pinnacleStake = PINNACLE_FIXED_STAKE): StakePlan | null {
+export function planStakes(legs: LegInput[], crownStake = CROWN_FIXED_STAKE): StakePlan | null {
   if (legs.length < 2) return null;
-  const pinnacleLegs = legs.filter((l) => l.provider === "pinnacle");
-  const anchor = pinnacleLegs.length
-    ? pinnacleLegs.reduce((a, b) => (b.decimalOdds > a.decimalOdds ? b : a))
+  const crownLegs = legs.filter((l) => l.provider === "crown");
+  const anchor = crownLegs.length
+    ? crownLegs.reduce((a, b) => (b.decimalOdds > a.decimalOdds ? b : a))
     : null;
-  if (!anchor) return null; // cross-book structure requires a Pinnacle leg
-  const targetPayout = pinnacleStake * anchor.decimalOdds;
+  if (!anchor) return null; // cross-book structure requires a Crown leg
+  const targetPayout = crownStake * anchor.decimalOdds;
   const out: BetLeg[] = legs.map((l) => ({
     provider: l.provider,
     label: l.label,
@@ -84,9 +84,9 @@ export interface TwoWayInput {
   market: Extract<Market, "AH" | "OU">;
   lineKey: string;
   lineDisplay: string;
-  /** HKJC price for one side and Pinnacle price for the complementary side. */
+  /** HKJC price for one side and Crown price for the complementary side. */
   hkjc: { selection: Selection; decimalOdds: number };
-  pinnacle: { selection: Selection; decimalOdds: number };
+  crown: { selection: Selection; decimalOdds: number };
 }
 
 const COMPLEMENTS: Record<string, string> = { H: "A", A: "H", O: "U", U: "O" };
@@ -96,19 +96,19 @@ export function isComplementaryPair(a: Selection, b: Selection): boolean {
 }
 
 /** Two-way complementary arbitrage on one exact line. Returns null when q >= 1. */
-export function findTwoWayArb(input: TwoWayInput, pinnacleStake = PINNACLE_FIXED_STAKE): ArbOpportunity | null {
-  const { hkjc, pinnacle } = input;
-  if (!isComplementaryPair(hkjc.selection, pinnacle.selection)) return null;
-  if (!(hkjc.decimalOdds > 1) || !(pinnacle.decimalOdds > 1)) return null;
-  const q = impliedProb(hkjc.decimalOdds) + impliedProb(pinnacle.decimalOdds);
+export function findTwoWayArb(input: TwoWayInput, crownStake = CROWN_FIXED_STAKE): ArbOpportunity | null {
+  const { hkjc, crown } = input;
+  if (!isComplementaryPair(hkjc.selection, crown.selection)) return null;
+  if (!(hkjc.decimalOdds > 1) || !(crown.decimalOdds > 1)) return null;
+  const q = impliedProb(hkjc.decimalOdds) + impliedProb(crown.decimalOdds);
   if (!(q < 1)) return null;
   const plan = planStakes(
     [
       {
-        provider: "pinnacle",
-        selection: pinnacle.selection,
-        decimalOdds: pinnacle.decimalOdds,
-        label: "平博",
+        provider: "crown",
+        selection: crown.selection,
+        decimalOdds: crown.decimalOdds,
+        label: "皇冠",
         market: input.market,
         lineKey: input.lineKey,
         lineDisplay: input.lineDisplay,
@@ -123,7 +123,7 @@ export function findTwoWayArb(input: TwoWayInput, pinnacleStake = PINNACLE_FIXED
         lineDisplay: input.lineDisplay,
       },
     ],
-    pinnacleStake,
+    crownStake,
   );
   if (!plan) return null;
   return {
@@ -147,37 +147,37 @@ export interface ThreeWayInput {
   league: string;
   kickoffUtc: number;
   hkjc: Partial<Record<"H" | "D" | "A", number>>;
-  pinnacle: Partial<Record<"H" | "D" | "A", number>>;
+  crown: Partial<Record<"H" | "D" | "A", number>>;
 }
 
 /**
  * 1X2 cover structure. Requires H, D and A to all be available from at least
- * one book, and at least one leg to come from Pinnacle. Picks the best price per
+ * one book, and at least one leg to come from Crown. Picks the best price per
  * outcome. Two of three outcomes is never accepted.
  */
-export function findThreeWayArb(input: ThreeWayInput, pinnacleStake = PINNACLE_FIXED_STAKE): ArbOpportunity | null {
+export function findThreeWayArb(input: ThreeWayInput, crownStake = CROWN_FIXED_STAKE): ArbOpportunity | null {
   const outcomes: Array<"H" | "D" | "A"> = ["H", "D", "A"];
   const picks: LegInput[] = [];
   for (const o of outcomes) {
     const h = input.hkjc[o];
-    const c = input.pinnacle[o];
+    const c = input.crown[o];
     const best = Math.max(h && h > 1 ? h : 0, c && c > 1 ? c : 0);
     if (!(best > 1)) return null; // incomplete coverage -> not an arb
-    const provider: Provider = c && c === best ? "pinnacle" : "hkjc";
+    const provider: Provider = c && c === best ? "crown" : "hkjc";
     picks.push({
       provider,
       selection: o,
       decimalOdds: best,
-      label: provider === "pinnacle" ? "平博" : "馬會",
+      label: provider === "crown" ? "皇冠" : "馬會",
       market: "1X2",
       lineKey: "",
       lineDisplay: "—",
     });
   }
-  if (!picks.some((p) => p.provider === "pinnacle")) return null;
+  if (!picks.some((p) => p.provider === "crown")) return null;
   const q = totalProbability(picks.map((p) => p.decimalOdds));
   if (!(q < 1)) return null;
-  const plan = planStakes(picks, pinnacleStake);
+  const plan = planStakes(picks, crownStake);
   if (!plan) return null;
   return {
     key: `arb|${input.matchId}|1X2||HDA`,

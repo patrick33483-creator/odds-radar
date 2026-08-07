@@ -15,7 +15,7 @@ import {
 } from "../server/lib/lines";
 import { findThreeWayArb, findTwoWayArb, planStakes, totalProbability } from "../server/lib/arb";
 import { evaluateEv, margin, noVigProbs } from "../server/lib/ev";
-import { buildSynthetic, syntheticCoversPinnacle } from "../server/lib/synthetic";
+import { buildSynthetic, syntheticCoversCrown } from "../server/lib/synthetic";
 import { leagueSimilarity, matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
 import { teamAliasSeedRows, TEAM_ALIAS_SEED_PAIRS } from "../server/lib/team-alias-seeds";
@@ -119,13 +119,13 @@ describe("arbitrage stake math", () => {
     const arb = findTwoWayArb({
       ...base,
       hkjc: { selection: "H", decimalOdds: 2.2 },
-      pinnacle: { selection: "A", decimalOdds: 2.1 },
+      crown: { selection: "A", decimalOdds: 2.1 },
     });
     expect(arb).not.toBeNull();
     expect(arb!.q).toBeCloseTo(1 / 2.2 + 1 / 2.1, 6);
-    const pinnacleLeg = arb!.legs.find((l) => l.provider === "pinnacle")!;
+    const crownLeg = arb!.legs.find((l) => l.provider === "crown")!;
     const hkjcLeg = arb!.legs.find((l) => l.provider === "hkjc")!;
-    expect(pinnacleLeg.stake).toBe(5000);
+    expect(crownLeg.stake).toBe(5000);
     expect(hkjcLeg.stake).toBeCloseTo((5000 * 2.1) / 2.2, 1);
     expect(arb!.payout).toBeCloseTo(10500, 2);
     expect(arb!.profit).toBeCloseTo(arb!.payout - arb!.totalStake, 2);
@@ -134,13 +134,13 @@ describe("arbitrage stake math", () => {
 
   it("returns null when there is no edge", () => {
     expect(
-      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 1.9 }, pinnacle: { selection: "A", decimalOdds: 1.95 } }),
+      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 1.9 }, crown: { selection: "A", decimalOdds: 1.95 } }),
     ).toBeNull();
   });
 
   it("refuses non-complementary pairs", () => {
     expect(
-      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 2.2 }, pinnacle: { selection: "H", decimalOdds: 2.2 } }),
+      findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 2.2 }, crown: { selection: "H", decimalOdds: 2.2 } }),
     ).toBeNull();
   });
 
@@ -151,19 +151,19 @@ describe("arbitrage stake math", () => {
       league: "L",
       kickoffUtc: 0,
       hkjc: { H: 3.5, A: 3.6 },
-      pinnacle: { H: 3.4 },
+      crown: { H: 3.4 },
     });
     expect(partial).toBeNull();
   });
 
-  it("accepts a genuine three-way cover with a Pinnacle leg", () => {
+  it("accepts a genuine three-way cover with a Crown leg", () => {
     const arb = findThreeWayArb({
       matchId: "m1",
       matchLabel: "A vs B",
       league: "L",
       kickoffUtc: 0,
       hkjc: { H: 3.6, D: 3.9, A: 3.8 },
-      pinnacle: { H: 3.4, D: 4.2, A: 3.5 },
+      crown: { H: 3.4, D: 4.2, A: 3.5 },
     });
     expect(arb).not.toBeNull();
     expect(arb!.legs).toHaveLength(3);
@@ -172,7 +172,7 @@ describe("arbitrage stake math", () => {
     for (const p of payouts) expect(p).toBeCloseTo(payouts[0], 0);
   });
 
-  it("requires a Pinnacle leg to anchor the plan", () => {
+  it("requires a Crown leg to anchor the plan", () => {
     expect(
       planStakes([
         { provider: "hkjc", selection: "H", decimalOdds: 2.2, label: "馬會", market: "AH", lineKey: "0.00", lineDisplay: "0" },
@@ -294,11 +294,11 @@ describe("synthetic odds formulas", () => {
     expect(q.homeHandicap).toBe(0.5);
   });
 
-  it("only compares against a Pinnacle leg that is fully covered", () => {
+  it("only compares against a Crown leg that is fully covered", () => {
     const q = buildSynthetic("away", 0.5, inputs, 1000)!;
-    expect(syntheticCoversPinnacle(q, -0.5, "H")).toBe(true);
-    expect(syntheticCoversPinnacle(q, -0.5, "A")).toBe(false); // same-side, not a cover
-    expect(syntheticCoversPinnacle(q, -0.75, "H")).toBe(false); // different line
+    expect(syntheticCoversCrown(q, -0.5, "H")).toBe(true);
+    expect(syntheticCoversCrown(q, -0.5, "A")).toBe(false); // same-side, not a cover
+    expect(syntheticCoversCrown(q, -0.75, "H")).toBe(false); // different line
   });
 });
 

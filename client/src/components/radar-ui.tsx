@@ -65,9 +65,9 @@ export function ColdStartBanner({ stage }: { stage: StatusResponse["coldStartSta
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
       <span>
         <strong className="font-semibold">首次載入中</strong>
-        ：正在讀取馬會賽前賠率與 Pinnacle 賽程對照
+        ：正在讀取馬會賽前賠率、Pinnacle EV 基準及皇冠鎖利盤
         {stage === "quick" ? "（輕量模式，不會逐場拉取賠率明細）" : ""}。 平博賠率明細只會在開賽前 30
-        分鐘的密集掃描視窗內抓取，或由你按「更新」手動觸發。
+        分鐘的密集掃描視窗內抓取，或由你按「更新」手動觸發；皇冠盤亦會在同一輪讀取。
       </span>
     </div>
   );
@@ -253,10 +253,14 @@ export function SourceBar({ status }: { status: StatusResponse | undefined }) {
       data-testid="bar-source-status"
     >
       <span data-testid="text-pinnacle-strategy">
-        <span className="mr-1 font-semibold text-pinnacle">Pinnacle 來源</span>
+        <span className="mr-1 font-semibold text-pinnacle">EV：Pinnacle</span>
         {STRATEGY_LABEL[src.strategy] ?? src.strategy}
         {rowNote ? ` · ${rowNote}` : ""}
         {src.strategy === "opticodds-primary" ? "" : src.officialConfigured ? "" : " · 未設定官方憑證（公開 API 於 2025-07-23 起關閉）"}
+      </span>
+      <span data-testid="text-crown-strategy">
+        <span className="mr-1 font-semibold text-positive">鎖利：皇冠</span>
+        titan007 皇冠盤 · 皇冠注碼固定 HK$5,000
       </span>
       <span data-testid="text-scan-policy">
         <span className="mr-1 font-semibold">自動掃描</span>
