@@ -126,6 +126,7 @@ export interface CandidateEvent {
 
 export interface MatchDecision {
   pinnacleMatchId: string | null;
+  reversed: boolean;
   confidence: number;
   method: string;
   kickoffDeltaSec: number | null;
@@ -164,6 +165,14 @@ export function scoreCandidate(
   return { score, nameScore, leagueScore, timeScore };
 }
 
+function scoreCandidateReversed(
+  target: CandidateEvent,
+  cand: CandidateEvent,
+  aliases?: AliasIndex,
+): ReturnType<typeof scoreCandidate> {
+  return scoreCandidate(target, { ...cand, homeTeam: cand.awayTeam, awayTeam: cand.homeTeam }, aliases);
+}
+
 /**
  * Pick the best Pinnacle candidate for one HKJC match.
  * Names alone can never produce a match: the kickoff window is a hard gate.
@@ -179,6 +188,7 @@ export function matchEvent(
   if (inWindow.length === 0) {
     return {
       pinnacleMatchId: null,
+      reversed: false,
       confidence: 0,
       method: "time+league+alias",
       kickoffDeltaSec: null,
@@ -186,14 +196,17 @@ export function matchEvent(
       learnedAliases: [],
     };
   }
-  let best: { cand: CandidateEvent; parts: ReturnType<typeof scoreCandidate> } | null = null;
+  let best: { cand: CandidateEvent; parts: ReturnType<typeof scoreCandidate>; reversed: boolean } | null = null;
   for (const c of inWindow) {
-    const parts = scoreCandidate(target, c, aliases);
-    if (!best || parts.score > best.parts.score) best = { cand: c, parts };
+    const direct = scoreCandidate(target, c, aliases);
+    const reversed = scoreCandidateReversed(target, c, aliases);
+    const pick = reversed.score > direct.score ? { parts: reversed, reversed: true } : { parts: direct, reversed: false };
+    if (!best || pick.parts.score > best.parts.score) best = { cand: c, ...pick };
   }
   if (!best) {
     return {
       pinnacleMatchId: null,
+      reversed: false,
       confidence: 0,
       method: "time+league+alias",
       kickoffDeltaSec: null,
@@ -201,12 +214,13 @@ export function matchEvent(
       learnedAliases: [],
     };
   }
-  const { cand, parts } = best;
+  const { cand, parts, reversed } = best;
   const deltaSec = Math.round((cand.kickoffUtc - target.kickoffUtc) / 1000);
 
   if (parts.nameScore < NAME_FLOOR) {
     return {
       pinnacleMatchId: null,
+      reversed: false,
       confidence: Math.round(parts.score * 1000) / 1000,
       method: "time+league+alias",
       kickoffDeltaSec: deltaSec,
@@ -217,6 +231,7 @@ export function matchEvent(
   if (parts.score < ACCEPT_CONFIDENCE) {
     return {
       pinnacleMatchId: null,
+      reversed: false,
       confidence: Math.round(parts.score * 1000) / 1000,
       method: "time+league+alias",
       kickoffDeltaSec: deltaSec,
@@ -228,15 +243,16 @@ export function matchEvent(
   const canonAway = normalizeName(target.awayTeam);
   return {
     pinnacleMatchId: cand.id,
+    reversed,
     confidence: Math.round(parts.score * 1000) / 1000,
     method: "time+league+alias",
     kickoffDeltaSec: deltaSec,
     unmatchedReason: null,
     learnedAliases: [
       { canonical: canonHome, alias: normalizeName(target.homeTeam), provider: "hkjc" },
-      { canonical: canonHome, alias: normalizeName(cand.homeTeam), provider: "pinnacle" },
+      { canonical: canonHome, alias: normalizeName(reversed ? cand.awayTeam : cand.homeTeam), provider: "pinnacle" },
       { canonical: canonAway, alias: normalizeName(target.awayTeam), provider: "hkjc" },
-      { canonical: canonAway, alias: normalizeName(cand.awayTeam), provider: "pinnacle" },
+      { canonical: canonAway, alias: normalizeName(reversed ? cand.homeTeam : cand.awayTeam), provider: "pinnacle" },
     ],
   };
 }

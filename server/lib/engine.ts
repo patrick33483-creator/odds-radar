@@ -23,6 +23,7 @@
  */
 
 import { PinnacleProvider } from "../providers/pinnacle";
+import { OpticOddsProvider } from "../providers/opticodds";
 import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
@@ -118,6 +119,7 @@ interface HealthPatch {
 export class RadarEngine {
   private readonly hkjc = new HkjcProvider();
   private readonly pinnacle = new PinnacleProvider();
+  private readonly optic = new OpticOddsProvider();
 
   private refreshing = false;
   private inflight: Promise<void> | null = null;
@@ -126,7 +128,11 @@ export class RadarEngine {
   private coldStartStage: StatusResponse["coldStartStage"] = "idle";
   private degradedReason: string | null = null;
 
-  private fixtureCache: { at: number; rows: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>> } | null = null;
+  private fixtureCache: {
+    at: number;
+    optic: Awaited<ReturnType<OpticOddsProvider["fetchFixtures"]>>;
+    titan: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>>;
+  } | null = null;
   private pinnacleDetail = new Map<string, PinnacleDetailCacheEntry>();
   private pinnacleRowsSeen = 0;
   private lastScan: ScanOutcome | null = null;
@@ -297,30 +303,86 @@ export class RadarEngine {
       // lightweight Pinnacle schedule index for the same practical horizon so
       // future events enter the candidate pool; this does NOT request any
       // per-match odds detail outside the dense pre-kickoff scan window.
-      const rows = DEMO
-        ? DEMO_FIXTURE.pinnacleFixtures
-        : await this.pinnacle.fetchFixtures([0, 1, 2, 3, 4]);
-      this.fixtureCache = { at: Date.now(), rows };
+      if (DEMO) {
+        this.fixtureCache = { at: Date.now(), optic: DEMO_FIXTURE.pinnacleFixtures, titan: [] };
+      } else {
+        let optic: Awaited<ReturnType<OpticOddsProvider["fetchFixtures"]>> = [];
+        try {
+          optic = await this.optic.fetchFixtures();
+        } catch (err) {
+          log("optic_fixtures_error", { error: (err as Error).message });
+        }
+        const titan = await this.pinnacle.fetchFixtures([0, 1, 2, 3, 4]);
+        this.fixtureCache = { at: Date.now(), optic, titan };
+      }
     }
-    const fixtures = this.fixtureCache.rows;
+    const opticFixtures = this.fixtureCache.optic;
+    const titanFixtures = this.fixtureCache.titan;
     this.seedTeamAliases(now);
     const aliases = this.aliasIndex();
-    const candidates: CandidateEvent[] = fixtures.map((f) => ({
+    const toCandidates = (fixtures: typeof opticFixtures): CandidateEvent[] => fixtures.map((f) => ({
       id: f.providerMatchId,
       league: f.league,
       homeTeam: f.homeTeam,
       awayTeam: f.awayTeam,
       kickoffUtc: f.kickoffUtc,
     }));
+    const opticCandidates = toCandidates(opticFixtures);
+    const titanCandidates = toCandidates(titanFixtures);
 
     const pending = db.select().from(matches).all().filter((m) => m.kickoffUtc > now - 5 * 60_000);
+    let mapped = 0;
+    const matchWithVerifiedTimeFallback = (
+      target: CandidateEvent,
+      candidates: CandidateEvent[],
+      sourceAliases?: AliasIndex,
+    ) => {
+      const direct = matchEvent(target, candidates, sourceAliases);
+      if (direct.pinnacleMatchId) return direct;
+      const nearby = candidates.filter((c) => Math.abs(c.kickoffUtc - target.kickoffUtc) <= 35 * 60_000);
+      if (!nearby.length) return direct;
+      const originalTimes = new Map(nearby.map((c) => [c.id, c.kickoffUtc]));
+      const retry = matchEvent(
+        target,
+        nearby.map((c) => ({ ...c, kickoffUtc: target.kickoffUtc })),
+        sourceAliases,
+      );
+      if (!retry.pinnacleMatchId || retry.confidence < 0.9) return direct;
+      const original = originalTimes.get(retry.pinnacleMatchId) ?? target.kickoffUtc;
+      return {
+        ...retry,
+        method: "extended-time+league+verified-alias",
+        kickoffDeltaSec: Math.round((original - target.kickoffUtc) / 1000),
+      };
+    };
     const mapTx = rawDb.transaction(() => {
       for (const m of pending) {
-        const decision = matchEvent(
-          { id: m.id, league: m.league, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoffUtc: m.kickoffUtc },
-          candidates,
-          aliases,
-        );
+        const target = { id: m.id, league: m.league, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoffUtc: m.kickoffUtc };
+        const opticTarget = {
+          ...target,
+          league: m.leagueEn || m.league,
+          homeTeam: m.homeTeamEn || m.homeTeam,
+          awayTeam: m.awayTeamEn || m.awayTeam,
+        };
+        const opticDecision = matchWithVerifiedTimeFallback(opticTarget, opticCandidates);
+        const titanDecision = matchWithVerifiedTimeFallback(target, titanCandidates, aliases);
+        const decision = opticDecision.pinnacleMatchId ? opticDecision : titanDecision;
+        const previous = this.sourceMap(m.id);
+        let activeSource = opticDecision.pinnacleMatchId ? "opticodds" : titanDecision.pinnacleMatchId ? "titan007" : null;
+        let activeId = decision.pinnacleMatchId ? `${activeSource === "opticodds" ? "optic" : "titan"}:${decision.pinnacleMatchId}` : null;
+        if (!activeId && m.pinnacleMatchId) {
+          activeId = m.pinnacleMatchId;
+          activeSource = m.pinnacleMatchId.startsWith("optic:") ? "opticodds" : "titan007";
+        }
+        if (activeId) mapped++;
+        const savedDecision = activeId && !decision.pinnacleMatchId
+          ? {
+              confidence: db.select().from(matchMapping).where(eq(matchMapping.matchId, m.id)).get()?.confidence ?? 0.62,
+              method: "preserved-confirmed",
+              kickoffDeltaSec: null,
+              unmatchedReason: null,
+            }
+          : decision;
         rawDb
           .prepare(
             `INSERT INTO match_mapping(match_id,pinnacle_match_id,confidence,method,kickoff_delta_sec,unmatched_reason,updated_at)
@@ -330,9 +392,25 @@ export class RadarEngine {
                kickoff_delta_sec=excluded.kickoff_delta_sec, unmatched_reason=excluded.unmatched_reason,
                updated_at=excluded.updated_at`,
           )
-          .run(m.id, decision.pinnacleMatchId, decision.confidence, decision.method, decision.kickoffDeltaSec, decision.unmatchedReason, now);
-        rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?").run(decision.pinnacleMatchId, m.id);
-        for (const a of decision.learnedAliases) {
+          .run(m.id, activeId, savedDecision.confidence, `opticodds-primary:${savedDecision.method}`, savedDecision.kickoffDeltaSec, savedDecision.unmatchedReason, now);
+        rawDb
+          .prepare(
+            `INSERT INTO pinnacle_source_map(match_id,optic_id,optic_reversed,titan_id,titan_reversed,active_source,updated_at)
+             VALUES(?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET optic_id=excluded.optic_id,
+             optic_reversed=excluded.optic_reversed,titan_id=excluded.titan_id,titan_reversed=excluded.titan_reversed,
+             active_source=excluded.active_source,updated_at=excluded.updated_at`,
+          )
+          .run(
+            m.id,
+            opticDecision.pinnacleMatchId ?? previous?.optic_id ?? null,
+            opticDecision.pinnacleMatchId ? (opticDecision.reversed ? 1 : 0) : (previous?.optic_reversed ?? 0),
+            titanDecision.pinnacleMatchId ?? previous?.titan_id ?? (m.pinnacleMatchId && !m.pinnacleMatchId.startsWith("optic:") ? m.pinnacleMatchId.replace(/^titan:/, "") : null),
+            titanDecision.pinnacleMatchId ? (titanDecision.reversed ? 1 : 0) : (previous?.titan_reversed ?? 0),
+            activeSource,
+            now,
+          );
+        rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?").run(activeId, m.id);
+        for (const a of [...opticDecision.learnedAliases, ...titanDecision.learnedAliases]) {
           if (!a.alias) continue;
           rawDb
             .prepare(
@@ -343,8 +421,60 @@ export class RadarEngine {
       }
     });
     mapTx();
-    log("pinnacle_fixtures", { fixtures: fixtures.length, mapped: pending.length });
-    return fixtures.length;
+    log("pinnacle_fixtures", {
+      opticFixtures: opticFixtures.length,
+      titanFixtures: titanFixtures.length,
+      hkjcMatches: pending.length,
+      mapped,
+    });
+    return opticFixtures.length + titanFixtures.length;
+  }
+
+  private sourceMap(matchId: string): {
+    optic_id: string | null;
+    optic_reversed: number;
+    titan_id: string | null;
+    titan_reversed: number;
+  } | null {
+    return (rawDb
+      .prepare("SELECT optic_id,optic_reversed,titan_id,titan_reversed FROM pinnacle_source_map WHERE match_id=?")
+      .get(matchId) as {
+      optic_id: string | null;
+      optic_reversed: number;
+      titan_id: string | null;
+      titan_reversed: number;
+    } | undefined) ?? null;
+  }
+
+  private needsTitanFallback(matchId: string, opticPrices: ProviderPrice[]): boolean {
+    if (!opticPrices.length) return true;
+    const hk = rawDb
+      .prepare("SELECT market,line_key,selection FROM odds_latest WHERE match_id=? AND provider='hkjc'")
+      .all(matchId) as Array<{ market: string; line_key: string; selection: string }>;
+    const expected = new Map<string, Set<string>>();
+    for (const row of hk) {
+      const key = `${row.market}|${row.line_key}`;
+      const set = expected.get(key) ?? new Set<string>();
+      set.add(row.selection);
+      expected.set(key, set);
+    }
+    const optic = new Set(
+      opticPrices.map((p) => `${p.market}|${lineKeyOf(p.market, p.lineValue)}|${p.selection}`),
+    );
+    for (const [line, selections] of expected) {
+      if (![...selections].every((selection) => optic.has(`${line}|${selection}`))) return true;
+    }
+    return false;
+  }
+
+  private mergePinnaclePrices(primary: ProviderPrice[], fallback: ProviderPrice[]): ProviderPrice[] {
+    const merged = new Map<string, ProviderPrice>();
+    for (const p of primary) merged.set(`${p.market}|${lineKeyOf(p.market, p.lineValue)}|${p.selection}`, p);
+    for (const p of fallback) {
+      const key = `${p.market}|${lineKeyOf(p.market, p.lineValue)}|${p.selection}`;
+      if (!merged.has(key)) merged.set(key, p);
+    }
+    return [...merged.values()];
   }
 
   /**
@@ -371,9 +501,37 @@ export class RadarEngine {
         let prices = !bypassCache && cached && Date.now() - cached.at < ttl ? cached.prices : null;
         if (!prices) {
           try {
-            prices = DEMO
-              ? (DEMO_FIXTURE.pinnaclePrices[m.pinnacleMatchId] ?? [])
-              : await this.pinnacle.fetchMatchPrices(m.pinnacleMatchId);
+            if (DEMO) {
+              prices = DEMO_FIXTURE.pinnaclePrices[m.pinnacleMatchId] ?? [];
+            } else {
+              const source = this.sourceMap(m.id);
+              let opticPrices: ProviderPrice[] = [];
+              let titanPrices: ProviderPrice[] = [];
+              if (source?.optic_id) {
+                try {
+                  opticPrices = await this.optic.fetchMatchPrices(source.optic_id, !!source.optic_reversed);
+                } catch (err) {
+                  log("optic_detail_error", { opticId: source.optic_id, error: (err as Error).message });
+                }
+              }
+              if (source?.titan_id && this.needsTitanFallback(m.id, opticPrices)) {
+                titanPrices = await this.pinnacle.fetchMatchPrices(source.titan_id);
+                if (source.titan_reversed) {
+                  titanPrices = titanPrices.map((p) =>
+                    p.market === "AH"
+                      ? {
+                          ...p,
+                          lineValue: p.lineValue === null ? null : -p.lineValue,
+                          selection: p.selection === "H" ? "A" : p.selection === "A" ? "H" : p.selection,
+                        }
+                      : p.market === "1X2"
+                        ? { ...p, selection: p.selection === "H" ? "A" : p.selection === "A" ? "H" : p.selection }
+                        : p,
+                  );
+                }
+              }
+              prices = this.mergePinnaclePrices(opticPrices, titanPrices);
+            }
             this.pinnacleDetail.set(m.pinnacleMatchId, { at: Date.now(), prices });
             fetched++;
           } catch (err) {
@@ -384,6 +542,7 @@ export class RadarEngine {
         }
         if (prices.length) {
           rows++;
+          rawDb.prepare("DELETE FROM odds_latest WHERE match_id=? AND provider='pinnacle'").run(m.id);
           this.persistPrices(m.id, "pinnacle", prices, Date.now());
         }
       }
@@ -457,7 +616,7 @@ export class RadarEngine {
   private recomputeDegradedReason(): void {
     const health = db.select().from(providerHealth).all();
     const bad = health.filter((h) => !h.ok);
-    const src = this.pinnacle.status();
+    const src = this.pinnacleSourceStatus();
     const srcNote = src.warnings.length ? `（Pinnacle 來源提示：${src.warnings[src.warnings.length - 1]}）` : "";
     this.degradedReason = DEMO
       ? "示範資料模式（DEMO）：畫面數字為樣本，並非真實賠率。"
@@ -885,7 +1044,7 @@ export class RadarEngine {
       nextRefreshEligibleAt: this.nextRefreshEligibleAt(),
       degradedReason: this.degradedReason,
       providers,
-      pinnacleSource: this.pinnacle.status(),
+      pinnacleSource: this.pinnacleSourceStatus(),
       scan: this.scanConfigInfo(),
       counts: {
         matches: rows.length,
@@ -895,6 +1054,21 @@ export class RadarEngine {
         synthetic: syn.filter((s) => s.isArb).length,
         snapshots: countSnapshots(),
       },
+    };
+  }
+
+  private pinnacleSourceStatus(): StatusResponse["pinnacleSource"] {
+    const titan = this.pinnacle.status();
+    const optic = this.optic.status();
+    return {
+      strategy: "opticodds-primary",
+      primary: "opticodds",
+      fallback: "titan007",
+      opticOk: optic.ok,
+      officialConfigured: titan.officialConfigured,
+      lastRowMatchedBy: titan.lastRowMatchedBy,
+      lastRowCompanyId: titan.lastRowCompanyId,
+      warnings: [...optic.warnings, ...titan.warnings].slice(-5),
     };
   }
 
@@ -1035,9 +1209,15 @@ export class RadarEngine {
         for (const b of due) {
           const m = db.select().from(matches).where(eq(matches.id, b.matchId)).get();
           if (!m?.pinnacleMatchId) continue;
-          const r = byPinnacleId.get(m.pinnacleMatchId);
+          const source = this.sourceMap(m.id);
+          const titanId = source?.titan_id ?? (m.pinnacleMatchId.startsWith("titan:") ? m.pinnacleMatchId.slice(6) : m.pinnacleMatchId);
+          const r = byPinnacleId.get(titanId);
           if (!r) continue;
-          stmt.run(b.matchId, m.pinnacleMatchId, r.homeScore, r.awayScore, r.halfHome ?? null, r.halfAway ?? null, r.source, now);
+          const homeScore = source?.titan_reversed ? r.awayScore : r.homeScore;
+          const awayScore = source?.titan_reversed ? r.homeScore : r.awayScore;
+          const halfHome = source?.titan_reversed ? r.halfAway : r.halfHome;
+          const halfAway = source?.titan_reversed ? r.halfHome : r.halfAway;
+          stmt.run(b.matchId, titanId, homeScore, awayScore, halfHome ?? null, halfAway ?? null, r.source, now);
         }
       });
       tx();

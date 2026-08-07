@@ -71,8 +71,8 @@ export default function Dashboard() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] }),
   });
 
-  // Helper trigger for the pre-kickoff dense scan. No schedule exists; this is a
-  // manual trigger of the same code path a scheduler would call later.
+  // Manual trigger for the same pre-kickoff dense-scan path used by the
+  // automatic 30-minute window runner.
   const scan = useMutation({
     mutationFn: async () => {
       await apiRequest("POST", "/api/scan/window");
@@ -257,7 +257,7 @@ export default function Dashboard() {
       </header>
 
       {/* -------------------------------- table ------------------------------ */}
-      <main className="min-h-0 flex-1 overflow-auto">
+      <main className="min-h-0 flex-1 overflow-auto overscroll-x-contain">
         {isLoading ? (
           <TableSkeleton />
         ) : rows.length === 0 ? (
@@ -267,10 +267,19 @@ export default function Dashboard() {
             testId="empty-odds-table"
           />
         ) : (
-          <table className="w-full min-w-[560px] border-separate border-spacing-0 text-xs">
+          <>
+            <div
+              className="sticky left-0 top-0 z-20 border-b border-grid bg-muted/80 px-3 py-1 text-center text-[10px] text-muted-foreground backdrop-blur sm:hidden"
+              data-testid="text-mobile-scroll-hint"
+            >
+              ← 左右滑動查看全部賠率 →
+            </div>
+            <table className="w-full min-w-[560px] border-separate border-spacing-0 text-xs">
             <thead className="sticky top-0 z-10 bg-card">
               <tr className="text-left text-[10px] uppercase tracking-wide text-muted-foreground">
-                <th className="border-b border-grid px-2 py-1.5 font-medium">賽事</th>
+                <th className="sticky left-0 z-20 w-[200px] max-w-[200px] border-b border-grid bg-card px-2 py-1.5 font-medium sm:w-auto sm:max-w-none">
+                  賽事
+                </th>
                 <th className="border-b border-grid px-2 py-1.5 font-medium">盤口</th>
                 {sels.map((s) => (
                   <th key={s} className="border-b border-grid px-2 py-1.5 text-right font-medium">
@@ -293,13 +302,18 @@ export default function Dashboard() {
                       <tr
                         key={rowKey}
                         className={cn(
-                          "align-top hover:bg-accent/40",
+                          "group align-top hover:bg-accent/40",
                           l.arb && "bg-positive/10",
                           idx === 0 && "border-t border-grid",
                         )}
                         data-testid={`row-odds-${rowKey}`}
                       >
-                        <td className="border-b border-grid px-2 py-1.5">
+                        <td
+                          className={cn(
+                            "sticky left-0 z-[5] w-[200px] max-w-[200px] border-b border-grid bg-background px-2 py-1.5 group-hover:bg-accent/40 sm:w-auto sm:max-w-none",
+                            l.arb && "bg-positive/10",
+                          )}
+                        >
                           {idx === 0 ? (
                             <button
                               className="flex items-start gap-1 text-left"
@@ -452,7 +466,8 @@ export default function Dashboard() {
                 }),
               )}
             </tbody>
-          </table>
+            </table>
+          </>
         )}
       </main>
 

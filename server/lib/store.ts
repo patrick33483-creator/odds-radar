@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS match_mapping (
   updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS match_mapping_pinnacle_idx ON match_mapping(pinnacle_match_id);
 
+CREATE TABLE IF NOT EXISTS pinnacle_source_map (
+  match_id TEXT PRIMARY KEY, optic_id TEXT, optic_reversed INTEGER NOT NULL DEFAULT 0,
+  titan_id TEXT, titan_reversed INTEGER NOT NULL DEFAULT 0,
+  active_source TEXT, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS pinnacle_source_map_optic_idx ON pinnacle_source_map(optic_id);
+CREATE INDEX IF NOT EXISTS pinnacle_source_map_titan_idx ON pinnacle_source_map(titan_id);
+
 CREATE TABLE IF NOT EXISTS opportunities (
   key TEXT PRIMARY KEY, category TEXT NOT NULL, match_id TEXT NOT NULL, market TEXT NOT NULL,
   line_key TEXT NOT NULL, selection TEXT NOT NULL, payload TEXT NOT NULL, metric REAL NOT NULL,

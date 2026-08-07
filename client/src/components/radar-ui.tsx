@@ -232,6 +232,7 @@ export function Sparkline({ values, color }: { values: number[]; color: string }
 const STRATEGY_LABEL: Record<string, string> = {
   "official-api": "官方 API（已授權帳戶）",
   titan007: "titan007 公開賠率頁（免憑證）",
+  "opticodds-primary": "OpticOdds 主來源 · titan007 後備補漏",
 };
 
 export function SourceBar({ status }: { status: StatusResponse | undefined }) {
@@ -255,7 +256,7 @@ export function SourceBar({ status }: { status: StatusResponse | undefined }) {
         <span className="mr-1 font-semibold text-pinnacle">Pinnacle 來源</span>
         {STRATEGY_LABEL[src.strategy] ?? src.strategy}
         {rowNote ? ` · ${rowNote}` : ""}
-        {src.officialConfigured ? "" : " · 未設定官方憑證（公開 API 於 2025-07-23 起關閉）"}
+        {src.strategy === "opticodds-primary" ? "" : src.officialConfigured ? "" : " · 未設定官方憑證（公開 API 於 2025-07-23 起關閉）"}
       </span>
       <span data-testid="text-scan-policy">
         <span className="mr-1 font-semibold">自動掃描</span>

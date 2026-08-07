@@ -149,10 +149,13 @@ export interface ProviderStatus {
 
 /** How the replaceable Pinnacle adapter is currently sourcing prices. */
 export interface PinnacleSourceInfo {
-  strategy: "official-api" | "titan007";
+  strategy: "official-api" | "titan007" | "opticodds-primary";
   officialConfigured: boolean;
   lastRowMatchedBy: "name" | "id-hint" | null;
   lastRowCompanyId: string | null;
+  primary: "opticodds";
+  fallback: "titan007";
+  opticOk: boolean;
   warnings: string[];
 }
 

@@ -83,6 +83,16 @@ describe("line normalization", () => {
     expect(isSameHandicapRoad(-0.25, 0.25)).toBe(false);
   });
 
+  it("can match a provider fixture whose home and away order is reversed", () => {
+    const kickoffUtc = Date.now() + 3_600_000;
+    const out = matchEvent(
+      { id: "hk", league: "Cup", homeTeam: "Alpha United", awayTeam: "Beta City", kickoffUtc },
+      [{ id: "optic", league: "Cup", homeTeam: "Beta City", awayTeam: "Alpha United", kickoffUtc }],
+    );
+    expect(out.pinnacleMatchId).toBe("optic");
+    expect(out.reversed).toBe(true);
+  });
+
   it("splits quarter lines and converts HK odds", () => {
     expect(splitLine(-0.25)).toEqual([-0.5, 0]);
     expect(splitLine(-0.5)).toEqual([-0.5]);

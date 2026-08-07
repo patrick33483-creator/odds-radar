@@ -29,6 +29,7 @@ import {
   BLOCKED_COMPANY_IDS,
 } from "../server/providers/pinnacle-names";
 import { parsePinnacleAsianTriple, parsePinnacle1X2, listBookmakerRows } from "../server/providers/pinnacle";
+import { parseOpticPrices } from "../server/providers/opticodds";
 
 const NOW = 1_800_000_000_000;
 const CFG: ScanConfig = { windowMinutes: 30, intervalSec: 30, maxRuntimeSec: 240 };
@@ -287,5 +288,40 @@ describe("Pinnacle bookmaker-row identification", () => {
     const js = 'var game = Array("545|1|Crown|1.83|4.05|3.45|50|22|26|92|1.56|4.65|4.50|59|20|20","177|2|Pinnacle|1.78|3.93|3.95|52|23|23|93|1.61|4.63|4.81|59|20|19");';
     const out = parsePinnacle1X2(js);
     expect(out).toEqual({ h: 1.61, d: 4.63, a: 4.81, companyId: "177" });
+  });
+});
+
+describe("OpticOdds Pinnacle normalization", () => {
+  const fixture = {
+    id: "optic-1",
+    start_date: "2026-08-07T12:00:00Z",
+    home_team_display: "Alpha United",
+    away_team_display: "Beta City",
+    odds: [
+      { sportsbook: "Pinnacle", market: "Asian Handicap Relative", selection: "Alpha United", points: -0.25, price: 1.95, is_main: true, timestamp: 1_800_000_000 },
+      { sportsbook: "Pinnacle", market: "Asian Handicap Relative", selection: "Beta City", points: 0.25, price: 1.97, is_main: true, timestamp: 1_800_000_000 },
+      { sportsbook: "Pinnacle", market: "Asian Total Goals", name: "Over 2.75", points: 2.75, price: 1.91, is_main: true },
+      { sportsbook: "Pinnacle", market: "Asian Total Goals", name: "Under 2.75", points: 2.75, price: 1.99, is_main: true },
+    ],
+  };
+
+  it("keeps Pinnacle -0.25 as HKJC home gives level/half", () => {
+    const prices = parseOpticPrices(fixture);
+    expect(prices.filter((p) => p.market === "AH").map((p) => [p.selection, p.lineValue])).toEqual([
+      ["H", -0.25],
+      ["A", -0.25],
+    ]);
+    expect(prices.filter((p) => p.market === "OU").map((p) => [p.selection, p.lineValue])).toEqual([
+      ["O", 2.75],
+      ["U", 2.75],
+    ]);
+  });
+
+  it("flips side and handicap when the provider fixture is reversed", () => {
+    const prices = parseOpticPrices(fixture, true);
+    expect(prices.filter((p) => p.market === "AH").map((p) => [p.selection, p.lineValue])).toEqual([
+      ["A", 0.25],
+      ["H", 0.25],
+    ]);
   });
 });
