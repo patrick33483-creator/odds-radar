@@ -97,3 +97,14 @@ export function evaluateEv(input: EvInput): EvOpportunity[] {
 export function isSafe(op: EvOpportunity): boolean {
   return op.flags.length === 0;
 }
+
+/** Keep one highest-EV HKJC execution route per identical economic selection. */
+export function selectBestEv(opportunities: EvOpportunity[]): EvOpportunity[] {
+  const best = new Map<string, EvOpportunity>();
+  for (const op of opportunities) {
+    const key = `${op.matchId}|${op.market}|${op.lineKey}|${op.selection}`;
+    const current = best.get(key);
+    if (!current || op.edge > current.edge) best.set(key, op);
+  }
+  return [...best.values()];
+}

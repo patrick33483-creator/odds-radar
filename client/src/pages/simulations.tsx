@@ -77,7 +77,7 @@ export default function Simulations() {
               模擬投注紀錄
             </h1>
             <p className="truncate text-[10px] text-muted-foreground">
-              情況一 皇冠固定 $5,000 · 情況二 馬會固定 $10,000（Pinnacle EV ≥ 3%）· 合成鎖利 皇冠固定 $5,000
+              情況一 皇冠固定 $5,000 · 情況二 馬會固定 $10,000（直接盤／合成盤擇最高 Pinnacle EV ≥ 3%）· 合成鎖利 皇冠固定 $5,000
             </p>
           </div>
           <div className="ml-auto flex items-center gap-1">

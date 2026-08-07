@@ -14,7 +14,7 @@ import {
   splitLine,
 } from "../server/lib/lines";
 import { findThreeWayArb, findTwoWayArb, planStakes, totalProbability } from "../server/lib/arb";
-import { evaluateEv, margin, noVigProbs } from "../server/lib/ev";
+import { evaluateEv, margin, noVigProbs, selectBestEv } from "../server/lib/ev";
 import { buildSynthetic, syntheticCoversCrown } from "../server/lib/synthetic";
 import { leagueSimilarity, matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
@@ -242,12 +242,78 @@ describe("no-vig EV", () => {
     expect(ops[0].flags).toContain("outlier");
     expect(ops[0].flags).toContain("low_confidence");
   });
+
+  it("keeps only the highest-EV execution route for the same line and selection", () => {
+    const base = {
+      key: "ev|m1|AH|-0.25|H",
+      matchId: "m1",
+      matchLabel: "A vs B",
+      league: "L",
+      kickoffUtc: 1,
+      market: "AH" as const,
+      lineKey: "-0.25",
+      lineDisplay: "0/-0.5",
+      selection: "H" as const,
+      fairOdds: 1.9,
+      trueProb: 1 / 1.9,
+      stake: 10000,
+      flags: [],
+    };
+    const direct = { ...base, hkjcOdds: 2.0, edge: 0.052632, expectedProfit: 526.32 };
+    const synthetic = {
+      ...base,
+      hkjcOdds: 2.1,
+      edge: 0.105263,
+      expectedProfit: 1052.63,
+      synthetic: true,
+      components: [],
+    };
+    const selected = selectBestEv([direct, synthetic]);
+    expect(selected).toHaveLength(1);
+    expect(selected[0].synthetic).toBe(true);
+    expect(selected[0].hkjcOdds).toBe(2.1);
+  });
+
+  it("can evaluate a synthetic HKJC handicap price against Pinnacle no-vig probability", () => {
+    const now = Date.now();
+    const quote = buildSynthetic(
+      "home",
+      0.5,
+      { oddsHome: 5, oddsDraw: 5, oddsAway: 2, official1: null },
+      10000,
+    )!;
+    const ops = evaluateEv({
+      matchId: "m-syn",
+      matchLabel: "A vs B",
+      league: "L",
+      kickoffUtc: now + 3.6e6,
+      market: "AH",
+      lineKey: "0.5",
+      lineDisplay: "+0.5",
+      pinnacle: [
+        { selection: "H", decimalOdds: 1.95 },
+        { selection: "A", decimalOdds: 1.95 },
+      ],
+      hkjc: [{ selection: "H", decimalOdds: quote.odds, fetchedAt: now }],
+      now,
+      mappingConfidence: 0.95,
+    });
+    expect(quote.odds).toBe(2.5);
+    expect(ops).toHaveLength(1);
+    expect(ops[0].edge).toBeCloseTo(0.25, 6);
+  });
 });
 
 /* ------------------------------- synthetic ------------------------------- */
 
 describe("synthetic odds formulas", () => {
   const inputs = { oddsHome: 2.4, oddsDraw: 3.4, oddsAway: 3.8, official1: 1.4 };
+
+  it("allocates the full HK$10,000 EV stake across real HKJC component legs", () => {
+    const q = buildSynthetic("away", 0.25, inputs, 10000)!;
+    expect(q.components.reduce((sum, leg) => sum + leg.stake, 0)).toBeCloseTo(10000, 2);
+    expect(q.components.every((leg) => leg.provider === "hkjc-synthetic")).toBe(true);
+  });
 
   it("matches the recovered +0.5 worked example (O_D=3.40, O_A=3.80, W=1000)", () => {
     const q = buildSynthetic("away", 0.5, inputs, 1000)!;

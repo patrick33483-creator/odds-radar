@@ -29,7 +29,7 @@ import type { ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb } from "./arb";
-import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, STALE_MS } from "./ev";
+import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
 import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
@@ -830,6 +830,7 @@ export class RadarEngine {
       const mapping = mappings.get(m.id);
       const prices = byMatch.get(m.id) ?? [];
       const matchLabel = `${m.homeTeam} vs ${m.awayTeam}`;
+      const directEvs: EvOpportunity[] = [];
       const cell = (provider: string, market: Market, lineKey: string, selection: Selection): PriceCell | undefined => {
         const requestedLine = Number(lineKey);
         const r = prices.find(
@@ -938,7 +939,7 @@ export class RadarEngine {
           });
         }
         if (arb) arbs.push(arb);
-        evs.push(...lineEv);
+        directEvs.push(...lineEv);
 
         lineRows.push({
           matchId: m.id,
@@ -961,6 +962,33 @@ export class RadarEngine {
       /* synthetic quotes from HKJC 1X2 vs Crown handicap singles */
       const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices);
       synthetics.push(...syn);
+      /*
+       * Case 2 EV also considers an equivalent HKJC Asian-handicap price
+       * synthesized from 1X2 / official HKJC legs. For the same economic
+       * selection, keep only the higher EV of the direct and synthetic route.
+       */
+      const syntheticEvs = this.buildSyntheticEvsFor(
+        m.id,
+        matchLabel,
+        m.league,
+        m.kickoffUtc,
+        prices,
+        mapping?.confidence ?? 0,
+        now,
+      );
+      const matchEvs = selectBestEv([...directEvs, ...syntheticEvs]);
+      evs.push(...matchEvs);
+      for (const line of lineRows) {
+        const selected = matchEvs.filter(
+          (e) =>
+            e.market === line.market &&
+            e.selection &&
+            (e.market === "AH"
+              ? isSameHandicapRoad(Number(e.lineKey), Number(line.lineKey))
+              : e.lineKey === line.lineKey),
+        );
+        line.ev = selected.length ? selected : null;
+      }
 
       rows.push({
         id: m.id,
@@ -975,7 +1003,7 @@ export class RadarEngine {
         unmatchedReason: mapping?.unmatchedReason ?? null,
         lines: lineRows,
         hasArb: lineRows.some((r) => !!r.arb),
-        hasEv: lineRows.some((r) => (r.ev?.length ?? 0) > 0),
+        hasEv: matchEvs.length > 0,
         hasSynthetic: syn.some((s) => s.isArb),
         synthetics: syn,
       });
@@ -983,6 +1011,103 @@ export class RadarEngine {
 
     const leagues = Array.from(new Set(rows.map((r) => r.league))).sort();
     return { status: this.buildStatus(rows, arbs, evs, synthetics), matches: rows, arbs, ev: evs, synthetics, leagues };
+  }
+
+  private buildSyntheticEvsFor(
+    matchId: string,
+    matchLabel: string,
+    league: string,
+    kickoffUtc: number,
+    prices: Array<{
+      provider: string;
+      market: string;
+      lineKey: string;
+      selection: string;
+      decimalOdds: number;
+      fetchedAt: number;
+    }>,
+    mappingConfidence: number,
+    now: number,
+  ): EvOpportunity[] {
+    const hk1x2 = (selection: Selection) =>
+      prices.find((p) => p.provider === "hkjc" && p.market === "1X2" && p.selection === selection);
+    const home = hk1x2("H");
+    const draw = hk1x2("D");
+    const away = hk1x2("A");
+    if (!home || !draw || !away) return [];
+
+    const out: EvOpportunity[] = [];
+    for (const side of ["away", "home"] as SynSide[]) {
+      const selection: Selection = side === "away" ? "A" : "H";
+      const officialLine = lineKeyOf("AH", side === "away" ? -1 : 1);
+      const official = prices.find(
+        (p) =>
+          p.provider === "hkjc" &&
+          p.market === "AH" &&
+          p.lineKey === officialLine &&
+          p.selection === selection,
+      );
+      for (const target of SYNTHETIC_TARGETS) {
+        const homeHandicap = side === "away" ? -target : target;
+        const lineKey = lineKeyOf("AH", homeHandicap);
+        const quote = buildSynthetic(
+          side,
+          target,
+          {
+            oddsHome: home.decimalOdds,
+            oddsDraw: draw.decimalOdds,
+            oddsAway: away.decimalOdds,
+            official1: official?.decimalOdds ?? null,
+          },
+          HKJC_FIXED_STAKE,
+        );
+        if (!quote) continue;
+
+        const pin = prices.filter(
+          (p) =>
+            p.provider === "pinnacle" &&
+            p.market === "AH" &&
+            isSameHandicapRoad(Number(p.lineKey), homeHandicap) &&
+            (p.selection === "H" || p.selection === "A"),
+        );
+        const pinHome = pin.find((p) => p.selection === "H");
+        const pinAway = pin.find((p) => p.selection === "A");
+        if (!pinHome || !pinAway) continue;
+
+        const usedRows = target === 0.75 && official ? [home, draw, away, official] : [home, draw, away];
+        const evaluated = evaluateEv({
+          matchId,
+          matchLabel,
+          league,
+          kickoffUtc,
+          market: "AH",
+          lineKey,
+          lineDisplay: quote.lineDisplay,
+          pinnacle: [
+            { selection: "H", decimalOdds: pinHome.decimalOdds },
+            { selection: "A", decimalOdds: pinAway.decimalOdds },
+          ],
+          hkjc: [
+            {
+              selection,
+              decimalOdds: quote.odds,
+              fetchedAt: Math.min(...usedRows.map((p) => p.fetchedAt)),
+            },
+          ],
+          now,
+          mappingConfidence,
+        });
+        for (const e of evaluated) {
+          out.push({
+            ...e,
+            synthetic: true,
+            formula: quote.formula,
+            components: quote.components,
+          });
+        }
+      }
+    }
+    return out;
   }
 
   private buildSyntheticsFor(
@@ -1186,7 +1311,7 @@ export class RadarEngine {
           for (const l of a.legs) insertLeg.run(betId, l.provider, l.market, l.lineKey, l.selection, l.decimalOdds, l.stake, 0, null);
         }
       }
-      /* 情況二 — EV >= 3%, HKJC fixed 10,000 */
+      /* 情況二 — highest direct/synthetic HKJC EV >= 3%, fixed 10,000 */
       for (const e of dash.ev) {
         if (!eligible(e.matchId, e.kickoffUtc)) continue;
         if (!isSafe(e) || e.edge < EV_THRESHOLD) continue;
@@ -1198,7 +1323,23 @@ export class RadarEngine {
         );
         if (res.changes) {
           const betId = Number(res.lastInsertRowid);
-          insertLeg.run(betId, "hkjc", e.market, e.lineKey, e.selection, e.hkjcOdds, HKJC_FIXED_STAKE, 0, null);
+          if (e.synthetic && e.components?.length) {
+            for (const c of e.components) {
+              insertLeg.run(
+                betId,
+                "hkjc",
+                c.market,
+                c.lineKey,
+                c.selection,
+                c.decimalOdds,
+                c.stake,
+                1,
+                c.syntheticDetail ?? e.formula ?? "合成 EV",
+              );
+            }
+          } else {
+            insertLeg.run(betId, "hkjc", e.market, e.lineKey, e.selection, e.hkjcOdds, HKJC_FIXED_STAKE, 0, null);
+          }
         }
       }
       /* 合成賠率 — Crown fixed 5,000, HKJC split by the synthetic formula */

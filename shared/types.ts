@@ -111,6 +111,10 @@ export interface EvOpportunity {
   stake: number;
   expectedProfit: number;
   flags: string[];
+  /** True when the effective HKJC price is assembled from multiple HKJC legs. */
+  synthetic?: boolean;
+  formula?: string;
+  components?: BetLeg[];
 }
 
 export interface SyntheticOpportunity {

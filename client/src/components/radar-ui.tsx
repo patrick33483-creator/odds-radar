@@ -254,7 +254,7 @@ export function SourceBar({ status }: { status: StatusResponse | undefined }) {
     >
       <span data-testid="text-pinnacle-strategy">
         <span className="mr-1 font-semibold text-pinnacle">EV：Pinnacle</span>
-        {STRATEGY_LABEL[src.strategy] ?? src.strategy}
+        無水概率基準 · 馬會直接盤／合成盤擇最高 · {STRATEGY_LABEL[src.strategy] ?? src.strategy}
         {rowNote ? ` · ${rowNote}` : ""}
         {src.strategy === "opticodds-primary" ? "" : src.officialConfigured ? "" : " · 未設定官方憑證（公開 API 於 2025-07-23 起關閉）"}
       </span>

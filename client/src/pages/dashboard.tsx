@@ -162,7 +162,7 @@ export default function Dashboard() {
           <Kpi label="賽事" value={status?.counts.matches ?? "—"} testId="kpi-matches" />
           <Kpi label="已配對" value={status?.counts.matched ?? "—"} tone="pinnacle" testId="kpi-matched" />
           <Kpi label="鎖利" value={status?.counts.arbs ?? "—"} tone="positive" testId="kpi-arbs" />
-          <Kpi label="正期望值" value={status?.counts.ev ?? "—"} tone="hkjc" testId="kpi-ev" />
+          <Kpi label="最高正期望值" value={status?.counts.ev ?? "—"} tone="hkjc" testId="kpi-ev" hint="馬會直接盤與合成盤比較後，每個同場同路項目只保留最高 EV" />
           <Kpi label="合成鎖利" value={status?.counts.synthetic ?? "—"} tone="synthetic" testId="kpi-synthetic" />
           <Kpi
             label="賠率快照"
@@ -427,7 +427,8 @@ export default function Dashboard() {
                                   <div className="mt-1 space-y-0.5 text-[11px]" data-testid={`detail-ev-${rowKey}`}>
                                     {l.ev.map((e) => (
                                       <p key={e.key} className="tnum text-hkjc">
-                                        {SELECTION_LABEL[e.selection]} EV {fmtPct(e.edge)} · 公道價 {fmtOdds(e.fairOdds)}
+                                        {SELECTION_LABEL[e.selection]} EV {fmtPct(e.edge)} · {e.synthetic ? "馬會合成" : "馬會直接盤"} @{" "}
+                                        {fmtOdds(e.hkjcOdds)} · 公道價 {fmtOdds(e.fairOdds)}
                                         {e.flags.length ? <span className="ml-1 text-negative">⚠ {e.flags.join(",")}</span> : null}
                                       </p>
                                     ))}
