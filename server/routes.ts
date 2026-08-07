@@ -113,11 +113,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
    *   default        -> dense window scope (<=30 min to kickoff) detail refresh
    *   ?scope=full    -> explicit all-match detail scan; NOT used by any
    *                     recurring/automated path
+   *   ?scope=24h     -> future 24 h pre-warm; refreshes detail but never buys
    *   ?scope=light   -> fixtures + HKJC only
    */
   app.post("/api/refresh", async (req, res) => {
     const scope = String(req.query.scope ?? "window");
-    const mode = scope === "full" ? "full" : scope === "light" ? "lightweight" : "window";
+    const mode =
+      scope === "full"
+        ? "full"
+        : scope === "24h"
+          ? "prewarm24h"
+          : scope === "light"
+            ? "lightweight"
+            : "window";
     const r = await engine.refresh({ force: true, mode });
     res.json({ ...r, status: engine.buildDashboardData().status });
   });

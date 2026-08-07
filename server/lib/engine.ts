@@ -4,9 +4,8 @@
  * SCAN POLICY (latest correction)
  *   - The only automated scanning path is the dense pre-kickoff window scan in
  *     lib/scan.ts: events with 0 < minutes_to_kickoff <= 30 only.
- *   - Recurring / automated refreshes are LIGHTWEIGHT: HKJC's single pre-match
- *     GraphQL call plus the cached titan007 fixture list and event mapping.
- *     They never issue per-match Pinnacle odds-detail requests.
+ *   - The hourly pre-warm path refreshes fixtures/mapping and Pinnacle detail
+ *     only for mapped matches starting within 24 hours. It never places bets.
  *   - A full all-match detail scan exists only as an explicit human action
  *     (POST /api/refresh?scope=full) and is never used by any recurring path.
  *   - NO SCHEDULE / CRON IS CREATED. Frequency is intentionally undecided.
@@ -35,6 +34,7 @@ import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import {
   isSimulationPurchaseWindow,
+  isPrewarmWindow,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -83,9 +83,10 @@ export const FIXTURE_CACHE_MS = 10 * 60_000;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
 
-/** lightweight = fixtures + HKJC prices only; window = dense pre-kickoff scan;
- *  full = explicit manual all-match detail scan (never automated). */
-export type RefreshMode = "lightweight" | "window" | "full";
+/** lightweight = fixtures + HKJC prices only; prewarm24h = future 24 h detail
+ *  refresh without bets; window = manual dense pre-kickoff detail refresh;
+ *  full = explicit manual all-match detail scan. */
+export type RefreshMode = "lightweight" | "prewarm24h" | "window" | "full";
 
 const DEMO = process.env.RADAR_DEMO === "1";
 
@@ -401,6 +402,7 @@ export class RadarEngine {
       .filter((m) => m.pinnacleMatchId && m.kickoffUtc > now)
       .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
     if (mode === "full") return all;
+    if (mode === "prewarm24h") return all.filter((m) => isPrewarmWindow(m.kickoffUtc, now));
     if (mode === "window") return all.filter((m) => m.kickoffUtc - now <= cfg.windowMinutes * 60_000);
     return [];
   }

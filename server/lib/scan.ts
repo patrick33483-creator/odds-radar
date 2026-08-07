@@ -93,6 +93,12 @@ export function isSimulationPurchaseWindow(
   return remaining > 0 && remaining <= windowMinutes * 60_000;
 }
 
+/** Hourly pre-warm scope: future, mapped events within the next 24 hours. */
+export function isPrewarmWindow(kickoffUtc: number, now: number, horizonHours = 24): boolean {
+  const remaining = kickoffUtc - now;
+  return remaining > 0 && remaining <= horizonHours * 60 * 60_000;
+}
+
 export interface ScanDeps {
   now(): number;
   /** Lightweight fixtures + mapping. MUST NOT make per-match odds detail calls. */

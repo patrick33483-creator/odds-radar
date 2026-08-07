@@ -13,6 +13,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isSimulationPurchaseWindow,
+  isPrewarmWindow,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -81,6 +82,13 @@ describe("window selection", () => {
     expect(isSimulationPurchaseWindow(NOW + 30 * 60_000 + 1, NOW)).toBe(false);
     expect(isSimulationPurchaseWindow(NOW, NOW)).toBe(false);
     expect(isSimulationPurchaseWindow(NOW - 1, NOW)).toBe(false);
+  });
+
+  it("limits hourly pre-warm detail refreshes to the next 24 hours", () => {
+    expect(isPrewarmWindow(NOW + 24 * 60 * 60_000, NOW)).toBe(true);
+    expect(isPrewarmWindow(NOW + 24 * 60 * 60_000 + 1, NOW)).toBe(false);
+    expect(isPrewarmWindow(NOW + 1, NOW)).toBe(true);
+    expect(isPrewarmWindow(NOW, NOW)).toBe(false);
   });
 });
 
