@@ -669,10 +669,12 @@ export class RadarEngine {
   private async loadScanCandidates(): Promise<ScanCandidate[]> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
+    const completedMatches = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
     return db
       .select()
       .from(matches)
       .all()
+      .filter((m) => !completedMatches.has(m.id))
       .map((m) => ({
         matchId: m.id,
         matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
@@ -698,9 +700,17 @@ export class RadarEngine {
     // events selected for this pass. General/manual refreshes never buy.
     this.placeSimulations(dash, now, new Set(events.map((e) => e.matchId)));
     this.recomputeDegradedReason();
-    // Only a NEW arbitrage (direct or synthetic) stops the loop; EV does not.
+    // Stop on any newly purchased actionable opportunity, including EV. Once a
+    // match has a simulated bet, future window scans suppress the entire match.
+    const eventIds = new Set(events.map((e) => e.matchId));
+    const newBetKeys = db
+      .select()
+      .from(simulationBets)
+      .all()
+      .filter((b) => eventIds.has(b.matchId) && b.placedAt >= now)
+      .map((b) => `bet|${b.uniqueKey}`);
     const newArbs = fresh.filter((k) => k.startsWith("arb|") || k.startsWith("synth|"));
-    return { detailCalls: res.fetched, newOpportunityKeys: newArbs };
+    return { detailCalls: res.fetched, newOpportunityKeys: [...new Set([...newArbs, ...newBetKeys])] };
   }
 
   /**
@@ -754,10 +764,12 @@ export class RadarEngine {
   /** Events currently inside the dense window (used by the helper endpoint). */
   windowPreview(): ReturnType<typeof selectWindowEvents> {
     const cfg = scanConfig();
+    const completedMatches = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
     const candidates: ScanCandidate[] = db
       .select()
       .from(matches)
       .all()
+      .filter((m) => !completedMatches.has(m.id))
       .map((m) => ({
         matchId: m.id,
         matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
