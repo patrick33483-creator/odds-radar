@@ -302,6 +302,9 @@ describe("OpticOdds Pinnacle normalization", () => {
       { sportsbook: "Pinnacle", market: "Asian Handicap Relative", selection: "Beta City", points: 0.25, price: 1.97, is_main: true, timestamp: 1_800_000_000 },
       { sportsbook: "Pinnacle", market: "Asian Total Goals", name: "Over 2.75", points: 2.75, price: 1.91, is_main: true },
       { sportsbook: "Pinnacle", market: "Asian Total Goals", name: "Under 2.75", points: 2.75, price: 1.99, is_main: true },
+      { sportsbook: "Pinnacle", market: "1st Half Asian Total Goals", name: "Over 1", points: 1, price: 1.75, is_main: true },
+      { sportsbook: "Pinnacle", market: "Asian Handicap Relative Corners", selection: "Alpha United", points: -0.5, price: 1.9, is_main: true },
+      { sportsbook: "Pinnacle", market: "Asian Handicap Relative Corners", selection: "Beta City", points: 0.5, price: 1.9, is_main: true },
     ],
   };
 
@@ -319,9 +322,24 @@ describe("OpticOdds Pinnacle normalization", () => {
 
   it("flips side and handicap when the provider fixture is reversed", () => {
     const prices = parseOpticPrices(fixture, true);
-    expect(prices.filter((p) => p.market === "AH").map((p) => [p.selection, p.lineValue])).toEqual([
-      ["A", 0.25],
+    expect(prices.filter((p) => p.market === "AH").map((p) => [p.selection, p.lineValue]).sort()).toEqual([
       ["H", 0.25],
-    ]);
+      ["A", 0.25],
+    ].sort());
+  });
+
+  it("excludes derivative markets and incoherent complementary prices", () => {
+    const noisy = {
+      ...fixture,
+      odds: [
+        ...fixture.odds,
+        { sportsbook: "Pinnacle", market: "Asian Total Goals", name: "Over 3.25", points: 3.25, price: 4.19, is_main: true },
+        { sportsbook: "Pinnacle", market: "Asian Total Goals", name: "Under 3.25", points: 3.25, price: 6.51, is_main: true },
+      ],
+    };
+    const prices = parseOpticPrices(noisy);
+    expect(prices.some((p) => p.market === "OU" && p.lineValue === 1)).toBe(false);
+    expect(prices.some((p) => p.market === "AH" && p.lineValue === -0.5)).toBe(false);
+    expect(prices.some((p) => p.market === "OU" && p.lineValue === 3.25)).toBe(false);
   });
 });

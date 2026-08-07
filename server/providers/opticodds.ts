@@ -106,7 +106,7 @@ export function parseOpticPrices(fixture: OpticFixture, reversed = false): Provi
         : Math.round(sourceUpdatedAt)
       : null;
 
-    if (marketName.includes("asian handicap")) {
+    if (marketName === "asian handicap relative" || marketName === "asian handicap") {
       const points = Number(q.points);
       if (!Number.isFinite(points)) continue;
       const providerHome = sameTeam(selectionName, home);
@@ -124,7 +124,9 @@ export function parseOpticPrices(fixture: OpticFixture, reversed = false): Provi
       continue;
     }
 
-    if (marketName.includes("asian total") || marketName.includes("total goals")) {
+    // Full-match Asian totals only. Broad substring matching also captures
+    // first-half, team, exact-goals and corner markets.
+    if (marketName === "asian total goals") {
       const points = Number(q.points);
       if (!Number.isFinite(points)) continue;
       const label = `${q.name ?? ""} ${q.selection ?? ""}`.toLowerCase();
@@ -141,7 +143,7 @@ export function parseOpticPrices(fixture: OpticFixture, reversed = false): Provi
       continue;
     }
 
-    if (marketName === "moneyline" || marketName.includes("three way")) {
+    if (marketName === "moneyline" || marketName === "three way moneyline") {
       const isHome = sameTeam(selectionName, home);
       const isAway = sameTeam(selectionName, away);
       const isDraw = /draw|tie|和/.test(selectionName.toLowerCase());
@@ -158,7 +160,36 @@ export function parseOpticPrices(fixture: OpticFixture, reversed = false): Provi
       });
     }
   }
-  return out;
+  // Keep only complete, coherent markets. This blocks partial/stale quote
+  // combinations that can otherwise make both complementary outcomes appear
+  // to have implausibly large positive EV.
+  const grouped = new Map<string, ProviderPrice[]>();
+  for (const price of out) {
+    const key = `${price.market}|${price.lineValue ?? ""}`;
+    const rows = grouped.get(key) ?? [];
+    rows.push(price);
+    grouped.set(key, rows);
+  }
+
+  const coherent: ProviderPrice[] = [];
+  for (const rows of grouped.values()) {
+    const expected = rows[0]?.market === "1X2" ? ["H", "D", "A"] : rows[0]?.market === "OU" ? ["O", "U"] : ["H", "A"];
+    const latestBySelection = new Map<string, ProviderPrice>();
+    for (const row of rows) {
+      const prior = latestBySelection.get(row.selection);
+      if (!prior || (row.sourceUpdatedAt ?? 0) >= (prior.sourceUpdatedAt ?? 0)) {
+        latestBySelection.set(row.selection, row);
+      }
+    }
+    const complete = expected.map((selection) => latestBySelection.get(selection)).filter(Boolean) as ProviderPrice[];
+    if (complete.length !== expected.length) continue;
+    const impliedTotal = complete.reduce((sum, row) => sum + 1 / row.decimalOdds, 0);
+    if (impliedTotal < 0.9 || impliedTotal > 1.2) continue;
+    const timestamps = complete.map((row) => row.sourceUpdatedAt).filter((v): v is number => v !== null);
+    if (timestamps.length === complete.length && Math.max(...timestamps) - Math.min(...timestamps) > 60_000) continue;
+    coherent.push(...complete);
+  }
+  return coherent;
 }
 
 export class OpticOddsProvider {
