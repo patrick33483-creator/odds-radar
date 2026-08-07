@@ -12,9 +12,9 @@
  *     and mapping data, and stop the moment a new arbitrage appears (ALERT).
  *   - Total runtime is bounded well below 300 s.
  *
- * NO SCHEDULE IS CREATED ANYWHERE IN THIS CODEBASE. The real frequency is still
- * undecided; the interval and total runtime are env-configurable so a scheduler
- * can be attached later:
+ * The server checks the already-loaded HKJC schedule every 5 minutes and calls
+ * this scanner only when an eligible event is inside the window. The interval
+ * inside each dense run and total runtime remain env-configurable:
  *
  *   RADAR_SCAN_WINDOW_MIN        default 30   (clamped 1..30)
  *   RADAR_SCAN_INTERVAL_SEC      default 30   (clamped 5..120)
@@ -24,6 +24,11 @@
 import type { ScanOutcome } from "@shared/types";
 
 export const SCAN_HARD_LIMIT_SEC = 300;
+export const AUTO_SCAN_CHECK_MS = 5 * 60_000;
+
+export function autoScanEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.RADAR_AUTO_SCAN !== "0";
+}
 
 export interface ScanConfig {
   windowMinutes: number;

@@ -5,9 +5,48 @@ import { engine } from "./lib/engine";
 import { createBackup, listBackups } from "./lib/backup";
 import { storage } from "./storage";
 import { formatLine } from "./lib/lines";
+import { AUTO_SCAN_CHECK_MS, autoScanEnabled } from "./lib/scan";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
+let autoScanTimer: NodeJS.Timeout | null = null;
+let autoScanStartupTimer: NodeJS.Timeout | null = null;
+
+function installAutoWindowScan(): void {
+  if (!autoScanEnabled() || autoScanTimer) return;
+  const tick = async () => {
+    try {
+      const inWindow = engine.windowPreview();
+      if (!inWindow.length) return;
+      const outcome = await engine.runScan();
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "auto_window_scan",
+          result: outcome.result,
+          selected: outcome.selected.length,
+          passes: outcome.passes,
+          detailCalls: outcome.detailCalls,
+        }),
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "auto_window_scan_error",
+          error: (err as Error).message,
+        }),
+      );
+    }
+  };
+  // Give boot-time lightweight refresh enough time to populate the schedule.
+  autoScanStartupTimer = setTimeout(() => void tick(), 30_000);
+  autoScanStartupTimer.unref();
+  autoScanTimer = setInterval(() => void tick(), AUTO_SCAN_CHECK_MS);
+  autoScanTimer.unref();
+}
 
 function buildSimulations(): SimulationsResponse {
   const rows = storage.listSimulations();
@@ -94,6 +133,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   if (process.env.RADAR_BOOTSTRAP !== "0") {
     void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
   }
+  installAutoWindowScan();
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.buildDashboardData();

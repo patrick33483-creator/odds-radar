@@ -35,6 +35,7 @@ import { teamAliasSeedRows } from "./team-alias-seeds";
 import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
+  autoScanEnabled,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -469,7 +470,7 @@ export class RadarEngine {
 
   scanConfigInfo(): StatusResponse["scan"] {
     const cfg = scanConfig();
-    return { ...cfg, scheduleConfigured: false, lastScan: this.lastScan };
+    return { ...cfg, scheduleConfigured: autoScanEnabled(), lastScan: this.lastScan };
   }
 
   /** Lightweight candidate list for the window scan: fixtures + mapping only. */

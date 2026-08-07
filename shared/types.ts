@@ -178,9 +178,8 @@ export interface ScanConfigInfo {
   windowMinutes: number;
   intervalSec: number;
   maxRuntimeSec: number;
-  /** No cron/scheduled task exists — the helper is triggered manually or by a
-   *  scheduler the operator adds later. */
-  scheduleConfigured: false;
+  /** Whether the server-side five-minute schedule check is enabled. */
+  scheduleConfigured: boolean;
   lastScan: ScanOutcome | null;
 }
 

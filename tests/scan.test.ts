@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
+  autoScanEnabled,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -95,6 +96,12 @@ describe("window selection", () => {
 /* ------------------------------ configuration ----------------------------- */
 
 describe("scan configuration", () => {
+  it("enables automatic schedule checks by default and allows an explicit off switch", () => {
+    expect(autoScanEnabled({} as NodeJS.ProcessEnv)).toBe(true);
+    expect(autoScanEnabled({ RADAR_AUTO_SCAN: "1" } as NodeJS.ProcessEnv)).toBe(true);
+    expect(autoScanEnabled({ RADAR_AUTO_SCAN: "0" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+
   it("defaults to 30 s dense interval and <=240 s runtime", () => {
     const cfg = scanConfig({} as NodeJS.ProcessEnv);
     expect(cfg).toEqual({ windowMinutes: 30, intervalSec: 30, maxRuntimeSec: 240 });
