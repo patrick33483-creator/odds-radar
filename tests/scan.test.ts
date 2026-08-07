@@ -5,7 +5,7 @@
  *   - outside the 30-minute window -> NO_WINDOW and ZERO detail calls
  *   - inside the window            -> the in-window events are scanned
  *   - already-started / in-play / unmapped events are excluded
- *   - configuration is always bounded below 300 s
+ *   - an active scan continues beyond the former short runtime cap
  *   - the recurring helper contains no full-scan path (it only ever receives
  *     the events selected by the window filter)
  */
@@ -109,12 +109,12 @@ describe("scan configuration", () => {
     expect(autoScanEnabled({ RADAR_AUTO_SCAN: "0" } as NodeJS.ProcessEnv)).toBe(false);
   });
 
-  it("defaults to 30 s dense interval and <=240 s runtime", () => {
+  it("defaults to a 30 s dense interval and a full 30-minute window", () => {
     const cfg = scanConfig({} as NodeJS.ProcessEnv);
-    expect(cfg).toEqual({ windowMinutes: 30, intervalSec: 30, maxRuntimeSec: 240 });
+    expect(cfg).toEqual({ windowMinutes: 30, intervalSec: 30, maxRuntimeSec: 1800 });
   });
 
-  it("clamps env overrides and always stays below the 300 s hard limit", () => {
+  it("clamps window and interval overrides while ignoring the former short runtime cap", () => {
     const cfg = scanConfig({
       RADAR_SCAN_WINDOW_MIN: "600",
       RADAR_SCAN_INTERVAL_SEC: "1",
@@ -122,13 +122,7 @@ describe("scan configuration", () => {
     } as unknown as NodeJS.ProcessEnv);
     expect(cfg.windowMinutes).toBe(30);
     expect(cfg.intervalSec).toBe(5);
-    expect(cfg.maxRuntimeSec).toBeLessThan(SCAN_HARD_LIMIT_SEC);
-    expect(cfg.maxRuntimeSec).toBe(290);
-    for (const raw of ["0", "-5", "abc", undefined]) {
-      const c = scanConfig({ RADAR_SCAN_MAX_RUNTIME_SEC: raw } as unknown as NodeJS.ProcessEnv);
-      expect(c.maxRuntimeSec).toBeLessThan(SCAN_HARD_LIMIT_SEC);
-      expect(c.maxRuntimeSec).toBeGreaterThanOrEqual(30);
-    }
+    expect(cfg.maxRuntimeSec).toBe(SCAN_HARD_LIMIT_SEC);
   });
 });
 
@@ -191,10 +185,15 @@ describe("runWindowScan", () => {
     const out = await runWindowScan(deps);
     expect(out.result).toBe("NO_ALERT");
     expect(out.selected.map((s) => s.matchId)).toEqual(["in-1", "in-2"]);
-    for (const pass of h.polled) expect(pass).toEqual(["in-1", "in-2"]);
+    expect(h.polled[0]).toEqual(["in-1", "in-2"]);
+    for (const pass of h.polled) {
+      expect(pass.every((id) => id === "in-1" || id === "in-2")).toBe(true);
+      expect(pass).not.toContain("out-1");
+      expect(pass).not.toContain("started");
+    }
+    expect(h.polled.at(-1)).toEqual(["in-2"]);
     expect(h.passes).toBeGreaterThan(1);
-    // Every pass touched exactly the 2 in-window events — no full-scan path.
-    expect(out.detailCalls).toBe(h.passes * 2);
+    expect(out.detailCalls).toBe(h.polled.reduce((sum, pass) => sum + pass.length, 0));
   });
 
   it("stops immediately when a new arb appears", async () => {
@@ -205,12 +204,12 @@ describe("runWindowScan", () => {
     expect(out.newOpportunityKeys).toEqual(["arb|hkjc:10|AH|-0.50|H"]);
   });
 
-  it("never exceeds the configured runtime budget (and it is < 300 s)", async () => {
-    const cfg: ScanConfig = { windowMinutes: 30, intervalSec: 30, maxRuntimeSec: 240 };
-    const { deps } = harness([cand({ matchId: "in-1", minutes: 20 })], { cfg });
+  it("continues beyond the former short runtime cap until kickoff", async () => {
+    const cfg: ScanConfig = { windowMinutes: 30, intervalSec: 30, maxRuntimeSec: 60 };
+    const { deps } = harness([cand({ matchId: "in-1", minutes: 3 })], { cfg });
     const out = await runWindowScan(deps);
-    expect(out.runtimeMs).toBeLessThanOrEqual(cfg.maxRuntimeSec * 1000);
-    expect(cfg.maxRuntimeSec * 1000).toBeLessThan(SCAN_HARD_LIMIT_SEC * 1000);
+    expect(out.runtimeMs).toBeGreaterThan(cfg.maxRuntimeSec * 1000);
+    expect(out.runtimeMs).toBeGreaterThanOrEqual(3 * 60_000);
   });
 
   it("drops events that kick off mid-session", async () => {

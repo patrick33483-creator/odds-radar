@@ -8,23 +8,23 @@
  *     (default 30). Already-started / in-play / finished events are excluded.
  *   - If nothing is in the window: return NO_WINDOW immediately and make ZERO
  *     per-match Pinnacle detail calls.
- *   - Otherwise poll just those events densely, in-process, reusing the fixture
- *     and mapping data, and stop the moment a new arbitrage appears (ALERT).
- *   - Total runtime is bounded well below 300 s.
+ *   - Otherwise poll just those events densely, in-process, and stop when every
+ *     selected event has kicked off or the moment a simulated bet is created.
+ *   - Re-evaluate the loaded schedule on every pass so newly eligible events can
+ *     join an already-running dense session.
  *
- * The server checks the already-loaded HKJC schedule every 5 minutes and calls
+ * The server checks the already-loaded HKJC schedule every 30 seconds and calls
  * this scanner only when an eligible event is inside the window. The interval
- * inside each dense run and total runtime remain env-configurable:
+ * inside each dense run remains env-configurable:
  *
  *   RADAR_SCAN_WINDOW_MIN        default 30   (clamped 1..30)
  *   RADAR_SCAN_INTERVAL_SEC      default 30   (clamped 5..120)
- *   RADAR_SCAN_MAX_RUNTIME_SEC   default 240  (clamped 30..290, hard < 300)
  */
 
 import type { ScanOutcome } from "@shared/types";
 
-export const SCAN_HARD_LIMIT_SEC = 300;
-export const AUTO_SCAN_CHECK_MS = 5 * 60_000;
+export const SCAN_HARD_LIMIT_SEC = 30 * 60;
+export const AUTO_SCAN_CHECK_MS = 30_000;
 
 export function autoScanEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.RADAR_AUTO_SCAN !== "0";
@@ -45,11 +45,11 @@ function num(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-/** Env-driven config, always bounded so a run can never approach 300 s. */
+/** Env-driven config. maxRuntimeSec is informational: one full scan window. */
 export function scanConfig(env: NodeJS.ProcessEnv = process.env): ScanConfig {
   const windowMinutes = clamp(Math.round(num(env.RADAR_SCAN_WINDOW_MIN, 30)), 1, 30);
   const intervalSec = clamp(Math.round(num(env.RADAR_SCAN_INTERVAL_SEC, 30)), 5, 120);
-  const maxRuntimeSec = clamp(Math.round(num(env.RADAR_SCAN_MAX_RUNTIME_SEC, 240)), 30, SCAN_HARD_LIMIT_SEC - 10);
+  const maxRuntimeSec = windowMinutes * 60;
   return { windowMinutes, intervalSec, maxRuntimeSec };
 }
 
@@ -115,13 +115,12 @@ export interface ScanDeps {
 }
 
 /**
- * Run one bounded dense-scan session. Never scans outside the window and never
- * touches per-match detail endpoints when the window is empty.
+ * Run one continuous dense-scan session. Never scans outside the window and
+ * never touches per-match detail endpoints when the window is empty.
  */
 export async function runWindowScan(deps: ScanDeps): Promise<ScanOutcome> {
   const cfg = deps.config;
   const startedAt = deps.now();
-  const deadline = startedAt + cfg.maxRuntimeSec * 1000;
   const base = {
     startedAt,
     windowMinutes: cfg.windowMinutes,
@@ -147,8 +146,8 @@ export async function runWindowScan(deps: ScanDeps): Promise<ScanOutcome> {
     };
   }
 
-  const selected = selectWindowEvents(candidates, deps.now(), cfg);
-  if (selected.length === 0) {
+  const initial = selectWindowEvents(candidates, deps.now(), cfg);
+  if (initial.length === 0) {
     const finishedAt = deps.now();
     return {
       ...base,
@@ -166,25 +165,31 @@ export async function runWindowScan(deps: ScanDeps): Promise<ScanOutcome> {
   let passes = 0;
   let detailCalls = 0;
   let alertKeys: string[] = [];
+  const selectedById = new Map(
+    initial.map((e) => [e.matchId, e] as const),
+  );
 
-  while (deps.now() < deadline) {
-    // Drop anything that kicked off during the session.
-    const live = selected.filter((e) => e.kickoffUtc - deps.now() > 0);
+  while (true) {
+    try {
+      candidates = await deps.loadCandidates();
+    } catch {
+      candidates = [...selectedById.values()];
+    }
+    const live = selectWindowEvents(candidates, deps.now(), cfg);
+    for (const event of live) selectedById.set(event.matchId, event);
     if (live.length === 0) break;
     const pass = await deps.pollPass(live);
     passes++;
     detailCalls += pass.detailCalls;
     if (pass.newOpportunityKeys.length) {
       alertKeys = pass.newOpportunityKeys;
-      break; // stop immediately on a new arb
+      break; // stop immediately after a simulated bet/opportunity is produced
     }
-    const remaining = deadline - deps.now();
-    if (remaining <= cfg.intervalSec * 1000) break;
     await deps.sleep(cfg.intervalSec * 1000);
   }
 
   const finishedAt = deps.now();
-  const selectedInfo = selected.map((e) => ({
+  const selectedInfo = [...selectedById.values()].map((e) => ({
     matchId: e.matchId,
     matchLabel: e.matchLabel,
     minutesToKickoff: Math.round(e.minutesToKickoff * 10) / 10,
@@ -200,6 +205,6 @@ export async function runWindowScan(deps: ScanDeps): Promise<ScanOutcome> {
     newOpportunityKeys: alertKeys,
     message: alertKeys.length
       ? `發現 ${alertKeys.length} 個新機會，已即時停止掃描。`
-      : `已密集掃描 ${selectedInfo.length} 場（${passes} 輪），未發現新機會。`,
+      : `已連續密集掃描 ${selectedInfo.length} 場至開賽（${passes} 輪），未發現新機會。`,
   };
 }

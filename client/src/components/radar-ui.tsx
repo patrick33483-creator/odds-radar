@@ -264,7 +264,7 @@ export function SourceBar({ status }: { status: StatusResponse | undefined }) {
       </span>
       <span data-testid="text-scan-policy">
         <span className="mr-1 font-semibold">自動掃描</span>
-        只在開賽前 {scan.windowMinutes} 分鐘內密集掃描 · 間隔 {scan.intervalSec} 秒 · 單次上限 {scan.maxRuntimeSec} 秒
+        只在開賽前 {scan.windowMinutes} 分鐘內密集掃描 · 間隔 {scan.intervalSec} 秒 · 持續至開賽或產生注單
         {scan.scheduleConfigured ? " · 賽前 30 分鐘自動觸發" : " · 密集掃描只限手動觸發"}
       </span>
       {src.warnings.length ? (

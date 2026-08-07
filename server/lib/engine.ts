@@ -740,7 +740,29 @@ export class RadarEngine {
     try {
       const outcome = await runWindowScan({
         now: () => Date.now(),
-        loadCandidates: () => this.loadScanCandidates(),
+        loadCandidates: (() => {
+          let prepared = false;
+          return async () => {
+            if (!prepared) {
+              prepared = true;
+              return this.loadScanCandidates();
+            }
+            const completedMatches = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
+            return db
+              .select()
+              .from(matches)
+              .all()
+              .filter((m) => !completedMatches.has(m.id))
+              .map((m) => ({
+                matchId: m.id,
+                matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
+                kickoffUtc: m.kickoffUtc,
+                inplay: !!m.inplay,
+                status: m.status,
+                pinnacleMatchId: m.pinnacleMatchId,
+              }));
+          };
+        })(),
         pollPass: (events) => this.densePass(events),
         sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
         config: scanConfig(),

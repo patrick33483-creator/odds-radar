@@ -185,7 +185,7 @@ export interface ScanConfigInfo {
   windowMinutes: number;
   intervalSec: number;
   maxRuntimeSec: number;
-  /** Whether the server-side five-minute schedule check is enabled. */
+  /** Whether the server-side 30-second schedule check is enabled. */
   scheduleConfigured: boolean;
   lastScan: ScanOutcome | null;
 }
