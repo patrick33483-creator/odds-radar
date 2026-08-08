@@ -88,6 +88,7 @@ import type {
   LineRow,
   Market,
   MatchRow,
+  MatchRefreshResponse,
   PriceCell,
   ProviderStatus,
   Selection,
@@ -155,6 +156,7 @@ export class RadarEngine {
   private pinnacleRowsSeen = 0;
   private lastScan: ScanOutcome | null = null;
   private scanning = false;
+  private matchRefreshes = new Map<string, Promise<MatchRefreshResponse>>();
 
   constructor() {
     const stored = getState("lastGoodAt");
@@ -212,6 +214,79 @@ export class RadarEngine {
       });
     await this.inflight;
     return { started: true, throttled: false, mode };
+  }
+
+  /**
+   * Explicit human-only refresh for one mapped match. It refreshes the HKJC
+   * card once, then bypasses the Pinnacle/Crown detail caches for this match.
+   * It never records a simulation or triggers a full-card detail scan.
+   */
+  async refreshMatch(matchId: string): Promise<MatchRefreshResponse> {
+    const active = this.matchRefreshes.get(matchId);
+    if (active) return active;
+
+    const task = this.runMatchRefresh(matchId).finally(() => {
+      this.matchRefreshes.delete(matchId);
+    });
+    this.matchRefreshes.set(matchId, task);
+    return task;
+  }
+
+  private async runMatchRefresh(matchId: string): Promise<MatchRefreshResponse> {
+    if (this.inflight) await this.inflight;
+
+    const startedAt = Date.now();
+    const initial = db.select().from(matches).where(eq(matches.id, matchId)).get();
+    if (!initial) throw new Error("MATCH_NOT_FOUND");
+    if (!initial.pinnacleMatchId) throw new Error("MATCH_NOT_MAPPED");
+    if (initial.kickoffUtc <= startedAt) throw new Error("MATCH_ALREADY_STARTED");
+
+    const hkjcOk = await this.refreshHkjc();
+    const current = db.select().from(matches).where(eq(matches.id, matchId)).get() ?? initial;
+    const detail = await this.pollPinnacleDetail(
+      [{ id: current.id, pinnacleMatchId: current.pinnacleMatchId, kickoffUtc: current.kickoffUtc }],
+      Date.now() + 60_000,
+      true,
+    );
+
+    const fresh = db
+      .select()
+      .from(oddsLatest)
+      .where(eq(oddsLatest.matchId, matchId))
+      .all()
+      .filter((row) => row.fetchedAt >= startedAt);
+    const hkjcPrices = fresh.filter((row) => row.provider === "hkjc").length;
+    const pinnaclePrices = fresh.filter((row) => row.provider === "pinnacle").length;
+    const crownPrices = fresh.filter((row) => row.provider === "crown").length;
+    const ok = hkjcOk && detail.failed === 0 && pinnaclePrices > 0;
+    const matchLabel = `${current.homeTeam} vs ${current.awayTeam}`;
+
+    if (hkjcOk) {
+      this.lastGoodAt = Date.now();
+      setState("lastGoodAt", String(this.lastGoodAt));
+    }
+    this.recomputeDegradedReason();
+    log("match_refresh", {
+      matchId,
+      matchLabel,
+      ok,
+      hkjcPrices,
+      pinnaclePrices,
+      crownPrices,
+    });
+
+    return {
+      ok,
+      matchId,
+      matchLabel,
+      refreshedAt: Date.now(),
+      hkjcPrices,
+      pinnaclePrices,
+      crownPrices,
+      message: ok
+        ? `已更新：馬會 ${hkjcPrices}、Pinnacle ${pinnaclePrices}、皇冠 ${crownPrices} 個報價`
+        : `更新未完整：馬會 ${hkjcPrices}、Pinnacle ${pinnaclePrices}、皇冠 ${crownPrices} 個報價`,
+    };
   }
 
   private setHealth(provider: "hkjc" | "pinnacle", patch: HealthPatch): void {

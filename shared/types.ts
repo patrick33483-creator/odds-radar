@@ -227,6 +227,17 @@ export interface DashboardResponse {
   leagues: string[];
 }
 
+export interface MatchRefreshResponse {
+  ok: boolean;
+  matchId: string;
+  matchLabel: string;
+  refreshedAt: number;
+  hkjcPrices: number;
+  pinnaclePrices: number;
+  crownPrices: number;
+  message: string;
+}
+
 export interface SimulationLegDto {
   id: number;
   provider: string;

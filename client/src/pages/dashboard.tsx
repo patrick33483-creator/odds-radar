@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useLocation } from "wouter";
-import { ChevronDown, ChevronRight, ScanSearch, Search } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw, ScanSearch, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -31,7 +31,7 @@ import {
   fmtPct,
   fmtTime,
 } from "@/components/radar-ui";
-import { MARKET_LABEL, SELECTION_LABEL, type DashboardResponse, type LineRow, type Market, type MatchRow, type Selection } from "@shared/types";
+import { MARKET_LABEL, SELECTION_LABEL, type DashboardResponse, type LineRow, type Market, type MatchRefreshResponse, type MatchRow, type Selection } from "@shared/types";
 
 const MARKETS: Market[] = ["AH", "OU", "1X2"];
 const WINDOWS = [
@@ -51,6 +51,11 @@ export default function Dashboard() {
   const [arbOnly, setArbOnly] = useState(false);
   const [showSynthetic, setShowSynthetic] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [matchRefreshFeedback, setMatchRefreshFeedback] = useState<{
+    matchId: string;
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   const { data, isLoading, isError, error } = useQuery<DashboardResponse>({
     queryKey: ["/api/dashboard"],
@@ -80,6 +85,19 @@ export default function Dashboard() {
       await apiRequest("POST", "/api/scan/window");
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] }),
+  });
+
+  const matchRefresh = useMutation<MatchRefreshResponse, Error, string>({
+    mutationFn: async (matchId) => {
+      const response = await apiRequest("POST", "/api/refresh/match", { matchId });
+      return response.json() as Promise<MatchRefreshResponse>;
+    },
+    onMutate: (matchId) => setMatchRefreshFeedback({ matchId, ok: true, message: "正在更新馬會、Pinnacle 及皇冠報價…" }),
+    onSuccess: (result) => {
+      setMatchRefreshFeedback({ matchId: result.matchId, ok: result.ok, message: result.message });
+      queryClient.invalidateQueries({ queryKey: ["/api/dashboard"] });
+    },
+    onError: (err, matchId) => setMatchRefreshFeedback({ matchId, ok: false, message: err.message }),
   });
 
   const status = data?.status;
@@ -402,6 +420,40 @@ export default function Dashboard() {
                       {isOpen ? (
                         <tr key={`${rowKey}-detail`} data-testid={`row-detail-${rowKey}`}>
                           <td colSpan={sels.length + 5} className="border-b border-grid bg-accent/30 px-3 py-2">
+                            <div className="mb-2 flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
+                              <p className="text-xs text-muted-foreground">
+                                指定賽事刷新只更新此場報價，不會觸發全場掃描或模擬下注。
+                              </p>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="gap-1.5"
+                                onClick={() => matchRefresh.mutate(m.id)}
+                                disabled={!m.matched || (matchRefresh.isPending && matchRefresh.variables === m.id)}
+                                data-testid={`button-refresh-match-${m.id}`}
+                              >
+                                <RefreshCw
+                                  className={cn(
+                                    "h-3.5 w-3.5",
+                                    matchRefresh.isPending && matchRefresh.variables === m.id && "animate-spin",
+                                  )}
+                                />
+                                {matchRefresh.isPending && matchRefresh.variables === m.id ? "更新中" : "刷新此場"}
+                              </Button>
+                              {matchRefreshFeedback?.matchId === m.id ? (
+                                <p
+                                  className={cn(
+                                    "basis-full text-xs",
+                                    matchRefreshFeedback.ok ? "text-positive" : "text-negative",
+                                  )}
+                                  role="status"
+                                  data-testid={`status-refresh-match-${m.id}`}
+                                >
+                                  {matchRefreshFeedback.message}
+                                </p>
+                              ) : null}
+                            </div>
                             <div className="grid gap-3 sm:grid-cols-2">
                               <div>
                                 <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">

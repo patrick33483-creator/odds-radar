@@ -9,6 +9,7 @@ import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./l
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
+const matchRefreshSchema = z.object({ matchId: z.string().min(1).max(120) });
 let autoScanTimer: NodeJS.Timeout | null = null;
 let autoScanStartupTimer: NodeJS.Timeout | null = null;
 
@@ -187,6 +188,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             : "window";
     const r = await engine.refresh({ force: true, mode });
     res.json({ ...r, status: engine.buildDashboardData().status });
+  });
+
+  app.post("/api/refresh/match", async (req, res) => {
+    const parsed = matchRefreshSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ message: "matchId 格式不正確" });
+    try {
+      return res.json(await engine.refreshMatch(parsed.data.matchId));
+    } catch (err) {
+      const code = (err as Error).message;
+      if (code === "MATCH_NOT_FOUND") return res.status(404).json({ message: "找不到指定賽事" });
+      if (code === "MATCH_NOT_MAPPED") return res.status(409).json({ message: "此賽事尚未配對 Pinnacle，暫時無法單場刷新" });
+      if (code === "MATCH_ALREADY_STARTED") return res.status(409).json({ message: "賽事已經開賽，賽前盤不再刷新" });
+      console.error(JSON.stringify({ ts: new Date().toISOString(), scope: "radar", event: "match_refresh_error", error: code }));
+      return res.status(502).json({ message: "單場刷新失敗，請稍後再試" });
+    }
   });
 
   /**
