@@ -12,6 +12,8 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  createAutoScanTickGate,
+  excludeSimulatedMatches,
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
@@ -100,6 +102,56 @@ describe("window selection", () => {
     expect(isPrewarmWindow(NOW + 24 * 60 * 60_000 + 1, NOW)).toBe(false);
     expect(isPrewarmWindow(NOW + 1, NOW)).toBe(true);
     expect(isPrewarmWindow(NOW, NOW)).toBe(false);
+  });
+});
+
+describe("automatic scan guards", () => {
+  it("runs only once for overlapping ticks and suppresses a later tick in the same second", async () => {
+    let now = NOW;
+    let runs = 0;
+    let releaseFirstRun!: () => void;
+    const firstRunHeld = new Promise<void>((resolve) => {
+      releaseFirstRun = resolve;
+    });
+    const gate = createAutoScanTickGate(() => now);
+
+    const first = gate.run(async () => {
+      runs++;
+      await firstRunHeld;
+    });
+    await Promise.resolve();
+
+    const overlapping = await gate.run(async () => {
+      runs++;
+    });
+    expect(overlapping).toBe(false);
+    expect(runs).toBe(1);
+
+    releaseFirstRun();
+    expect(await first).toBe(true);
+    expect(await gate.run(async () => {
+      runs++;
+    })).toBe(false);
+
+    now += 1_000;
+    expect(await gate.run(async () => {
+      runs++;
+    })).toBe(true);
+    expect(runs).toBe(2);
+  });
+
+  it("excludes every match with a simulation from automatic scan candidates", () => {
+    const candidates = [
+      { matchId: "hkjc:case1", category: "case1_arb" },
+      { matchId: "hkjc:case2", category: "case2_ev" },
+      { matchId: "hkjc:synth", category: "synth_arb" },
+      { matchId: "hkjc:open", category: null },
+    ];
+    const simulatedMatchIds = new Set(["hkjc:case1", "hkjc:case2", "hkjc:synth"]);
+
+    expect(excludeSimulatedMatches(candidates, simulatedMatchIds)).toEqual([
+      { matchId: "hkjc:open", category: null },
+    ]);
   });
 });
 

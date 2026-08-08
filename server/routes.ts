@@ -5,7 +5,7 @@ import { engine } from "./lib/engine";
 import { createBackup, listBackups } from "./lib/backup";
 import { storage } from "./storage";
 import { formatLine } from "./lib/lines";
-import { AUTO_SCAN_CHECK_MS, autoScanEnabled } from "./lib/scan";
+import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./lib/scan";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -14,11 +14,27 @@ let autoScanStartupTimer: NodeJS.Timeout | null = null;
 
 function installAutoWindowScan(): void {
   if (!autoScanEnabled() || autoScanTimer) return;
-  const tick = async () => {
-    try {
-      // `runScan` records a clear TARGET_REACHED status and returns before any
-      // fixture or price request if the strict simulation cap is complete.
-      if (engine.scanConfigInfo().simulationTargetReached) {
+  const tickGate = createAutoScanTickGate();
+  const tick = () => {
+    void tickGate.run(async () => {
+      try {
+        // `runScan` records a clear TARGET_REACHED status and returns before any
+        // fixture or price request if the strict simulation cap is complete.
+        if (engine.scanConfigInfo().simulationTargetReached) {
+          const outcome = await engine.runScan();
+          console.log(
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              scope: "radar",
+              event: "auto_window_scan",
+              result: outcome.result,
+              message: outcome.message,
+            }),
+          );
+          return;
+        }
+        const inWindow = engine.windowPreview();
+        if (!inWindow.length) return;
         const outcome = await engine.runScan();
         console.log(
           JSON.stringify({
@@ -26,35 +42,22 @@ function installAutoWindowScan(): void {
             scope: "radar",
             event: "auto_window_scan",
             result: outcome.result,
-            message: outcome.message,
+            selected: outcome.selected.length,
+            passes: outcome.passes,
+            detailCalls: outcome.detailCalls,
           }),
         );
-        return;
+      } catch (err) {
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            scope: "radar",
+            event: "auto_window_scan_error",
+            error: (err as Error).message,
+          }),
+        );
       }
-      const inWindow = engine.windowPreview();
-      if (!inWindow.length) return;
-      const outcome = await engine.runScan();
-      console.log(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          scope: "radar",
-          event: "auto_window_scan",
-          result: outcome.result,
-          selected: outcome.selected.length,
-          passes: outcome.passes,
-          detailCalls: outcome.detailCalls,
-        }),
-      );
-    } catch (err) {
-      console.error(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          scope: "radar",
-          event: "auto_window_scan_error",
-          error: (err as Error).message,
-        }),
-      );
-    }
+    });
   };
   // Give boot-time lightweight refresh enough time to populate the schedule.
   autoScanStartupTimer = setTimeout(() => void tick(), 30_000);

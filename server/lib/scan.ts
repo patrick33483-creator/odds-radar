@@ -81,6 +81,52 @@ export interface ScanCandidate {
   pinnacleMatchId: string | null;
 }
 
+/**
+ * A simulation bet permanently removes its match from automatic scan scope.
+ * The caller intentionally supplies IDs from every simulation category.
+ */
+export function excludeSimulatedMatches<T extends { matchId: string }>(
+  candidates: T[],
+  simulatedMatchIds: ReadonlySet<string>,
+): T[] {
+  return candidates.filter((candidate) => !simulatedMatchIds.has(candidate.matchId));
+}
+
+export interface AutoScanTickGate {
+  /**
+   * Starts the task only when another tick is not already running and no task
+   * has started in the current wall-clock second. Returns whether it ran.
+   */
+  run(task: () => Promise<void>): Promise<boolean>;
+}
+
+/**
+ * Guards the startup timer and recurring timer that share an automatic scan.
+ * This prevents both overlapping work and the 30-second startup/interval
+ * collision that can occur in the same second.
+ */
+export function createAutoScanTickGate(now: () => number = () => Date.now()): AutoScanTickGate {
+  let inFlight: Promise<void> | null = null;
+  let lastStartedSecond: number | null = null;
+
+  return {
+    async run(task: () => Promise<void>): Promise<boolean> {
+      const currentSecond = Math.floor(now() / 1_000);
+      if (inFlight || lastStartedSecond === currentSecond) return false;
+
+      lastStartedSecond = currentSecond;
+      const running = Promise.resolve().then(task);
+      inFlight = running;
+      try {
+        await running;
+        return true;
+      } finally {
+        if (inFlight === running) inFlight = null;
+      }
+    },
+  };
+}
+
 const STARTED_STATUS = /INPLAY|LIVE|FINISHED|ENDED|ABANDON|CANCEL|POSTPONE|RESULT/i;
 
 /**

@@ -39,6 +39,7 @@ import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
+  excludeSimulatedMatches,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -717,12 +718,20 @@ export class RadarEngine {
   private async loadScanCandidates(): Promise<ScanCandidate[]> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
-    const completedMatches = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
-    return db
+    return this.unsimulatedScanCandidates();
+  }
+
+  /**
+   * Every simulation category retires its entire match from automatic scans.
+   * This is shared by the preview, initial window load, and later dense passes
+   * so PinnAPI detail is never fetched again after an inserted simulation.
+   */
+  private unsimulatedScanCandidates(): ScanCandidate[] {
+    const simulatedMatchIds = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
+    const candidates: ScanCandidate[] = db
       .select()
       .from(matches)
       .all()
-      .filter((m) => !completedMatches.has(m.id))
       .map((m) => ({
         matchId: m.id,
         matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
@@ -731,6 +740,7 @@ export class RadarEngine {
         status: m.status,
         pinnacleMatchId: m.pinnacleMatchId,
       }));
+    return excludeSimulatedMatches(candidates, simulatedMatchIds);
   }
 
   /** One dense pass: refresh HKJC (1 call) + Pinnacle detail for the window only. */
@@ -819,20 +829,7 @@ export class RadarEngine {
               prepared = true;
               return this.loadScanCandidates();
             }
-            const completedMatches = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
-            return db
-              .select()
-              .from(matches)
-              .all()
-              .filter((m) => !completedMatches.has(m.id))
-              .map((m) => ({
-                matchId: m.id,
-                matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
-                kickoffUtc: m.kickoffUtc,
-                inplay: !!m.inplay,
-                status: m.status,
-                pinnacleMatchId: m.pinnacleMatchId,
-              }));
+            return this.unsimulatedScanCandidates();
           };
         })(),
         pollPass: (events) => this.densePass(events),
@@ -858,21 +855,7 @@ export class RadarEngine {
   /** Events currently inside the dense window (used by the helper endpoint). */
   windowPreview(): ReturnType<typeof selectWindowEvents> {
     const cfg = scanConfig();
-    const completedMatches = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
-    const candidates: ScanCandidate[] = db
-      .select()
-      .from(matches)
-      .all()
-      .filter((m) => !completedMatches.has(m.id))
-      .map((m) => ({
-        matchId: m.id,
-        matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
-        kickoffUtc: m.kickoffUtc,
-        inplay: !!m.inplay,
-        status: m.status,
-        pinnacleMatchId: m.pinnacleMatchId,
-      }));
-    return selectWindowEvents(candidates, Date.now(), cfg);
+    return selectWindowEvents(this.unsimulatedScanCandidates(), Date.now(), cfg);
   }
 
   private persistPrices(matchId: string, provider: "hkjc" | "pinnacle" | "crown", prices: ProviderPrice[], now: number): void {
