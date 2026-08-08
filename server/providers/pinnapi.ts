@@ -157,16 +157,25 @@ function collectFixtureRows(value: unknown, out: JsonRecord[], depth = 0): void 
   }
 }
 
+function hasFullMatchPeriod(row: JsonRecord): boolean {
+  const periods = asRecord(row.periods);
+  return !!periods && asRecord(periods.num_0) !== null;
+}
+
+interface PinnapiFixtureCandidate extends PinnapiFixture {
+  hasFullMatch: boolean;
+}
+
 /**
  * Maps the fixtures response into CandidateEvent-compatible records. Duplicate
- * child/parent records resolve to the parent (`parent_id === null`) whenever it
- * is available for the same event or fixture identity.
+ * parent/child records prefer the item that exposes a full-match `num_0`
+ * period. When both expose `num_0`, the top-level parent is preferred.
  */
 export function parsePinnapiFixtures(payload: unknown): PinnapiFixture[] {
   const rawRows: JsonRecord[] = [];
   collectFixtureRows(payload, rawRows);
-  const candidates: PinnapiFixture[] = rawRows
-    .map((row): PinnapiFixture | null => {
+  const candidates: PinnapiFixtureCandidate[] = rawRows
+    .map((row): PinnapiFixtureCandidate | null => {
       const eventId = str(row.event_id ?? row.eventId ?? row.id);
       const league = str(row.league_name ?? row.league ?? row.leagueName);
       const homeTeam = str(row.home ?? row.home_team ?? row.homeTeam);
@@ -184,19 +193,49 @@ export function parsePinnapiFixtures(payload: unknown): PinnapiFixture[] {
         inplay: false,
         status: str(row.status ?? row.event_status ?? row.state) || "scheduled",
         parentId,
+        hasFullMatch: hasFullMatchPeriod(row),
       };
     })
-    .filter((row): row is PinnapiFixture => row !== null);
+    .filter((row): row is PinnapiFixtureCandidate => row !== null);
 
-  const ids = new Set(candidates.map((row) => row.providerMatchId));
-  const parentPreferred = candidates.filter((row) => !row.parentId || !ids.has(row.parentId));
-  const byFixture = new Map<string, PinnapiFixture>();
-  for (const row of parentPreferred) {
+  const byId = new Map(candidates.map((row) => [row.providerMatchId, row]));
+  const familyIdOf = (row: PinnapiFixtureCandidate): string => {
+    let current = row;
+    const seen = new Set<string>([current.providerMatchId]);
+    while (current.parentId && !seen.has(current.parentId)) {
+      const parent = byId.get(current.parentId);
+      if (!parent) break;
+      seen.add(parent.providerMatchId);
+      current = parent;
+    }
+    return current.providerMatchId;
+  };
+  const families = new Map<string, PinnapiFixtureCandidate[]>();
+  for (const row of candidates) {
+    const familyId = familyIdOf(row);
+    const family = families.get(familyId) ?? [];
+    family.push(row);
+    families.set(familyId, family);
+  }
+  const familyPreferred = [...families.values()].map((family) => {
+    const withFullMatch = family.filter((row) => row.hasFullMatch);
+    const eligible = withFullMatch.length ? withFullMatch : family;
+    return eligible.find((row) => row.parentId === null) ?? eligible[0];
+  });
+
+  const byFixture = new Map<string, PinnapiFixtureCandidate>();
+  for (const row of familyPreferred) {
     const key = `${row.league.toLowerCase()}|${row.homeTeam.toLowerCase()}|${row.awayTeam.toLowerCase()}|${Math.round(row.kickoffUtc / 60_000)}`;
     const prior = byFixture.get(key);
-    if (!prior || (prior.parentId !== null && row.parentId === null)) byFixture.set(key, row);
+    if (
+      !prior ||
+      (row.hasFullMatch && !prior.hasFullMatch) ||
+      (row.hasFullMatch === prior.hasFullMatch && prior.parentId !== null && row.parentId === null)
+    ) {
+      byFixture.set(key, row);
+    }
   }
-  return [...byFixture.values()];
+  return [...byFixture.values()].map(({ hasFullMatch: _hasFullMatch, ...fixture }) => fixture);
 }
 
 function values(value: unknown): JsonRecord[] {

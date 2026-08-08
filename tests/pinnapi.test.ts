@@ -18,6 +18,7 @@ describe("PinnAPI Edge fixtures", () => {
           away: "Beta",
           starts: "2026-08-08T12:00:00Z",
           status: "open",
+          periods: { num_0: {} },
         },
         {
           event_id: 102,
@@ -27,6 +28,7 @@ describe("PinnAPI Edge fixtures", () => {
           away: "Beta",
           start_ts: 1_786_190_400,
           status: "open",
+          periods: { num_0: {} },
         },
         {
           event_id: 103,
@@ -53,6 +55,37 @@ describe("PinnAPI Edge fixtures", () => {
       awayTeam: "Beta",
       parentId: null,
       inplay: false,
+    });
+  });
+
+  it("keeps a child with num_0 when its parent exposes only a derivative period", () => {
+    const fixtures = parsePinnapiFixtures({
+      events: [
+        {
+          event_id: 1633091876,
+          parent_id: null,
+          league_name: "Parent Child Regression",
+          home: "Alpha",
+          away: "Beta",
+          starts: "2026-08-08T12:00:00Z",
+          periods: { num_1: {} },
+        },
+        {
+          event_id: 1633529609,
+          parent_id: 1633091876,
+          league_name: "Parent Child Regression",
+          home: "Alpha",
+          away: "Beta",
+          starts: "2026-08-08T12:00:00Z",
+          periods: { num_0: {} },
+        },
+      ],
+    });
+
+    expect(fixtures).toHaveLength(1);
+    expect(fixtures[0]).toMatchObject({
+      providerMatchId: "1633529609",
+      parentId: "1633091876",
     });
   });
 });
