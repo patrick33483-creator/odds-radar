@@ -4,6 +4,7 @@
  */
 
 import type { EvOpportunity, Market, Selection } from "@shared/types";
+import { formatSelectionLine } from "./lines";
 
 export const EV_THRESHOLD = 0.03;
 export const HKJC_FIXED_STAKE = 10000;
@@ -84,7 +85,11 @@ export function evaluateEv(input: EvInput): EvOpportunity[] {
       kickoffUtc: input.kickoffUtc,
       market: input.market,
       lineKey: input.lineKey,
-      lineDisplay: input.lineDisplay,
+      lineDisplay: formatSelectionLine(
+        input.market,
+        input.lineKey ? Number(input.lineKey) : null,
+        leg.selection,
+      ),
       selection: leg.selection,
       hkjcOdds: leg.decimalOdds,
       fairOdds: Math.round(fairOdds * 1000) / 1000,

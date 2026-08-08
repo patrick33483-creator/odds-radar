@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   formatHandicap,
+  formatSelectionLine,
   formatTotal,
   hkToDecimal,
   handicapRoadKey,
@@ -74,6 +75,9 @@ describe("line normalization", () => {
     expect(formatHandicap(-0.5)).toBe("-0.5");
     expect(formatHandicap(-0.75)).toBe("-0.5/-1");
     expect(formatHandicap(0.75)).toBe("+0.5/+1");
+    expect(formatSelectionLine("AH", 0.25, "H")).toBe("0/+0.5");
+    expect(formatSelectionLine("AH", 0.25, "A")).toBe("0/-0.5");
+    expect(formatSelectionLine("AH", -0.75, "A")).toBe("+0.5/+1");
     expect(formatTotal(2.5)).toBe("2.5");
     expect(formatTotal(2.75)).toBe("2.5/3");
     expect(formatTotal(3)).toBe("3");

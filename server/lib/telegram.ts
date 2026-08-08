@@ -1,4 +1,5 @@
 import { rawDb, getState, setState } from "./store";
+import { formatSelectionLine } from "./lines";
 
 interface TelegramApiResponse {
   ok?: boolean;
@@ -37,6 +38,18 @@ const CATEGORY_LABEL: Record<string, string> = {
   synth_arb: "合成鎖利",
 };
 
+const PROVIDER_LABEL: Record<string, string> = {
+  hkjc: "馬會",
+  crown: "皇冠",
+  pinnacle: "Pinnacle（只作參考）",
+};
+
+const MARKET_LABEL: Record<string, string> = {
+  "1X2": "主客和",
+  AH: "讓球",
+  OU: "入球大細",
+};
+
 function money(value: number): string {
   return `HK$${Math.round(value).toLocaleString("en-HK")}`;
 }
@@ -57,9 +70,24 @@ function hkt(timestamp: number): string {
 }
 
 function buildMessage(bet: BetRow, legs: LegRow[]): string {
+  const [home = "主隊", away = "客隊"] = bet.match_label.split(/\s+vs\s+/i);
+  const selectionLabel = (leg: LegRow, display: string): string => {
+    if (leg.market === "1X2") {
+      return leg.selection === "H" ? `主勝（${home}）` : leg.selection === "D" ? "和局" : `客勝（${away}）`;
+    }
+    if (leg.market === "AH") {
+      const team = leg.selection === "H" ? home : away;
+      return `${team} ${display}`;
+    }
+    return `${leg.selection === "O" ? "大" : "細"} ${display}`;
+  };
   const legLines = legs.map(
-    (leg) =>
-      `- ${leg.provider.toUpperCase()} ${leg.market} ${leg.line_key || "—"} ${leg.selection} @ ${leg.decimal_odds.toFixed(3)}，${money(leg.stake)}${leg.synthetic ? "（合成）" : ""}`,
+    (leg) => {
+      const market = leg.market as "1X2" | "AH" | "OU";
+      const value = leg.line_key ? Number(leg.line_key) : null;
+      const display = formatSelectionLine(market, value, leg.selection);
+      return `- ${PROVIDER_LABEL[leg.provider] ?? leg.provider}｜${MARKET_LABEL[leg.market] ?? leg.market}｜${selectionLabel(leg, display)}｜賠率 ${leg.decimal_odds.toFixed(3)}｜注碼 ${money(leg.stake)}${leg.synthetic ? "（合成盤）" : ""}`;
+    },
   );
   const metric =
     bet.category === "case2_ev" && bet.ev_pct !== null
@@ -113,4 +141,3 @@ export async function notifySimulationBets(newBetKeys: string[]): Promise<number
   }
   return sent;
 }
-

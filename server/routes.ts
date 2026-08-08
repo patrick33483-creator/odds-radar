@@ -4,7 +4,7 @@ import { z } from "zod";
 import { engine } from "./lib/engine";
 import { createBackup, listBackups } from "./lib/backup";
 import { storage } from "./storage";
-import { formatLine } from "./lib/lines";
+import { formatLine, formatSelectionLine } from "./lib/lines";
 import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./lib/scan";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
@@ -118,7 +118,11 @@ function buildSimulations(): SimulationsResponse {
     league: r.bet.league,
     market: r.bet.market as Market,
     lineKey: r.bet.lineKey,
-    lineDisplay: formatLine(r.bet.market as Market, r.bet.lineKey ? Number(r.bet.lineKey) : null),
+    lineDisplay: formatSelectionLine(
+      r.bet.market as Market,
+      r.bet.lineKey ? Number(r.bet.lineKey) : null,
+      r.bet.selection,
+    ),
     selection: r.bet.selection as Selection,
     kickoffUtc: r.bet.kickoffUtc,
     totalStake: r.bet.totalStake,
@@ -139,7 +143,11 @@ function buildSimulations(): SimulationsResponse {
       provider: l.provider,
       market: l.market as Market,
       lineKey: l.lineKey,
-      lineDisplay: formatLine(l.market as Market, l.lineKey ? Number(l.lineKey) : null),
+      lineDisplay: formatSelectionLine(
+        l.market as Market,
+        l.lineKey ? Number(l.lineKey) : null,
+        l.selection,
+      ),
       selection: l.selection as Selection,
       decimalOdds: l.decimalOdds,
       stake: l.stake,

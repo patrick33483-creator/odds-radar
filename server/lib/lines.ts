@@ -141,6 +141,22 @@ export function formatLine(market: "1X2" | "AH" | "OU", value: number | null): s
   return market === "AH" ? formatHandicap(value) : formatTotal(value);
 }
 
+/**
+ * Display a line from the selected betting side's perspective.
+ * Asian-handicap values are stored canonically from the HOME perspective,
+ * so an away selection must invert the sign for user-facing text.
+ */
+export function formatSelectionLine(
+  market: "1X2" | "AH" | "OU",
+  value: number | null,
+  selection: string,
+): string {
+  if (market === "AH" && value !== null && selection === "A") {
+    return formatHandicap(-value);
+  }
+  return formatLine(market, value);
+}
+
 /** Split a quarter line into its two half-lines. Non-quarter lines return one. */
 export function splitLine(value: number): number[] {
   const isHalfStep = Math.abs(value * 2 - Math.round(value * 2)) < 1e-9;
