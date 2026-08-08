@@ -4,6 +4,7 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 
 const app = express();
 const httpServer = createServer(app);
@@ -23,6 +24,39 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+const accessUser = process.env.RADAR_ACCESS_USER?.trim();
+const accessPassword = process.env.RADAR_ACCESS_PASSWORD;
+if (accessUser && accessPassword) {
+  app.use((req, res, next) => {
+    const authorization = req.headers.authorization ?? "";
+    const encoded = authorization.startsWith("Basic ") ? authorization.slice(6) : "";
+    let suppliedUser = "";
+    let suppliedPassword = "";
+    try {
+      const decoded = Buffer.from(encoded, "base64").toString("utf8");
+      const separator = decoded.indexOf(":");
+      suppliedUser = separator >= 0 ? decoded.slice(0, separator) : "";
+      suppliedPassword = separator >= 0 ? decoded.slice(separator + 1) : "";
+    } catch {
+      // Invalid credentials are handled by the common rejection below.
+    }
+    const same = (a: string, b: string) => {
+      const left = Buffer.from(a);
+      const right = Buffer.from(b);
+      return left.length === right.length && timingSafeEqual(left, right);
+    };
+    if (same(suppliedUser, accessUser) && same(suppliedPassword, accessPassword)) {
+      return next();
+    }
+    res.setHeader("WWW-Authenticate", 'Basic realm="Odds Radar", charset="UTF-8"');
+    return res.status(401).send("Authentication required");
+  });
+}
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {

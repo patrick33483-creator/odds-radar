@@ -17,5 +17,6 @@ data.db-journal
 data.db
 data.db-*
 backups/
+data/
 scratch_*.ts
 tmpprobe/

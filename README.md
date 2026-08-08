@@ -42,15 +42,16 @@ npm run dev
 * 已開賽 / 進行中 / 已完場 / 未對照到 Pinnacle 的場次一律排除
 * CLI 結束碼：`0` = `NO_WINDOW`/`NO_ALERT`、`10` = `ALERT`、`1` = `ERROR`
 
-### 頻率仍然故意未定，**本次沒有建立任何外部排程／cron**
+### 持久伺服器自動頻率
 
 | 環境變數 | 預設 | 範圍 | 說明 |
 | --- | --- | --- | --- |
 | `RADAR_SCAN_WINDOW_MIN` | `30` | 1–30 | 密集掃描視窗（分鐘） |
 | `RADAR_SCAN_INTERVAL_SEC` | `30` | 5–120 | 密集輪詢間隔 |
 | `RADAR_SIM_TARGET` | `0` | `0` 或正整數 | 模擬注單總目標；`0` 為無上限。達標後自動視窗掃描不會發出賽程或賠率請求。 |
+| `RADAR_HOURLY_PREWARM` | 啟用 | `0` / `1` | 每小時預熱未來 24 小時賽事的配對與價格，不建立模擬注單 |
 
-本次沒有建立或啟用任何外部排程工作。既有伺服器程序如已設定啟用自動視窗檢查，達到 `RADAR_SIM_TARGET` 時會在任何上游請求前無動作返回。
+持久伺服器啟動後會在程序內自動執行上述兩個循環，不依賴瀏覽器或 Perplexity 頁面長開。達到 `RADAR_SIM_TARGET` 時，密集掃描會在任何上游請求前無動作返回。
 
 ---
 
@@ -129,22 +130,45 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 | `RADAR_DB` | `data.db` | SQLite 路徑 |
 | `RADAR_BACKUP_DIR` | `backups` | 備份目錄 |
 | `RADAR_BOOTSTRAP` | 啟用 | 設 `0` 可關閉啟動時的輕量暖機 |
+| `RADAR_AUTO_SCAN` | 啟用 | `0` 可關閉每 30 秒視窗檢查 |
+| `RADAR_HOURLY_PREWARM` | 啟用 | `0` 可關閉每小時 24 小時預熱配對 |
 | `RADAR_DEMO` | 關閉 | `1` = 明確示範模式 |
 | `RADAR_SCAN_WINDOW_MIN` / `RADAR_SCAN_INTERVAL_SEC` | `30` / `30` | 密集掃描設定（見上） |
 | `RADAR_SIM_TARGET` | `0` | 嚴格的模擬注單總數上限；`0` = 無上限 |
 | `PINNAPI_API_KEY` / `CUSTOM_CRED_PINNAPI_COM_TOKEN` | — | PinnAPI Edge 的其中一種憑證（優先使用 custom token） |
 | `PINNAPI_BASE_URL` / `CUSTOM_CRED_PINNAPI_COM_URL` | `https://pinnapi.com` | PinnAPI Edge 基底網址 |
 | `PINNACLE_TITAN_COMPANY_ID` | `47` | titan007 選列的最後備援提示（名稱比對優先） |
+| `RADAR_ACCESS_USER` / `RADAR_ACCESS_PASSWORD` | — | 生產儀表板 HTTP Basic 登入 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | 持久伺服器 Telegram 通知設定 |
+
+Telegram 通知由雷達伺服器直接送出，只在密集掃描建立新模擬注單後發送；同一張注單成功送達後會在 SQLite 記錄去重，不依賴 Perplexity 排程或瀏覽器長開。
 
 ---
 
-## 7. 映射遷移
+## 7. DigitalOcean 持久部署
+
+建議 Ubuntu 24.04、Singapore SGP1、Basic 1 GB Droplet。伺服器只需一次初始化：
+
+```bash
+sudo bash deploy/bootstrap-ubuntu.sh
+sudo git clone <private-github-repo> /opt/odds-radar
+cd /opt/odds-radar
+sudo cp .env.example .env
+sudo nano .env
+sudo docker compose up -d --build
+```
+
+`data/` 與 `backups/` 是主機持久目錄，不會因映像重建而消失。GitHub Actions 需要設定 `DEPLOY_HOST`、`DEPLOY_USER`、`DEPLOY_SSH_KEY` 三個 Repository Secrets；每次推送 `master` 都會先跑型別檢查、測試及打包，全部通過後才更新伺服器。
+
+---
+
+## 8. 映射遷移
 
 現有 SQLite 資料庫在啟動時只會對 `pinnacle_source_map` 加入 `pinnapi_id` 和 `pinnapi_reversed` 兩個欄位及索引；不會清除既有賽程、快照、機會或模擬資料。`matches.pinnacle_match_id` 保存目前啟用的來源 ID（通常為 `pinnapi:<event_id>`），而完整的 PinnAPI／OpticOdds／titan007 對照保存在 `pinnacle_source_map`。
 
 ---
 
-## 8. 測試
+## 9. 測試
 
 ```bash
 npm test

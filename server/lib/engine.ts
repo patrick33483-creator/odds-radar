@@ -35,6 +35,7 @@ import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDE
 import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
+import { notifySimulationBets } from "./telegram";
 import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
@@ -993,6 +994,14 @@ export class RadarEngine {
       });
       this.lastScan = outcome;
       setState("lastScan", JSON.stringify(outcome));
+      if (outcome.newOpportunityKeys.length) {
+        try {
+          const sent = await notifySimulationBets(outcome.newOpportunityKeys);
+          if (sent) log("telegram_notifications", { sent });
+        } catch (err) {
+          log("telegram_notification_error", { error: (err as Error).message });
+        }
+      }
       await this.settleDue(false);
       log("window_scan", {
         result: outcome.result,

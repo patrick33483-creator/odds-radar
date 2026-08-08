@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+dist
+data.db*
+data
+backups
+.env
+.env.*
+!.env.example
+*.log
+scratch_*.ts
+tmpprobe
+

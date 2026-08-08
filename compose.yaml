@@ -1,0 +1,29 @@
+services:
+  radar:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      HOST: 0.0.0.0
+      RADAR_DB: /app/data/data.db
+      RADAR_BACKUP_DIR: /app/backups
+      RADAR_AUTO_SCAN: "1"
+      RADAR_HOURLY_PREWARM: "1"
+      RADAR_SCAN_WINDOW_MIN: "30"
+      RADAR_SCAN_INTERVAL_SEC: "30"
+    ports:
+      - "80:5000"
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+

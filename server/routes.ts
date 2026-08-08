@@ -12,6 +12,8 @@ const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth
 const matchRefreshSchema = z.object({ matchId: z.string().min(1).max(120) });
 let autoScanTimer: NodeJS.Timeout | null = null;
 let autoScanStartupTimer: NodeJS.Timeout | null = null;
+let hourlyPrewarmTimer: NodeJS.Timeout | null = null;
+let hourlyPrewarmStartupTimer: NodeJS.Timeout | null = null;
 
 function installAutoWindowScan(): void {
   if (!autoScanEnabled() || autoScanTimer) return;
@@ -65,6 +67,44 @@ function installAutoWindowScan(): void {
   autoScanStartupTimer.unref();
   autoScanTimer = setInterval(() => void tick(), AUTO_SCAN_CHECK_MS);
   autoScanTimer.unref();
+}
+
+function installHourlyPrewarm(): void {
+  if (process.env.RADAR_HOURLY_PREWARM === "0" || hourlyPrewarmTimer) return;
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const outcome = await engine.refresh({ force: true, mode: "prewarm24h" });
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "hourly_prewarm",
+          started: outcome.started,
+          throttled: outcome.throttled,
+          mode: outcome.mode,
+        }),
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "hourly_prewarm_error",
+          error: (err as Error).message,
+        }),
+      );
+    } finally {
+      running = false;
+    }
+  };
+  // The normal boot refresh runs first; pre-warm follows after five minutes.
+  hourlyPrewarmStartupTimer = setTimeout(() => void run(), 5 * 60_000);
+  hourlyPrewarmStartupTimer.unref();
+  hourlyPrewarmTimer = setInterval(() => void run(), 60 * 60_000);
+  hourlyPrewarmTimer.unref();
 }
 
 function buildSimulations(): SimulationsResponse {
@@ -154,6 +194,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
   }
   installAutoWindowScan();
+  installHourlyPrewarm();
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.buildDashboardData();
