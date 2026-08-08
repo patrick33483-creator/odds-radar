@@ -10,7 +10,9 @@
  */
 
 import { splitLine } from "./lines";
+import { matchEvent, type AliasIndex, type CandidateEvent } from "./matching";
 import type { Market, Selection } from "@shared/types";
+import type { FinalResult } from "../providers/types";
 
 export type LegStatus = "win" | "half_win" | "push" | "half_loss" | "loss";
 
@@ -135,4 +137,58 @@ export const SETTLE_AFTER_MS = 105 * 60 * 1000;
 
 export function isSettleEligible(kickoffUtc: number, now: number): boolean {
   return now - kickoffUtc >= SETTLE_AFTER_MS;
+}
+
+export interface PinnapiLiveCacheState {
+  homeScore: number;
+  awayScore: number;
+  seenLive: number;
+  noLongerLive: number;
+}
+
+/**
+ * PinnAPI may only settle after a score was genuinely observed in its live
+ * feed, the event subsequently disappeared from that feed, and the normal
+ * 105-minute grace period has elapsed. A missing cache deliberately permits
+ * the titan007 fallback; a currently-live cache deliberately blocks it.
+ */
+export function chooseSettlementSource(
+  cache: PinnapiLiveCacheState | null | undefined,
+  kickoffUtc: number,
+  now: number,
+): "pinnapi_live" | "wait_for_pinnapi_end" | "titan_fallback" {
+  if (!isSettleEligible(kickoffUtc, now)) return "wait_for_pinnapi_end";
+  if (!cache || !cache.seenLive) return "titan_fallback";
+  return cache.noLongerLive ? "pinnapi_live" : "wait_for_pinnapi_end";
+}
+
+export interface MatchedFinalResult {
+  result: FinalResult;
+  /** True when the final-result feed listed the teams in the reverse order. */
+  reversed: boolean;
+}
+
+/**
+ * Safe fallback when a titan007 ID is unavailable or stale. It uses the same
+ * hard kickoff window, league scoring and normalized-team safeguards as normal
+ * fixture mapping; names alone can never settle a bet.
+ */
+export function matchFinalResult(
+  target: CandidateEvent,
+  results: FinalResult[],
+  aliases?: AliasIndex,
+): MatchedFinalResult | null {
+  const candidates = results
+    .filter((result) => result.providerMatchId && result.league && result.homeTeam && result.awayTeam && Number.isFinite(result.kickoffUtc))
+    .map((result) => ({
+      id: result.providerMatchId,
+      league: result.league,
+      homeTeam: result.homeTeam,
+      awayTeam: result.awayTeam,
+      kickoffUtc: result.kickoffUtc,
+    }));
+  const decision = matchEvent(target, candidates, aliases);
+  if (!decision.pinnacleMatchId) return null;
+  const result = results.find((entry) => entry.providerMatchId === decision.pinnacleMatchId);
+  return result ? { result, reversed: decision.reversed } : null;
 }

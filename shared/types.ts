@@ -266,6 +266,7 @@ export interface SimulationBetDto {
   realizedReturn: number | null;
   realizedPnl: number | null;
   finalScore: string | null;
+  settlementSource: string | null;
   legs: SimulationLegDto[];
 }
 

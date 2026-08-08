@@ -171,6 +171,8 @@ export const simulationBets = sqliteTable(
     realizedReturn: real("realized_return"),
     realizedPnl: real("realized_pnl"),
     finalScore: text("final_score"),
+    /** Final-score provenance, e.g. pinnapi_live or titan_over_YYYYMMDD. */
+    settlementSource: text("settlement_source"),
     notes: text("notes"),
   },
   (t) => ({
@@ -201,7 +203,7 @@ export const simulationLegs = sqliteTable(
   }),
 );
 
-/** Final results pulled from titan007. */
+/** Final results pulled from PinnAPI live cache or titan007 fallback. */
 export const results = sqliteTable(
   "results",
   {
@@ -214,6 +216,32 @@ export const results = sqliteTable(
     source: text("source").notNull(), // 'titan_today' | 'titan_over'
     fetchedAt: integer("fetched_at").notNull(),
   },
+);
+
+/**
+ * Last score observed for an open simulated bet in PinnAPI's single live
+ * markets response. A record becomes an end candidate only after it was seen
+ * live and later disappears from that live response.
+ */
+export const pinnapiLiveScores = sqliteTable(
+  "pinnapi_live_scores",
+  {
+    eventId: text("event_id").primaryKey(),
+    matchId: text("match_id").notNull(),
+    homeScore: integer("home_score").notNull(),
+    awayScore: integer("away_score").notNull(),
+    matchMinutes: integer("match_minutes"),
+    matchState: text("match_state"),
+    firstSeen: integer("first_seen").notNull(),
+    lastSeen: integer("last_seen").notNull(),
+    seenLive: integer("seen_live").notNull().default(1),
+    noLongerLive: integer("no_longer_live").notNull().default(0),
+    endedCandidateAt: integer("ended_candidate_at"),
+  },
+  (t) => ({
+    match: index("pinnapi_live_scores_match_idx").on(t.matchId),
+    open: index("pinnapi_live_scores_open_idx").on(t.seenLive, t.noLongerLive),
+  }),
 );
 
 /** Provider health / structured status. */
@@ -250,6 +278,7 @@ export type Opportunity = typeof opportunities.$inferSelect;
 export type SimulationBet = typeof simulationBets.$inferSelect;
 export type SimulationLeg = typeof simulationLegs.$inferSelect;
 export type MatchResult = typeof results.$inferSelect;
+export type PinnapiLiveScoreCache = typeof pinnapiLiveScores.$inferSelect;
 export type ProviderHealth = typeof providerHealth.$inferSelect;
 export type InsertSimulationBet = z.infer<typeof insertSimulationBetSchema>;
 export type InsertSimulationLeg = z.infer<typeof insertSimulationLegSchema>;

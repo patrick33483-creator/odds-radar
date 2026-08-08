@@ -40,6 +40,10 @@ export interface OddsProvider {
 
 export interface FinalResult {
   providerMatchId: string;
+  league: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoffUtc: number;
   homeScore: number;
   awayScore: number;
   halfHome?: number | null;

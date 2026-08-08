@@ -9,6 +9,7 @@ import {
   oddsLatest,
   oddsSnapshots,
   opportunities,
+  pinnapiLiveScores,
   providerHealth,
   results,
   simulationBets,
@@ -92,7 +93,7 @@ CREATE TABLE IF NOT EXISTS simulation_bets (
   total_stake REAL NOT NULL, expected_payout REAL NOT NULL, expected_profit REAL NOT NULL,
   roi REAL NOT NULL, ev_pct REAL, q_total REAL, placed_at INTEGER NOT NULL,
   settled_at INTEGER, result_status TEXT, realized_return REAL, realized_pnl REAL,
-  final_score TEXT, notes TEXT);
+  final_score TEXT, settlement_source TEXT, notes TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS simulation_bets_uniq ON simulation_bets(unique_key);
 CREATE INDEX IF NOT EXISTS simulation_bets_cat_idx ON simulation_bets(category, placed_at);
 
@@ -107,6 +108,15 @@ CREATE TABLE IF NOT EXISTS results (
   match_id TEXT PRIMARY KEY, pinnacle_match_id TEXT, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, half_home INTEGER, half_away INTEGER,
   source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
+  event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
+  away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,
+  first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+  seen_live INTEGER NOT NULL DEFAULT 1, no_longer_live INTEGER NOT NULL DEFAULT 0,
+  ended_candidate_at INTEGER);
+CREATE INDEX IF NOT EXISTS pinnapi_live_scores_match_idx ON pinnapi_live_scores(match_id);
+CREATE INDEX IF NOT EXISTS pinnapi_live_scores_open_idx ON pinnapi_live_scores(seen_live, no_longer_live);
 
 CREATE TABLE IF NOT EXISTS provider_health (
   provider TEXT PRIMARY KEY, ok INTEGER NOT NULL DEFAULT 0, last_success_at INTEGER,
@@ -126,6 +136,12 @@ CREATE TABLE IF NOT EXISTS app_state (
   if (!sourceNames.has("pinnapi_id")) sqlite.exec("ALTER TABLE pinnacle_source_map ADD COLUMN pinnapi_id TEXT");
   if (!sourceNames.has("pinnapi_reversed")) {
     sqlite.exec("ALTER TABLE pinnacle_source_map ADD COLUMN pinnapi_reversed INTEGER NOT NULL DEFAULT 0");
+  }
+  const simulationBetColumns = sqlite
+    .prepare("PRAGMA table_info(simulation_bets)")
+    .all() as Array<{ name: string }>;
+  if (!simulationBetColumns.some((column) => column.name === "settlement_source")) {
+    sqlite.exec("ALTER TABLE simulation_bets ADD COLUMN settlement_source TEXT");
   }
   sqlite.exec("CREATE INDEX IF NOT EXISTS pinnacle_source_map_pinnapi_idx ON pinnacle_source_map(pinnapi_id)");
 }
@@ -167,6 +183,7 @@ export {
   oddsLatest,
   oddsSnapshots,
   opportunities,
+  pinnapiLiveScores,
   providerHealth,
   results,
   simulationBets,

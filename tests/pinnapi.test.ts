@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   parsePinnapiFixtures,
+  parsePinnapiLiveEventIds,
+  parsePinnapiLiveScores,
   parsePinnapiLines,
   pinnapiConfig,
   pinnapiHeaders,
@@ -160,6 +162,44 @@ describe("PinnAPI Edge full-match prices", () => {
         expect.objectContaining({ market: "OU", lineValue: 2.75, selection: "U", decimalOdds: 2.17 }),
       ]),
     );
+  });
+});
+
+describe("PinnAPI Edge live-score snapshots", () => {
+  it("uses state scores first and only falls back to num_0 metadata for live rows", () => {
+    const payload = {
+      events: [
+        {
+          event_id: 901,
+          status: "live",
+          state: {
+            home: { score: 2 },
+            away: { score: 1 },
+            match: { minutes: 74, status: "running" },
+          },
+          periods: { num_0: { meta: { home_score: 9, away_score: 9 } } },
+        },
+        {
+          event_id: 902,
+          live: true,
+          state: { match: { minutes: "90+3" } },
+          periods: { num_0: { meta: { home_score: 0, away_score: 0 } } },
+        },
+        {
+          event_id: 903,
+          status: "open",
+          periods: { num_0: { meta: { home_score: 0, away_score: 0 } } },
+        },
+      ],
+    };
+
+    expect(parsePinnapiLiveScores(payload, 123_456)).toEqual([
+      { eventId: "901", homeScore: 2, awayScore: 1, minutes: 74, state: "running", observedAt: 123_456 },
+      { eventId: "902", homeScore: 0, awayScore: 0, minutes: 90, state: null, observedAt: 123_456 },
+    ]);
+    // The endpoint may list an incomplete live row. Its ID still prevents an
+    // already-observed event from being falsely marked as ended.
+    expect(parsePinnapiLiveEventIds(payload)).toEqual(["901", "902"]);
   });
 });
 

@@ -33,7 +33,6 @@
 
 import { fetchText } from "../lib/http";
 import { hkToDecimal, parsePinnacleHandicap, parsePinnacleTotal } from "../lib/lines";
-import { matchEvent, type CandidateEvent } from "../lib/matching";
 import {
   fetchApiFixtures,
   fetchApiPrices,
@@ -278,8 +277,6 @@ export class PinnacleProvider {
   private warnings: string[] = [];
   /** Matches where titan007 listed no Pinnacle row (aggregated, not per match). */
   private missingRows = new Set<string>();
-  /** titan007 fixtures cached for id translation when the API strategy is active. */
-  private apiFixtureCache: { at: number; rows: CandidateEvent[] } | null = null;
 
   get strategy(): PinnacleStrategy {
     return hasOfficialCredentials() && !this.officialFailed ? "official-api" : "titan007";
@@ -308,16 +305,6 @@ export class PinnacleProvider {
     if (this.strategy === "official-api") {
       try {
         const api = await fetchApiFixtures();
-        this.apiFixtureCache = {
-          at: Date.now(),
-          rows: api.map((f) => ({
-            id: f.providerMatchId,
-            league: f.league,
-            homeTeam: f.homeTeam,
-            awayTeam: f.awayTeam,
-            kickoffUtc: f.kickoffUtc,
-          })),
-        };
         return api.map((f) => ({
           providerMatchId: f.providerMatchId,
           league: f.league,
@@ -484,9 +471,9 @@ export class PinnacleProvider {
 
   /**
    * Final scores. Scores are neutral match data and always come from titan007's
-   * played-fixture pages (no odds are read here). When the official API
-   * strategy is active the titan007 fixture is translated into the API event id
-   * by kickoff + team-name matching so settlement keeps working.
+   * played-fixture pages (no odds are read here). Keep titan's own ID and
+   * fixture identity so a stale mapping can safely fall back to team + kickoff
+   * matching at settlement time.
    */
   async fetchResults(dayOffsets: number[] = [0, -1, -2]): Promise<FinalResult[]> {
     const out: FinalResult[] = [];
@@ -505,7 +492,15 @@ export class PinnacleProvider {
             const finished = /完|-1/.test(f.statusText) || off < 0;
             if (!finished) continue;
             out.push({
-              providerMatchId: this.translateId(f),
+              // Settlement uses the titan ID as a fast path, then falls back
+              // to the original fixture identity (teams + kickoff) if an ID
+              // mapping is stale or absent. Never collapse that evidence into
+              // an active odds-provider ID here.
+              providerMatchId: f.providerMatchId,
+              league: f.league,
+              homeTeam: f.homeTeam,
+              awayTeam: f.awayTeam,
+              kickoffUtc: f.kickoffUtc,
               homeScore: f.homeScore,
               awayScore: f.awayScore,
               halfHome: f.halfHome,
@@ -522,15 +517,6 @@ export class PinnacleProvider {
     return out.filter((r) => r.providerMatchId);
   }
 
-  /** titan007 sId -> active-strategy id (identity for the titan007 strategy). */
-  private translateId(f: PinnacleFixture): string {
-    if (this.strategy !== "official-api" || !this.apiFixtureCache) return f.providerMatchId;
-    const decision = matchEvent(
-      { id: f.providerMatchId, league: f.league, homeTeam: f.homeTeam, awayTeam: f.awayTeam, kickoffUtc: f.kickoffUtc },
-      this.apiFixtureCache.rows,
-    );
-    return decision.pinnacleMatchId ?? "";
-  }
 }
 
 export function pinnacleFixtureToEvent(f: PinnacleFixture, prices: ProviderPrice[]): ProviderEvent {

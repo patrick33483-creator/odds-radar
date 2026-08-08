@@ -49,7 +49,16 @@ import {
   type ScanCandidate,
   type ScanConfig,
 } from "./scan";
-import { aggregateBetStatus, isSettleEligible, legReturn, round2, settleLeg, type LegStatus } from "./settlement";
+import {
+  aggregateBetStatus,
+  chooseSettlementSource,
+  isSettleEligible,
+  legReturn,
+  matchFinalResult,
+  round2,
+  settleLeg,
+  type LegStatus,
+} from "./settlement";
 import {
   countSnapshots,
   db,
@@ -64,7 +73,6 @@ import {
   providerHealth,
   pruneSnapshots,
   rawDb,
-  results as resultsTable,
   setState,
   simulationBets,
   simulationLegs,
@@ -511,6 +519,79 @@ export class RadarEngine {
       titan_id: string | null;
       titan_reversed: number;
     } | undefined) ?? null;
+  }
+
+  /**
+   * After kickoff, update all open PinnAPI-mapped simulations from exactly one
+   * bounded all-live-markets request. The payload is filtered to tracked IDs
+   * locally; this path never issues an event-by-event score request.
+   */
+  private async refreshTrackedPinnapiLiveScores(now: number): Promise<void> {
+    if (DEMO || !this.pinnapi.status().configured) return;
+    const matchesById = new Map(db.select().from(matches).all().map((match) => [match.id, match]));
+    const tracked = new Map<string, { eventId: string; matchId: string; reversed: boolean }>();
+    for (const bet of db.select().from(simulationBets).all()) {
+      if (bet.settledAt || bet.kickoffUtc > now) continue;
+      const match = matchesById.get(bet.matchId);
+      if (!match) continue;
+      const source = this.sourceMap(match.id);
+      const eventId =
+        source?.pinnapi_id ??
+        (match.pinnacleMatchId?.startsWith("pinnapi:") ? match.pinnacleMatchId.slice("pinnapi:".length) : null);
+      if (eventId) tracked.set(eventId, { eventId, matchId: match.id, reversed: !!source?.pinnapi_reversed });
+    }
+    if (!tracked.size) return;
+
+    try {
+      const snapshot = await this.pinnapi.fetchLiveScoreSnapshot();
+      const scoreByEvent = new Map(snapshot.scores.map((score) => [score.eventId, score]));
+      const liveEventIds = new Set(snapshot.liveEventIds);
+      const upsert = rawDb.prepare(
+        `INSERT INTO pinnapi_live_scores(event_id,match_id,home_score,away_score,match_minutes,match_state,first_seen,last_seen,seen_live,no_longer_live,ended_candidate_at)
+         VALUES(?,?,?,?,?,?,?,?,1,0,NULL)
+         ON CONFLICT(event_id) DO UPDATE SET match_id=excluded.match_id,home_score=excluded.home_score,
+         away_score=excluded.away_score,match_minutes=excluded.match_minutes,match_state=excluded.match_state,
+         last_seen=excluded.last_seen,seen_live=1,no_longer_live=0,ended_candidate_at=NULL`,
+      );
+      const retainLive = rawDb.prepare(
+        `UPDATE pinnapi_live_scores SET match_id=?,last_seen=?,match_state=COALESCE(match_state,'live_score_unavailable'),
+         seen_live=1,no_longer_live=0,ended_candidate_at=NULL WHERE event_id=?`,
+      );
+      const markEnded = rawDb.prepare(
+        `UPDATE pinnapi_live_scores SET no_longer_live=1,match_state='no_longer_live',
+         ended_candidate_at=COALESCE(ended_candidate_at,?) WHERE event_id=? AND seen_live=1`,
+      );
+      const tx = rawDb.transaction(() => {
+        for (const trackedEvent of tracked.values()) {
+          const score = scoreByEvent.get(trackedEvent.eventId);
+          if (score) {
+            const homeScore = trackedEvent.reversed ? score.awayScore : score.homeScore;
+            const awayScore = trackedEvent.reversed ? score.homeScore : score.awayScore;
+            upsert.run(
+              trackedEvent.eventId,
+              trackedEvent.matchId,
+              homeScore,
+              awayScore,
+              score.minutes,
+              score.state,
+              score.observedAt,
+              score.observedAt,
+            );
+          } else if (liveEventIds.has(trackedEvent.eventId)) {
+            // An incomplete score row is still proof the event remains live;
+            // do not turn it into an end candidate.
+            retainLive.run(trackedEvent.matchId, snapshot.observedAt, trackedEvent.eventId);
+          } else {
+            // Disappearance matters only after a real score/live observation.
+            markEnded.run(snapshot.observedAt, trackedEvent.eventId);
+          }
+        }
+      });
+      tx();
+      log("pinnapi_live_scores", { tracked: tracked.size, scored: scoreByEvent.size });
+    } catch (err) {
+      log("pinnapi_live_scores_error", { error: (err as Error).message, tracked: tracked.size });
+    }
   }
 
   /** Re-orient a fallback or PinnAPI quote when its fixture was matched reversed. */
@@ -1474,49 +1555,133 @@ export class RadarEngine {
 
   /* ------------------------------ settlement ---------------------------- */
 
-  /** Pull results and settle every eligible simulated bet. */
+  /**
+   * Settle eligible simulations. PinnAPI's live cache is authoritative only
+   * after a score was observed while live and the same event subsequently left
+   * the live response. titan007 is strictly a fallback when that cache is
+   * absent, never a reason to settle an event still known to be live.
+   */
   async settleDue(manual: boolean): Promise<{ settled: number; pending: number; resultsFetched: number }> {
     const now = Date.now();
     const open = db.select().from(simulationBets).all().filter((b) => !b.settledAt);
-    const due = open.filter((b) => manual || isSettleEligible(b.kickoffUtc, now));
+    await this.refreshTrackedPinnapiLiveScores(now);
+    // Manual settlement may refresh/check results, but cannot bypass the
+    // existing 105-minute protection for a final score.
+    const due = open.filter((b) => isSettleEligible(b.kickoffUtc, now));
     if (!due.length) return { settled: 0, pending: open.length, resultsFetched: 0 };
 
-    let resultsFetched = 0;
-    try {
-      const fetched = DEMO ? DEMO_FIXTURE.results : await this.pinnacle.fetchResults([0, -1, -2, -3]);
-      resultsFetched = fetched.length;
-      const byPinnacleId = new Map(fetched.map((r) => [r.providerMatchId, r]));
-      const stmt = rawDb.prepare(
-        `INSERT INTO results(match_id,pinnacle_match_id,home_score,away_score,half_home,half_away,source,fetched_at)
-         VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
-         away_score=excluded.away_score, half_home=excluded.half_home, half_away=excluded.half_away,
-         source=excluded.source, fetched_at=excluded.fetched_at`,
+    const matchesById = new Map(db.select().from(matches).all().map((match) => [match.id, match]));
+    const cachedLive = rawDb
+      .prepare(
+        `SELECT event_id,match_id,home_score,away_score,seen_live,no_longer_live
+         FROM pinnapi_live_scores WHERE match_id IN (${due.map(() => "?").join(",")})`,
+      )
+      .all(...due.map((bet) => bet.matchId)) as Array<{
+      event_id: string;
+      match_id: string;
+      home_score: number;
+      away_score: number;
+      seen_live: number;
+      no_longer_live: number;
+    }>;
+    const cacheByEvent = new Map(cachedLive.map((row) => [row.event_id, row]));
+    const chosen = new Map<string, { homeScore: number; awayScore: number; pinnacleId: string; source: string }>();
+    const titanFallback = due.filter((bet) => {
+      const match = matchesById.get(bet.matchId);
+      const source = match ? this.sourceMap(match.id) : null;
+      const activePinnacleId = match?.pinnacleMatchId ?? null;
+      const eventId =
+        source?.pinnapi_id ??
+        (activePinnacleId?.startsWith("pinnapi:") ? activePinnacleId.slice("pinnapi:".length) : null);
+      const cache = eventId ? cacheByEvent.get(eventId) : undefined;
+      const choice = chooseSettlementSource(
+        cache
+          ? {
+              homeScore: cache.home_score,
+              awayScore: cache.away_score,
+              seenLive: cache.seen_live,
+              noLongerLive: cache.no_longer_live,
+            }
+          : null,
+        bet.kickoffUtc,
+        now,
       );
-      const tx = rawDb.transaction(() => {
-        for (const b of due) {
-          const m = db.select().from(matches).where(eq(matches.id, b.matchId)).get();
-          if (!m?.pinnacleMatchId) continue;
-          const source = this.sourceMap(m.id);
-          const titanId = source?.titan_id ?? (m.pinnacleMatchId.startsWith("titan:") ? m.pinnacleMatchId.slice(6) : m.pinnacleMatchId);
-          const r = byPinnacleId.get(titanId);
-          if (!r) continue;
-          const homeScore = source?.titan_reversed ? r.awayScore : r.homeScore;
-          const awayScore = source?.titan_reversed ? r.homeScore : r.awayScore;
-          const halfHome = source?.titan_reversed ? r.halfAway : r.halfHome;
-          const halfAway = source?.titan_reversed ? r.halfHome : r.halfAway;
-          stmt.run(b.matchId, titanId, homeScore, awayScore, halfHome ?? null, halfAway ?? null, r.source, now);
+      if (choice === "pinnapi_live" && cache) {
+        chosen.set(bet.matchId, {
+          homeScore: cache.home_score,
+          awayScore: cache.away_score,
+          pinnacleId: `pinnapi:${cache.event_id}`,
+          source: "pinnapi_live",
+        });
+      }
+      return choice === "titan_fallback";
+    });
+
+    let titanFetched = 0;
+    try {
+      if (titanFallback.length) {
+        const fetched = DEMO ? DEMO_FIXTURE.results : await this.pinnacle.fetchResults([0, -1, -2, -3]);
+        titanFetched = fetched.length;
+        const byTitanId = new Map(fetched.map((result) => [result.providerMatchId, result]));
+        const aliases = this.aliasIndex();
+        for (const bet of titanFallback) {
+          const match = matchesById.get(bet.matchId);
+          if (!match) continue;
+          const source = this.sourceMap(match.id);
+          const titanId =
+            source?.titan_id ??
+            (match.pinnacleMatchId?.startsWith("titan:") ? match.pinnacleMatchId.slice("titan:".length) : null);
+          let result = titanId ? byTitanId.get(titanId) : undefined;
+          let reversed = !!source?.titan_reversed;
+          if (!result) {
+            const matched = matchFinalResult(
+              {
+                id: match.id,
+                league: match.league,
+                homeTeam: match.homeTeam,
+                awayTeam: match.awayTeam,
+                kickoffUtc: match.kickoffUtc,
+              },
+              fetched,
+              aliases,
+            );
+            result = matched?.result;
+            reversed = !!matched?.reversed;
+          }
+          if (!result) continue;
+          chosen.set(bet.matchId, {
+            homeScore: reversed ? result.awayScore : result.homeScore,
+            awayScore: reversed ? result.homeScore : result.awayScore,
+            pinnacleId: result.providerMatchId,
+            source: result.source,
+          });
         }
-      });
-      tx();
+      }
     } catch (err) {
       log("results_error", { error: (err as Error).message });
     }
 
+    const resultStmt = rawDb.prepare(
+      `INSERT INTO results(match_id,pinnacle_match_id,home_score,away_score,half_home,half_away,source,fetched_at)
+       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+       away_score=excluded.away_score, half_home=excluded.half_home, half_away=excluded.half_away,
+       source=excluded.source, fetched_at=excluded.fetched_at`,
+    );
     let settled = 0;
     const tx = rawDb.transaction(() => {
       for (const b of due) {
-        const result = db.select().from(resultsTable).where(eq(resultsTable.matchId, b.matchId)).get();
+        const result = chosen.get(b.matchId);
         if (!result) continue;
+        resultStmt.run(
+          b.matchId,
+          result.pinnacleId,
+          result.homeScore,
+          result.awayScore,
+          null,
+          null,
+          result.source,
+          now,
+        );
         const legs = db.select().from(simulationLegs).where(eq(simulationLegs.betId, b.id)).all();
         if (!legs.length) continue;
         const score = { homeScore: result.homeScore, awayScore: result.awayScore };
@@ -1533,13 +1698,22 @@ export class RadarEngine {
         const pnl = round2(totalReturn - b.totalStake);
         rawDb
           .prepare(
-            "UPDATE simulation_bets SET settled_at=?, result_status=?, realized_return=?, realized_pnl=?, final_score=? WHERE id=?",
+            "UPDATE simulation_bets SET settled_at=?, result_status=?, realized_return=?, realized_pnl=?, final_score=?, settlement_source=? WHERE id=?",
           )
-          .run(now, aggregateBetStatus(statuses), round2(totalReturn), pnl, `${score.homeScore}-${score.awayScore}`, b.id);
+          .run(
+            now,
+            aggregateBetStatus(statuses),
+            round2(totalReturn),
+            pnl,
+            `${score.homeScore}-${score.awayScore}`,
+            result.source,
+            b.id,
+          );
         settled++;
       }
     });
     tx();
+    const resultsFetched = chosen.size + titanFetched;
     log("settlement", { settled, due: due.length, resultsFetched, manual });
     return { settled, pending: open.length - settled, resultsFetched };
   }

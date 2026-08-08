@@ -20,7 +20,15 @@ import { buildSynthetic, syntheticCoversCrown } from "../server/lib/synthetic";
 import { leagueSimilarity, matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
 import { teamAliasSeedRows, TEAM_ALIAS_SEED_PAIRS } from "../server/lib/team-alias-seeds";
-import { legReturn, settle1X2, settleHandicap, settleTotal } from "../server/lib/settlement";
+import {
+  chooseSettlementSource,
+  legReturn,
+  matchFinalResult,
+  SETTLE_AFTER_MS,
+  settle1X2,
+  settleHandicap,
+  settleTotal,
+} from "../server/lib/settlement";
 
 /* ----------------------------- normalization ----------------------------- */
 
@@ -557,5 +565,55 @@ describe("settlement scenarios", () => {
     expect(legReturn("push", 1000, 1.9)).toBe(1000);
     expect(legReturn("half_loss", 1000, 1.9)).toBe(500);
     expect(legReturn("loss", 1000, 1.9)).toBe(0);
+  });
+});
+
+describe("settlement-source safeguards", () => {
+  const kickoffUtc = 1_700_000_000_000;
+  const now = kickoffUtc + SETTLE_AFTER_MS + 1;
+
+  it("requires a live observation to disappear before PinnAPI can settle", () => {
+    expect(
+      chooseSettlementSource({ homeScore: 2, awayScore: 1, seenLive: 1, noLongerLive: 0 }, kickoffUtc, now),
+    ).toBe("wait_for_pinnapi_end");
+    expect(
+      chooseSettlementSource({ homeScore: 2, awayScore: 1, seenLive: 1, noLongerLive: 1 }, kickoffUtc, now),
+    ).toBe("pinnapi_live");
+  });
+
+  it("uses titan007 only when the PinnAPI live cache is insufficient", () => {
+    expect(chooseSettlementSource(null, kickoffUtc, now)).toBe("titan_fallback");
+    expect(
+      chooseSettlementSource({ homeScore: 1, awayScore: 0, seenLive: 1, noLongerLive: 1 }, kickoffUtc, kickoffUtc + SETTLE_AFTER_MS - 1),
+    ).toBe("wait_for_pinnapi_end");
+  });
+
+  it("matches a titan007 final result by teams and kickoff when its ID misses, including reversed teams", () => {
+    const result = {
+      providerMatchId: "titan-unmapped-result",
+      league: "Test League",
+      homeTeam: "Away FC",
+      awayTeam: "Home FC",
+      kickoffUtc,
+      homeScore: 3,
+      awayScore: 1,
+      source: "titan_over_20260808",
+    };
+    const matched = matchFinalResult(
+      {
+        id: "hkjc:test",
+        league: "Test League",
+        homeTeam: "Home FC",
+        awayTeam: "Away FC",
+        kickoffUtc,
+      },
+      [result],
+    );
+
+    expect(matched).toMatchObject({ result, reversed: true });
+    expect({
+      homeScore: matched!.reversed ? matched!.result.awayScore : matched!.result.homeScore,
+      awayScore: matched!.reversed ? matched!.result.homeScore : matched!.result.awayScore,
+    }).toEqual({ homeScore: 1, awayScore: 3 });
   });
 });

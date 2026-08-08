@@ -92,6 +92,7 @@ function buildSimulations(): SimulationsResponse {
     realizedReturn: r.bet.realizedReturn,
     realizedPnl: r.bet.realizedPnl,
     finalScore: r.bet.finalScore,
+    settlementSource: r.bet.settlementSource,
     legs: r.legs.map((l) => ({
       id: l.id,
       provider: l.provider,

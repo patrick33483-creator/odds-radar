@@ -40,6 +40,26 @@ export interface PinnapiLines {
   prices: ProviderPrice[];
 }
 
+/**
+ * A score observed in PinnAPI's bounded all-live-markets response. It is
+ * explicitly a live observation, never a final result by itself.
+ */
+export interface PinnapiLiveScore {
+  eventId: string;
+  homeScore: number;
+  awayScore: number;
+  minutes: number | null;
+  state: string | null;
+  observedAt: number;
+}
+
+export interface PinnapiLiveScoreSnapshot {
+  observedAt: number;
+  scores: PinnapiLiveScore[];
+  /** Live event IDs even when a malformed row carries no usable score. */
+  liveEventIds: string[];
+}
+
 export interface PinnapiConfig {
   baseUrl: string;
   configured: boolean;
@@ -58,13 +78,21 @@ function str(value: unknown): string {
 }
 
 function num(value: unknown): number | null {
-  const n = typeof value === "number" ? value : Number(str(value));
+  if (value === null || value === undefined) return null;
+  const text = str(value);
+  if (!text) return null;
+  const n = typeof value === "number" ? value : Number(text);
   return Number.isFinite(n) ? n : null;
 }
 
 function validDecimal(value: unknown): number | null {
   const n = num(value);
   return n !== null && n > 1 ? n : null;
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  const n = num(value);
+  return n !== null && n >= 0 && Number.isInteger(n) ? n : null;
 }
 
 function configuredBase(raw: string | undefined): string {
@@ -238,6 +266,96 @@ export function parsePinnapiFixtures(payload: unknown): PinnapiFixture[] {
   return [...byFixture.values()].map(({ hasFullMatch: _hasFullMatch, ...fixture }) => fixture);
 }
 
+function collectLiveRows(value: unknown, out: JsonRecord[], depth = 0): void {
+  if (depth > 5 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectLiveRows(item, out, depth + 1);
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) return;
+  if (record.event_id !== undefined || record.eventId !== undefined) out.push(record);
+  for (const key of ["events", "fixtures", "data", "leagues", "league"]) {
+    if (record[key] !== undefined) collectLiveRows(record[key], out, depth + 1);
+  }
+}
+
+function liveMinutes(value: unknown): number | null {
+  const direct = num(value);
+  if (direct !== null && direct >= 0) return Math.floor(direct);
+  const match = str(value).match(/\d+/);
+  return match ? Number(match[0]) : null;
+}
+
+/**
+ * Reads only score records that show a real live-state signal. A 0-0 payload
+ * without live state/minutes is intentionally ignored, so pre-match defaults
+ * cannot become a result merely because they resemble a score.
+ */
+export function parsePinnapiLiveScores(payload: unknown, observedAt = Date.now()): PinnapiLiveScore[] {
+  const rows: JsonRecord[] = [];
+  collectLiveRows(payload, rows);
+  const byEventId = new Map<string, PinnapiLiveScore>();
+
+  for (const row of rows) {
+    const eventId = str(row.event_id ?? row.eventId ?? row.id);
+    const state = asRecord(row.state);
+    const home = asRecord(state?.home);
+    const away = asRecord(state?.away);
+    const match = asRecord(state?.match);
+    const periods = asRecord(row.periods);
+    const fullMeta = asRecord(asRecord(periods?.num_0)?.meta);
+    const minutes = liveMinutes(match?.minutes ?? state?.minutes ?? row.minutes);
+    const stateText =
+      str(match?.state ?? match?.status ?? state?.status ?? row.status ?? row.event_status ?? row.live_status) || null;
+    const explicitLive =
+      state !== null ||
+      minutes !== null ||
+      row.inplay === true ||
+      row.live === true ||
+      row.is_live === true ||
+      /live|in[\s_-]?play|started|running/i.test(stateText ?? "");
+    if (!eventId || !explicitLive) continue;
+
+    // Documented primary fields: state.home.score / state.away.score.
+    // Full-match metadata is defensive only, never a pre-match substitute.
+    const homeScore = nonNegativeInteger(home?.score ?? state?.home_score ?? fullMeta?.home_score);
+    const awayScore = nonNegativeInteger(away?.score ?? state?.away_score ?? fullMeta?.away_score);
+    if (homeScore === null || awayScore === null) continue;
+    byEventId.set(eventId, { eventId, homeScore, awayScore, minutes, state: stateText, observedAt });
+  }
+  return [...byEventId.values()];
+}
+
+/** IDs positively represented by the bounded live endpoint, score optional. */
+export function parsePinnapiLiveEventIds(payload: unknown): string[] {
+  const rows: JsonRecord[] = [];
+  collectLiveRows(payload, rows);
+  const eventIds = new Set<string>();
+  for (const row of rows) {
+    const eventId = str(row.event_id ?? row.eventId ?? row.id);
+    const state = asRecord(row.state);
+    const match = asRecord(state?.match);
+    const stateMinutes = state ? state.minutes : undefined;
+    const stateText =
+      str(match?.state ?? match?.status ?? state?.status ?? row.status ?? row.event_status ?? row.live_status) || "";
+    if (
+      eventId &&
+      (state !== null ||
+        liveMinutes(match?.minutes ?? stateMinutes ?? row.minutes) !== null ||
+        row.inplay === true ||
+        row.live === true ||
+        row.is_live === true ||
+        /live|in[\s_-]?play|started|running/i.test(stateText))
+    ) {
+      // Keep a live ID even if its individual score row is incomplete, so it
+      // cannot falsely look like disappearance/end after a prior observation.
+      eventIds.add(eventId);
+    }
+  }
+  return [...eventIds];
+}
+
 function values(value: unknown): JsonRecord[] {
   if (Array.isArray(value)) return value.map(asRecord).filter((v): v is JsonRecord => !!v);
   const record = asRecord(value);
@@ -373,5 +491,28 @@ export class PinnapiProvider {
 
   async fetchMatchPrices(eventId: string): Promise<ProviderPrice[]> {
     return (await this.fetchEventLines(eventId)).prices;
+  }
+
+  /**
+   * Exactly one bounded request for the complete football live market. Callers
+   * filter this response to tracked event IDs; this method never fans out.
+   */
+  async fetchLiveScoreSnapshot(): Promise<PinnapiLiveScoreSnapshot> {
+    this.requireConfigured();
+    const observedAt = Date.now();
+    try {
+      const payload = await fetchJson<unknown>(this.endpoint("/kit/v1/markets?sport_id=1&event_type=live"), {
+        headers: pinnapiHeaders(),
+        timeoutMs: 25_000,
+        retries: 1,
+      });
+      const scores = parsePinnapiLiveScores(payload, observedAt);
+      const liveEventIds = parsePinnapiLiveEventIds(payload);
+      this.lastSuccessAt = observedAt;
+      return { observedAt, scores, liveEventIds };
+    } catch (err) {
+      this.warn(`PinnAPI live markets unavailable: ${(err as Error).message}`);
+      throw err;
+    }
   }
 }

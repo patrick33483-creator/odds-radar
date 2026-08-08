@@ -276,6 +276,9 @@ export default function Simulations() {
                     {b.settledAt ? (
                       <>
                         <span className="block">{b.finalScore}</span>
+                        {b.settlementSource ? (
+                          <span className="block text-[10px] text-muted-foreground">{b.settlementSource}</span>
+                        ) : null}
                         <span className={cn("block text-[10px]", (b.realizedPnl ?? 0) >= 0 ? "text-positive" : "text-negative")}>
                           HK${fmtMoney(b.realizedPnl)}
                         </span>
