@@ -1661,6 +1661,36 @@ export class RadarEngine {
       log("results_error", { error: (err as Error).message });
     }
 
+    // The official HKJC result feed is deliberately third: PinnAPI requires a
+    // genuine live-to-gone observation, titan007 remains the existing fallback,
+    // and only bets still unresolved after both may use the HKJC master ID.
+    let hkjcFetched = 0;
+    try {
+      const hkjcFallback = titanFallback
+        .filter((bet) => !chosen.has(bet.matchId))
+        .map((bet) => ({ bet, hkjcId: bet.matchId.replace(/^hkjc:/i, "") }))
+        .filter(({ hkjcId }) => !!hkjcId);
+      if (hkjcFallback.length) {
+        const official = await this.hkjc.fetchHistoricResults(
+          hkjcFallback.map(({ bet, hkjcId }) => ({ matchId: hkjcId, kickoffUtc: bet.kickoffUtc })),
+        );
+        hkjcFetched = official.length;
+        const byHkjcId = new Map(official.map((result) => [result.matchId, result]));
+        for (const { bet, hkjcId } of hkjcFallback) {
+          const result = byHkjcId.get(hkjcId);
+          if (!result) continue;
+          chosen.set(bet.matchId, {
+            homeScore: result.homeScore,
+            awayScore: result.awayScore,
+            pinnacleId: `hkjc:${result.matchId}`,
+            source: result.source,
+          });
+        }
+      }
+    } catch (err) {
+      log("hkjc_results_error", { error: (err as Error).message });
+    }
+
     const resultStmt = rawDb.prepare(
       `INSERT INTO results(match_id,pinnacle_match_id,home_score,away_score,half_home,half_away,source,fetched_at)
        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
@@ -1713,7 +1743,7 @@ export class RadarEngine {
       }
     });
     tx();
-    const resultsFetched = chosen.size + titanFetched;
+    const resultsFetched = chosen.size + titanFetched + hkjcFetched;
     log("settlement", { settled, due: due.length, resultsFetched, manual });
     return { settled, pending: open.length - settled, resultsFetched };
   }

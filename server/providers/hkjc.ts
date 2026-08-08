@@ -11,11 +11,14 @@
 
 import { fetchText } from "../lib/http";
 import { HKJC_MATCH_LIST_QUERY } from "./hkjc-query";
+import { HKJC_HISTORIC_FOOTBALL_MATCHES_QUERY } from "./hkjc-result-query";
 import { lineKeyOf, parseHkjcHandicap, parseHkjcTotal } from "../lib/lines";
 import type { OddsProvider, ProviderEvent, ProviderFetchResult, ProviderPrice } from "./types";
 import type { Selection } from "@shared/types";
 
 const ENDPOINT = "https://info.cld.hkjc.com/graphql/base/";
+export const HKJC_HISTORIC_PAGE_SIZE = 20;
+export const HKJC_HISTORIC_MAX_PAGES = 10;
 
 interface GqlCombination {
   combId: string;
@@ -50,12 +53,138 @@ interface GqlMatch {
   foPools: GqlPool[] | null;
 }
 
+interface HistoricResultRow {
+  homeResult?: unknown;
+  awayResult?: unknown;
+  payoutConfirmed?: unknown;
+  stageId?: unknown;
+  resultType?: unknown;
+  sequence?: unknown;
+}
+
+interface HistoricMatch {
+  id?: unknown;
+  status?: unknown;
+  results?: unknown;
+}
+
+export interface HkjcHistoricRequest {
+  /** HKJC numeric match ID, optionally with the local `hkjc:` prefix. */
+  matchId: string;
+  kickoffUtc: number;
+}
+
+export interface HkjcOfficialResult {
+  matchId: string;
+  homeScore: number;
+  awayScore: number;
+  sequence: number;
+  source: "hkjc_official";
+}
+
 const SELECTION_MAP: Record<string, Selection> = { H: "H", D: "D", A: "A", L: "U" };
 
 function toEpoch(iso: string | null): number | null {
   if (!iso) return null;
   const t = Date.parse(iso);
   return Number.isFinite(t) ? t : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function asNonNegativeInt(value: unknown): number | null {
+  if (typeof value === "string" && !value.trim()) return null;
+  const n = typeof value === "number" || typeof value === "string" ? Number(value) : NaN;
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+function asInt(value: unknown): number | null {
+  if (typeof value === "string" && !value.trim()) return null;
+  const n = typeof value === "number" || typeof value === "string" ? Number(value) : NaN;
+  return Number.isInteger(n) ? n : null;
+}
+
+function isEndedStatus(status: unknown): boolean {
+  const value = typeof status === "string" ? status.trim().toUpperCase() : "";
+  return value === "MATCHENDED" || value === "INPLAYMATCHENDED" || /(?:^|_)ENDED$/.test(value);
+}
+
+function historicMatches(payload: unknown): HistoricMatch[] {
+  const root = asRecord(payload);
+  const data = asRecord(root?.data);
+  const matches = data?.matches ?? data?.matchResult;
+  return Array.isArray(matches) ? (matches as HistoricMatch[]) : [];
+}
+
+function normalizedHkjcMatchId(matchId: string): string {
+  return matchId.replace(/^hkjc:/i, "").trim();
+}
+
+/**
+ * Return the HKT calendar date for the official historic-results query.
+ * Formatting through parts avoids host-timezone and locale-dependent dates.
+ */
+export function hkjcHktDate(epochMs: number): string | null {
+  if (!Number.isFinite(epochMs)) return null;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Hong_Kong",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(epochMs));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return values.year && values.month && values.day ? `${values.year}-${values.month}-${values.day}` : null;
+}
+
+/**
+ * HKJC's historic endpoint rejects large result ranges. Each request stays at
+ * the verified 20-row width; the total number of requests is also bounded.
+ */
+export function historicPageRanges(
+  maxPages = HKJC_HISTORIC_MAX_PAGES,
+  pageSize = HKJC_HISTORIC_PAGE_SIZE,
+): Array<{ startIndex: number; endIndex: number }> {
+  const safePages = Math.max(0, Math.floor(maxPages));
+  const safeSize = Math.max(1, Math.floor(pageSize));
+  return Array.from({ length: safePages }, (_, page) => ({
+    startIndex: page * safeSize,
+    endIndex: (page + 1) * safeSize,
+  }));
+}
+
+/**
+ * Strictly extract official full-match results only. In particular, this
+ * ignores live/interim rows and result types 2/4 even if they carry a score.
+ */
+export function parseHkjcHistoricResults(
+  payload: unknown,
+  requestedMatchIds: Iterable<string>,
+): HkjcOfficialResult[] {
+  const requested = new Set(
+    Array.from(requestedMatchIds, normalizedHkjcMatchId).filter((matchId) => !!matchId),
+  );
+  if (!requested.size) return [];
+
+  const best = new Map<string, HkjcOfficialResult>();
+  for (const match of historicMatches(payload)) {
+    const matchId = typeof match.id === "string" || typeof match.id === "number" ? normalizedHkjcMatchId(String(match.id)) : "";
+    if (!matchId || !requested.has(matchId) || !isEndedStatus(match.status) || !Array.isArray(match.results)) continue;
+
+    for (const row of match.results as HistoricResultRow[]) {
+      if (asInt(row.resultType) !== 1 || asInt(row.stageId) !== 5 || row.payoutConfirmed !== true) continue;
+      const homeScore = asNonNegativeInt(row.homeResult);
+      const awayScore = asNonNegativeInt(row.awayResult);
+      const sequence = asNonNegativeInt(row.sequence);
+      if (homeScore === null || awayScore === null || sequence === null) continue;
+      const existing = best.get(matchId);
+      if (!existing || sequence > existing.sequence) {
+        best.set(matchId, { matchId, homeScore, awayScore, sequence, source: "hkjc_official" });
+      }
+    }
+  }
+  return [...best.values()];
 }
 
 export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
@@ -170,6 +299,62 @@ export class HkjcProvider implements OddsProvider {
       partial: cutoff !== null,
       warnings,
     };
+  }
+
+  /**
+   * Fetch only the official historic rows needed to settle due simulations.
+   * The date range follows those bets' HKT kickoff dates, and every GraphQL
+   * response is locally reduced to the requested HKJC match IDs.
+   */
+  async fetchHistoricResults(requests: HkjcHistoricRequest[]): Promise<HkjcOfficialResult[]> {
+    const requested = Array.from(
+      new Map(
+        requests
+          .map((request) => ({
+            matchId: normalizedHkjcMatchId(request.matchId),
+            date: hkjcHktDate(request.kickoffUtc),
+          }))
+          .filter((request): request is { matchId: string; date: string } => !!request.matchId && !!request.date)
+          .map((request) => [request.matchId, request]),
+      ).values(),
+    );
+    if (!requested.length) return [];
+
+    const dates = requested.map((request) => request.date).sort();
+    const startDate = dates[0];
+    const endDate = dates[dates.length - 1];
+    const requestedIds = new Set(requested.map((request) => request.matchId));
+    const best = new Map<string, HkjcOfficialResult>();
+
+    for (const { startIndex, endIndex } of historicPageRanges()) {
+      const text = await fetchText(ENDPOINT, {
+        method: "POST",
+        body: JSON.stringify({
+          query: HKJC_HISTORIC_FOOTBALL_MATCHES_QUERY,
+          variables: { startDate, endDate, startIndex, endIndex, teamId: null },
+        }),
+        timeoutMs: 25_000,
+        retries: 2,
+        headers: {
+          "content-type": "application/json",
+          origin: "https://bet.hkjc.com",
+          referer: "https://bet.hkjc.com/",
+          accept: "application/json",
+        },
+      });
+      const json = JSON.parse(text) as { data?: unknown; errors?: Array<{ message: string }> };
+      if (json.errors?.length) {
+        throw new Error(`HKJC historic GraphQL error: ${json.errors.map((error) => error.message).join("; ")}`);
+      }
+
+      const rows = historicMatches(json);
+      for (const result of parseHkjcHistoricResults(json, requestedIds)) {
+        const existing = best.get(result.matchId);
+        if (!existing || result.sequence > existing.sequence) best.set(result.matchId, result);
+      }
+      if (best.size === requestedIds.size || rows.length < HKJC_HISTORIC_PAGE_SIZE) break;
+    }
+    return [...best.values()];
   }
 }
 
