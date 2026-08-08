@@ -68,7 +68,7 @@ export default function Simulations() {
   );
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+    <div className="flex min-h-[100dvh] flex-col overflow-y-auto bg-background text-foreground md:h-screen md:overflow-hidden">
       <header className="shrink-0 border-b border-border bg-card">
         <div className="flex flex-wrap items-center gap-2 px-3 py-2">
           <RadarLogo className="h-7 w-7 text-pinnacle" />
@@ -121,7 +121,7 @@ export default function Simulations() {
         </div>
 
         {/* summary cards */}
-        <div className="grid gap-2 border-t border-border p-3 sm:grid-cols-3">
+        <div className="grid auto-cols-[minmax(190px,1fr)] grid-flow-col gap-2 overflow-x-auto border-t border-border p-3 sm:grid-flow-row sm:grid-cols-3 sm:overflow-visible">
           {(data?.summaries ?? []).map((s) => (
             <div key={s.category} className="rounded-md border border-card-border bg-card p-2.5" data-testid={`card-summary-${s.category}`}>
               <p className="text-[11px] font-semibold">{CATEGORY_LABEL[s.category]}</p>
@@ -188,7 +188,10 @@ export default function Simulations() {
         </div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-auto">
+      <main
+        className="min-h-[220px] w-full flex-1 overflow-x-auto overflow-y-visible overscroll-contain [-webkit-overflow-scrolling:touch] md:min-h-0 md:overflow-auto"
+        data-testid="scroll-simulations"
+      >
         {isLoading ? (
           <TableSkeleton rows={5} />
         ) : isError ? (
