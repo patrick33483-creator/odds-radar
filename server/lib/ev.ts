@@ -36,7 +36,7 @@ export interface EvInput {
   lineKey: string;
   lineDisplay: string;
   /** Pinnacle prices for the full complementary set of the same exact line. */
-  pinnacle: Array<{ selection: Selection; decimalOdds: number }>;
+  pinnacle: Array<{ selection: Selection; decimalOdds: number; fetchedAt: number }>;
   /** HKJC prices on the same exact line. */
   hkjc: Array<{ selection: Selection; decimalOdds: number; fetchedAt: number }>;
   now: number;
@@ -54,6 +54,9 @@ export function evaluateEv(input: EvInput): EvOpportunity[] {
   const threshold = input.threshold ?? EV_THRESHOLD;
   const stake = input.stake ?? HKJC_FIXED_STAKE;
   if (input.pinnacle.length < 2) return [];
+  // A no-vig probability is only valid when every complementary Pinnacle
+  // outcome belongs to a current snapshot.
+  if (input.pinnacle.some((leg) => input.now - leg.fetchedAt > STALE_MS)) return [];
   const probs = noVigProbs(input.pinnacle.map((c) => c.decimalOdds));
   if (!probs) return [];
   const fairBySelection = new Map<Selection, number>();
@@ -61,6 +64,9 @@ export function evaluateEv(input: EvInput): EvOpportunity[] {
 
   const out: EvOpportunity[] = [];
   for (const leg of input.hkjc) {
+    // Keep stale quotes visible in the raw market table, but never turn them
+    // into an EV opportunity or simulated order.
+    if (input.now - leg.fetchedAt > STALE_MS) continue;
     const p = fairBySelection.get(leg.selection);
     if (p === undefined || !(p > 0)) continue;
     if (!(leg.decimalOdds > 1)) continue;
@@ -68,7 +74,6 @@ export function evaluateEv(input: EvInput): EvOpportunity[] {
     if (!(edge >= threshold)) continue;
     const fairOdds = 1 / p;
     const flags: string[] = [];
-    if (input.now - leg.fetchedAt > STALE_MS) flags.push("stale");
     if (leg.decimalOdds / fairOdds - 1 > OUTLIER_RATIO) flags.push("outlier");
     if (input.mappingConfidence < MIN_MAPPING_CONFIDENCE) flags.push("low_confidence");
     out.push({

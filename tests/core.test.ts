@@ -220,8 +220,8 @@ describe("no-vig EV", () => {
       lineKey: "-0.50",
       lineDisplay: "-0.5",
       pinnacle: [
-        { selection: "H", decimalOdds: 1.96 },
-        { selection: "A", decimalOdds: 1.98 },
+        { selection: "H", decimalOdds: 1.96, fetchedAt: now },
+        { selection: "A", decimalOdds: 1.98, fetchedAt: now },
       ],
       hkjc: [
         { selection: "H", decimalOdds: 2.15, fetchedAt: now },
@@ -237,7 +237,7 @@ describe("no-vig EV", () => {
     expect(ops[0].expectedProfit).toBeCloseTo(10000 * ops[0].edge, 1);
   });
 
-  it("adds safeguards for stale prices and low mapping confidence", () => {
+  it("adds safeguards for outlier prices and low mapping confidence", () => {
     const now = Date.now();
     const ops = evaluateEv({
       matchId: "m1",
@@ -248,16 +248,48 @@ describe("no-vig EV", () => {
       lineKey: "-0.50",
       lineDisplay: "-0.5",
       pinnacle: [
-        { selection: "H", decimalOdds: 1.96 },
-        { selection: "A", decimalOdds: 1.98 },
+        { selection: "H", decimalOdds: 1.96, fetchedAt: now },
+        { selection: "A", decimalOdds: 1.98, fetchedAt: now },
       ],
-      hkjc: [{ selection: "H", decimalOdds: 3.6, fetchedAt: now - 600_000 }],
+      hkjc: [{ selection: "H", decimalOdds: 3.6, fetchedAt: now }],
       now,
       mappingConfidence: 0.4,
     });
-    expect(ops[0].flags).toContain("stale");
     expect(ops[0].flags).toContain("outlier");
     expect(ops[0].flags).toContain("low_confidence");
+  });
+
+  it("rejects stale Pinnacle references and stale HKJC execution prices", () => {
+    const now = Date.now();
+    const base = {
+      matchId: "m-stale",
+      matchLabel: "A vs B",
+      league: "L",
+      kickoffUtc: now + 3.6e6,
+      market: "AH" as const,
+      lineKey: "-0.50",
+      lineDisplay: "-0.5",
+      now,
+      mappingConfidence: 0.95,
+    };
+    const currentPinnacle = [
+      { selection: "H" as const, decimalOdds: 1.96, fetchedAt: now },
+      { selection: "A" as const, decimalOdds: 1.98, fetchedAt: now },
+    ];
+    expect(
+      evaluateEv({
+        ...base,
+        pinnacle: currentPinnacle,
+        hkjc: [{ selection: "H", decimalOdds: 2.15, fetchedAt: now - 600_000 }],
+      }),
+    ).toEqual([]);
+    expect(
+      evaluateEv({
+        ...base,
+        pinnacle: currentPinnacle.map((leg) => ({ ...leg, fetchedAt: now - 600_000 })),
+        hkjc: [{ selection: "H", decimalOdds: 2.15, fetchedAt: now }],
+      }),
+    ).toEqual([]);
   });
 
   it("keeps only the highest-EV execution route for the same line and selection", () => {
@@ -308,8 +340,8 @@ describe("no-vig EV", () => {
       lineKey: "0.5",
       lineDisplay: "+0.5",
       pinnacle: [
-        { selection: "H", decimalOdds: 1.95 },
-        { selection: "A", decimalOdds: 1.95 },
+        { selection: "H", decimalOdds: 1.95, fetchedAt: now },
+        { selection: "A", decimalOdds: 1.95, fetchedAt: now },
       ],
       hkjc: [{ selection: "H", decimalOdds: quote.odds, fetchedAt: now }],
       now,

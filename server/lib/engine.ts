@@ -1044,6 +1044,9 @@ export class RadarEngine {
         const hasHk = Object.keys(hk).length === sels.length;
         const hasPin = Object.keys(pin).length === sels.length;
         const hasCrown = Object.keys(crown).length === sels.length;
+        const hasFreshHk = hasHk && sels.every((s) => !hk[s]!.stale);
+        const hasFreshPin = hasPin && sels.every((s) => !pin[s]!.stale);
+        const hasFreshCrown = hasCrown && sels.every((s) => !crown[s]!.stale);
         const exactLine = hasHk && hasPin;
         const deltas: Partial<Record<Selection, number>> = {};
         for (const s of sels) {
@@ -1055,10 +1058,10 @@ export class RadarEngine {
         let arb: ArbOpportunity | null = null;
 
         if (market === "1X2") {
-          if (hasPin) {
+          if (hasFreshPin) {
             totalProbability = sels.reduce((acc, s) => acc + 1 / pin[s]!.decimalOdds, 0);
           }
-          if (hasHk && hasCrown) {
+          if (hasFreshHk && hasFreshCrown) {
             bestQ = sels.reduce((acc, s) => acc + 1 / Math.max(hk[s]!.decimalOdds, crown[s]!.decimalOdds), 0);
             arb = findThreeWayArb({
               matchId: m.id,
@@ -1071,8 +1074,8 @@ export class RadarEngine {
           }
         } else {
           const [s1, s2] = sels;
-          if (hasPin) totalProbability = 1 / pin[s1]!.decimalOdds + 1 / pin[s2]!.decimalOdds;
-          if (hasHk && hasCrown) {
+          if (hasFreshPin) totalProbability = 1 / pin[s1]!.decimalOdds + 1 / pin[s2]!.decimalOdds;
+          if (hasFreshHk && hasFreshCrown) {
             const q1 = 1 / hk[s1]!.decimalOdds + 1 / crown[s2]!.decimalOdds;
             const q2 = 1 / hk[s2]!.decimalOdds + 1 / crown[s1]!.decimalOdds;
             bestQ = Math.min(q1, q2);
@@ -1092,7 +1095,7 @@ export class RadarEngine {
         }
 
         let lineEv: EvOpportunity[] = [];
-        if (hasPin && Object.keys(hk).length > 0) {
+        if (hasFreshPin && Object.keys(hk).length > 0) {
           lineEv = evaluateEv({
             matchId: m.id,
             matchLabel,
@@ -1101,7 +1104,13 @@ export class RadarEngine {
             market,
             lineKey: l.lineKey,
             lineDisplay: formatLine(market, l.lineValue),
-            pinnacle: sels.filter((s) => pin[s]).map((s) => ({ selection: s, decimalOdds: pin[s]!.decimalOdds })),
+            pinnacle: sels
+              .filter((s) => pin[s])
+              .map((s) => ({
+                selection: s,
+                decimalOdds: pin[s]!.decimalOdds,
+                fetchedAt: pin[s]!.fetchedAt,
+              })),
             hkjc: sels.filter((s) => hk[s]).map((s) => ({ selection: s, decimalOdds: hk[s]!.decimalOdds, fetchedAt: hk[s]!.fetchedAt })),
             now,
             mappingConfidence: mapping?.confidence ?? 0,
@@ -1129,7 +1138,7 @@ export class RadarEngine {
       }
 
       /* synthetic quotes from HKJC 1X2 vs Crown handicap singles */
-      const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices);
+      const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices, now);
       synthetics.push(...syn);
       /*
        * Case 2 EV also considers an equivalent HKJC Asian-handicap price
@@ -1273,8 +1282,8 @@ export class RadarEngine {
           lineKey,
           lineDisplay: quote.lineDisplay,
           pinnacle: [
-            { selection: "H", decimalOdds: pinHome.decimalOdds },
-            { selection: "A", decimalOdds: pinAway.decimalOdds },
+            { selection: "H", decimalOdds: pinHome.decimalOdds, fetchedAt: pinHome.fetchedAt },
+            { selection: "A", decimalOdds: pinAway.decimalOdds, fetchedAt: pinAway.fetchedAt },
           ],
           hkjc: [
             {
@@ -1304,23 +1313,36 @@ export class RadarEngine {
     matchLabel: string,
     league: string,
     kickoffUtc: number,
-    prices: Array<{ provider: string; market: string; lineKey: string; selection: string; decimalOdds: number }>,
+    prices: Array<{
+      provider: string;
+      market: string;
+      lineKey: string;
+      selection: string;
+      decimalOdds: number;
+      fetchedAt: number;
+    }>,
+    now: number,
   ): SyntheticOpportunity[] {
     const hk1x2 = (sel: string) =>
-      prices.find((p) => p.provider === "hkjc" && p.market === "1X2" && p.selection === sel)?.decimalOdds;
-    const oddsHome = hk1x2("H");
-    const oddsDraw = hk1x2("D");
-    const oddsAway = hk1x2("A");
-    if (!oddsHome || !oddsDraw || !oddsAway) return [];
+      prices.find((p) => p.provider === "hkjc" && p.market === "1X2" && p.selection === sel);
+    const home = hk1x2("H");
+    const draw = hk1x2("D");
+    const away = hk1x2("A");
+    if (!home || !draw || !away) return [];
+    const oddsHome = home.decimalOdds;
+    const oddsDraw = draw.decimalOdds;
+    const oddsAway = away.decimalOdds;
     const officialFor = (side: SynSide) => {
       const lineKey = (side === "away" ? -1 : 1).toFixed(2);
       const sel = side === "away" ? "A" : "H";
-      return prices.find((p) => p.provider === "hkjc" && p.market === "AH" && p.lineKey === lineKey && p.selection === sel)
-        ?.decimalOdds ?? null;
+      return prices.find(
+        (p) => p.provider === "hkjc" && p.market === "AH" && p.lineKey === lineKey && p.selection === sel,
+      );
     };
     const out: SyntheticOpportunity[] = [];
     for (const side of ["away", "home"] as SynSide[]) {
-      const official1 = officialFor(side);
+      const officialRow = officialFor(side);
+      const official1 = officialRow?.decimalOdds ?? null;
       for (const target of SYNTHETIC_TARGETS) {
         // Crown must quote the mirrored opposite leg on the exact same line.
         const crownHomeHandicap = side === "away" ? -target : target;
@@ -1332,7 +1354,7 @@ export class RadarEngine {
             p.lineKey === crownHomeHandicap.toFixed(2) &&
             p.selection === crownSelection,
         );
-        if (!crownRow) continue;
+        if (!crownRow || now - crownRow.fetchedAt > STALE_MS) continue;
         const crownOdds = crownRow.decimalOdds;
         // Crown leg anchored at HK$5,000 -> target payout -> synthetic outlay.
         const payout = CROWN_FIXED_STAKE * crownOdds;
@@ -1341,6 +1363,23 @@ export class RadarEngine {
         const W = payout / probe.odds;
         const quote = buildSynthetic(side, target, { oddsHome, oddsDraw, oddsAway, official1 }, W);
         if (!quote) continue;
+        const usedRows = quote.components
+          .map((component) =>
+            prices.find(
+              (price) =>
+                price.provider === "hkjc" &&
+                price.market === component.market &&
+                price.lineKey === component.lineKey &&
+                price.selection === component.selection,
+            ),
+          )
+          .filter((price): price is NonNullable<typeof price> => !!price);
+        if (
+          usedRows.length !== quote.components.length ||
+          usedRows.some((price) => now - price.fetchedAt > STALE_MS)
+        ) {
+          continue;
+        }
         if (!syntheticCoversCrown(quote, crownHomeHandicap, crownSelection)) continue;
         const q = 1 / quote.odds + 1 / crownOdds;
         const totalStake = round2(W + CROWN_FIXED_STAKE);
