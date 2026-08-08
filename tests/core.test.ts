@@ -324,7 +324,7 @@ describe("no-vig EV", () => {
 /* ------------------------------- synthetic ------------------------------- */
 
 describe("synthetic odds formulas", () => {
-  const inputs = { oddsHome: 2.4, oddsDraw: 3.4, oddsAway: 3.8, official1: 1.4 };
+  const inputs = { oddsHome: 2.4, oddsDraw: 3.4, oddsAway: 3.8, official1: 1.4, officialMinus1: 2.2 };
 
   it("allocates the full HK$10,000 EV stake across real HKJC component legs", () => {
     const q = buildSynthetic("away", 0.25, inputs, 10000)!;
@@ -351,13 +351,53 @@ describe("synthetic odds formulas", () => {
     expect(draw.stake * 3.4).toBeCloseTo(1000, 0); // draw returns the principal
   });
 
-  it("computes +0.25 as half +0 and half +0.5", () => {
-    const a = buildSynthetic("away", 0, inputs, 500)!;
-    const b = buildSynthetic("away", 0.5, inputs, 500)!;
+  it("computes +0.25 with exact draw-state returns", () => {
+    const a = buildSynthetic("away", 0, inputs, 1000)!;
+    const b = buildSynthetic("away", 0.5, inputs, 1000)!;
     const q = buildSynthetic("away", 0.25, inputs, 1000)!;
-    expect(q.odds).toBeCloseTo((a.odds + b.odds) / 2, 3);
     const total = q.components.reduce((s, c) => s + c.stake, 0);
     expect(total).toBeCloseTo(1000, 0);
+    const drawReturn = q.components
+      .filter((c) => c.selection === "D")
+      .reduce((sum, c) => sum + c.stake * c.decimalOdds, 0);
+    expect(drawReturn).toBeCloseTo(500 + 500 * q.odds, 0);
+    expect(q.odds).toBeGreaterThan(Math.min(a.odds, b.odds));
+    expect(q.odds).toBeLessThan(Math.max(a.odds, b.odds));
+  });
+
+  it("treats a giving -0.5 selection as exactly the same 1X2 win", () => {
+    const away = buildSynthetic("away", -0.5, inputs, 1000)!;
+    const home = buildSynthetic("home", -0.5, inputs, 1000)!;
+    expect(away.odds).toBe(3.8);
+    expect(away.homeHandicap).toBe(0.5);
+    expect(away.components).toEqual([
+      expect.objectContaining({ market: "1X2", selection: "A", stake: 1000 }),
+    ]);
+    expect(home.odds).toBe(2.4);
+    expect(home.homeHandicap).toBe(-0.5);
+    expect(home.components).toEqual([
+      expect.objectContaining({ market: "1X2", selection: "H", stake: 1000 }),
+    ]);
+  });
+
+  it("computes giving -0.25 as half DNB and half outright win", () => {
+    const dnb = buildSynthetic("home", 0, inputs, 500)!;
+    const q = buildSynthetic("home", -0.25, inputs, 1000)!;
+    expect(q.odds).toBeCloseTo((dnb.odds + inputs.oddsHome) / 2, 3);
+    expect(q.components.reduce((sum, leg) => sum + leg.stake, 0)).toBeCloseTo(1000, 2);
+  });
+
+  it("profit-weights giving -0.75 to preserve the exact one-goal return", () => {
+    const q = buildSynthetic("away", -0.75, inputs, 1000)!;
+    const outright = q.components.find((c) => c.market === "1X2" && c.selection === "A")!;
+    const minusOne = q.components.find((c) => c.market === "AH" && c.lineKey === "1.00" && c.selection === "A")!;
+    const oneGoalReturn = outright.stake * outright.decimalOdds + minusOne.stake;
+    expect(oneGoalReturn).toBeCloseTo(500 * q.odds + 500, 0);
+    expect(q.components.reduce((sum, leg) => sum + leg.stake, 0)).toBeCloseTo(1000, 2);
+  });
+
+  it("refuses giving -0.75 without the official -1.0 price", () => {
+    expect(buildSynthetic("home", -0.75, { ...inputs, officialMinus1: null }, 1000)).toBeNull();
   });
 
   it("computes +0.75 as half +0.5 and half official +1.0", () => {

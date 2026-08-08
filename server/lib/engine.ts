@@ -32,7 +32,7 @@ import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
-import { buildSynthetic, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
+import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import {
@@ -1208,15 +1208,23 @@ export class RadarEngine {
     const out: EvOpportunity[] = [];
     for (const side of ["away", "home"] as SynSide[]) {
       const selection: Selection = side === "away" ? "A" : "H";
-      const officialLine = lineKeyOf("AH", side === "away" ? -1 : 1);
-      const official = prices.find(
+      const officialPlusLine = lineKeyOf("AH", side === "away" ? -1 : 1);
+      const officialPlus = prices.find(
         (p) =>
           p.provider === "hkjc" &&
           p.market === "AH" &&
-          p.lineKey === officialLine &&
+          p.lineKey === officialPlusLine &&
           p.selection === selection,
       );
-      for (const target of SYNTHETIC_TARGETS) {
+      const officialMinusLine = lineKeyOf("AH", side === "away" ? 1 : -1);
+      const officialMinus = prices.find(
+        (p) =>
+          p.provider === "hkjc" &&
+          p.market === "AH" &&
+          p.lineKey === officialMinusLine &&
+          p.selection === selection,
+      );
+      for (const target of EV_SYNTHETIC_TARGETS) {
         const homeHandicap = side === "away" ? -target : target;
         const lineKey = lineKeyOf("AH", homeHandicap);
         const quote = buildSynthetic(
@@ -1226,7 +1234,8 @@ export class RadarEngine {
             oddsHome: home.decimalOdds,
             oddsDraw: draw.decimalOdds,
             oddsAway: away.decimalOdds,
-            official1: official?.decimalOdds ?? null,
+            official1: officialPlus?.decimalOdds ?? null,
+            officialMinus1: officialMinus?.decimalOdds ?? null,
           },
           HKJC_FIXED_STAKE,
         );
@@ -1243,7 +1252,18 @@ export class RadarEngine {
         const pinAway = pin.find((p) => p.selection === "A");
         if (!pinHome || !pinAway) continue;
 
-        const usedRows = target === 0.75 && official ? [home, draw, away, official] : [home, draw, away];
+        const usedRows = quote.components
+          .map((component) =>
+            prices.find(
+              (price) =>
+                price.provider === "hkjc" &&
+                price.market === component.market &&
+                price.lineKey === component.lineKey &&
+                price.selection === component.selection,
+            ),
+          )
+          .filter((price): price is NonNullable<typeof price> => !!price);
+        if (!usedRows.length) continue;
         const evaluated = evaluateEv({
           matchId,
           matchLabel,
