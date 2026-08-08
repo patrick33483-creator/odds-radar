@@ -3,7 +3,7 @@ import { AlertTriangle, Moon, Radar, RefreshCw, Sun, WifiOff } from "lucide-reac
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import type { ScanOutcome, StatusResponse } from "@shared/types";
+import type { BetLeg, EvOpportunity, ScanOutcome, StatusResponse } from "@shared/types";
 
 /* --------------------------------- theme --------------------------------- */
 
@@ -161,6 +161,60 @@ export function StatusPill({ status }: { status: StatusResponse | undefined }) {
 }
 
 /* ------------------------------- primitives ------------------------------ */
+
+export type ExecutionRoute = "direct" | "three-way-equivalent" | "synthetic";
+
+export function executionRouteFromLegs(
+  legs: Array<Pick<BetLeg, "market" | "synthetic">>,
+): ExecutionRoute {
+  const syntheticLegs = legs.filter((leg) => leg.synthetic);
+  if (!syntheticLegs.length) return "direct";
+  if (syntheticLegs.length === 1 && syntheticLegs[0].market === "1X2") {
+    return "three-way-equivalent";
+  }
+  return "synthetic";
+}
+
+export function executionRouteFromEv(ev: Pick<EvOpportunity, "synthetic" | "components">): ExecutionRoute {
+  if (!ev.synthetic) return "direct";
+  if (!ev.components?.length) return "synthetic";
+  return executionRouteFromLegs(ev.components);
+}
+
+export function ExecutionRouteBadge({
+  route,
+  testId,
+}: {
+  route: ExecutionRoute;
+  testId: string;
+}) {
+  const display = {
+    direct: {
+      label: "直接盤",
+      cls: "border-hkjc/30 bg-hkjc/10 text-hkjc",
+    },
+    "three-way-equivalent": {
+      label: "主客和等價",
+      cls: "border-pinnacle/30 bg-pinnacle/10 text-pinnacle",
+    },
+    synthetic: {
+      label: "合成盤",
+      cls: "border-synthetic/35 bg-synthetic/15 text-synthetic",
+    },
+  }[route];
+
+  return (
+    <span
+      className={cn(
+        "inline-flex whitespace-nowrap rounded border px-1.5 py-0.5 text-[9px] font-semibold leading-none",
+        display.cls,
+      )}
+      data-testid={testId}
+    >
+      {display.label}
+    </span>
+  );
+}
 
 export function EmptyState({ title, hint, testId }: { title: string; hint?: string; testId: string }) {
   return (

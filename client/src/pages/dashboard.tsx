@@ -13,6 +13,7 @@ import {
   DemoBanner,
   EmptyState,
   ErrorBanner,
+  ExecutionRouteBadge,
   Kpi,
   RadarLogo,
   RefreshButton,
@@ -23,6 +24,7 @@ import {
   TableSkeleton,
   ThemeToggle,
   ageLabel,
+  executionRouteFromEv,
   fmtKickoff,
   fmtMoney,
   fmtOdds,
@@ -426,11 +428,17 @@ export default function Dashboard() {
                                 {l.ev?.length ? (
                                   <div className="mt-1 space-y-0.5 text-[11px]" data-testid={`detail-ev-${rowKey}`}>
                                     {l.ev.map((e) => (
-                                      <p key={e.key} className="tnum text-hkjc">
-                                        {SELECTION_LABEL[e.selection]} EV {fmtPct(e.edge)} · {e.synthetic ? "馬會合成" : "馬會直接盤"} @{" "}
-                                        {fmtOdds(e.hkjcOdds)} · 公道價 {fmtOdds(e.fairOdds)}
-                                        {e.flags.length ? <span className="ml-1 text-negative">⚠ {e.flags.join(",")}</span> : null}
-                                      </p>
+                                      <div key={e.key} className="flex flex-wrap items-center gap-1">
+                                        <ExecutionRouteBadge
+                                          route={executionRouteFromEv(e)}
+                                          testId={`badge-execution-${e.key}`}
+                                        />
+                                        <p className="tnum text-hkjc">
+                                          {SELECTION_LABEL[e.selection]} EV {fmtPct(e.edge)} · 馬會 @ {fmtOdds(e.hkjcOdds)} · 公道價{" "}
+                                          {fmtOdds(e.fairOdds)}
+                                          {e.flags.length ? <span className="ml-1 text-negative">⚠ {e.flags.join(",")}</span> : null}
+                                        </p>
+                                      </div>
                                     ))}
                                   </div>
                                 ) : null}

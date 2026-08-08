@@ -18,9 +18,11 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { cn } from "@/lib/utils";
 import {
   EmptyState,
+  ExecutionRouteBadge,
   RadarLogo,
   TableSkeleton,
   ThemeToggle,
+  executionRouteFromLegs,
   fmtKickoff,
   fmtMoney,
   fmtOdds,
@@ -77,7 +79,7 @@ export default function Simulations() {
               模擬投注紀錄
             </h1>
             <p className="truncate text-[10px] text-muted-foreground">
-              情況一 皇冠固定 $5,000 · 情況二 馬會固定 $10,000（直接盤／合成盤擇最高 Pinnacle EV ≥ 3%）· 合成鎖利 皇冠固定 $5,000
+              情況一 皇冠固定 $5,000 · 情況二 馬會固定 $10,000（直接盤／主客和等價／合成盤擇最高 Pinnacle EV ≥ 3%）· 合成鎖利 皇冠固定 $5,000
             </p>
           </div>
           <div className="ml-auto flex items-center gap-1">
@@ -222,16 +224,22 @@ export default function Simulations() {
                 <tr key={b.id} className="align-top hover:bg-accent/40" data-testid={`row-bet-${b.id}`}>
                   <td className="tnum border-b border-grid px-2 py-1.5 text-muted-foreground">{fmtTime(b.placedAt)}</td>
                   <td className="border-b border-grid px-2 py-1.5">
-                    <span
-                      className={cn(
-                        "rounded px-1.5 py-0.5 text-[10px] font-medium",
-                        b.category === "case1_arb" && "bg-positive/15 text-positive",
-                        b.category === "case2_ev" && "bg-hkjc/10 text-hkjc",
-                        b.category === "synth_arb" && "bg-synthetic/15 text-synthetic",
-                      )}
-                    >
-                      {CATEGORY_LABEL[b.category]}
-                    </span>
+                    <div className="flex min-w-[92px] flex-col items-start gap-1">
+                      <span
+                        className={cn(
+                          "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                          b.category === "case1_arb" && "bg-positive/15 text-positive",
+                          b.category === "case2_ev" && "bg-hkjc/10 text-hkjc",
+                          b.category === "synth_arb" && "bg-synthetic/15 text-synthetic",
+                        )}
+                      >
+                        {CATEGORY_LABEL[b.category]}
+                      </span>
+                      <ExecutionRouteBadge
+                        route={executionRouteFromLegs(b.legs)}
+                        testId={`badge-execution-bet-${b.id}`}
+                      />
+                    </div>
                   </td>
                   <td className="border-b border-grid px-2 py-1.5">
                     <span className="block max-w-[180px] truncate font-medium">{b.matchLabel}</span>
