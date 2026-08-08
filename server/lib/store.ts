@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS match_mapping (
 CREATE INDEX IF NOT EXISTS match_mapping_pinnacle_idx ON match_mapping(pinnacle_match_id);
 
 CREATE TABLE IF NOT EXISTS pinnacle_source_map (
-  match_id TEXT PRIMARY KEY, optic_id TEXT, optic_reversed INTEGER NOT NULL DEFAULT 0,
+  match_id TEXT PRIMARY KEY, pinnapi_id TEXT, pinnapi_reversed INTEGER NOT NULL DEFAULT 0,
+  optic_id TEXT, optic_reversed INTEGER NOT NULL DEFAULT 0,
   titan_id TEXT, titan_reversed INTEGER NOT NULL DEFAULT 0,
   active_source TEXT, updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS pinnacle_source_map_optic_idx ON pinnacle_source_map(optic_id);
@@ -116,6 +117,17 @@ CREATE TABLE IF NOT EXISTS provider_health (
 CREATE TABLE IF NOT EXISTS app_state (
   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
 `);
+  // Existing installations predate PinnAPI. SQLite's CREATE TABLE IF NOT EXISTS
+  // does not evolve the table, so add only the two additive mapping columns.
+  const sourceColumns = sqlite
+    .prepare("PRAGMA table_info(pinnacle_source_map)")
+    .all() as Array<{ name: string }>;
+  const sourceNames = new Set(sourceColumns.map((column) => column.name));
+  if (!sourceNames.has("pinnapi_id")) sqlite.exec("ALTER TABLE pinnacle_source_map ADD COLUMN pinnapi_id TEXT");
+  if (!sourceNames.has("pinnapi_reversed")) {
+    sqlite.exec("ALTER TABLE pinnacle_source_map ADD COLUMN pinnapi_reversed INTEGER NOT NULL DEFAULT 0");
+  }
+  sqlite.exec("CREATE INDEX IF NOT EXISTS pinnacle_source_map_pinnapi_idx ON pinnacle_source_map(pinnapi_id)");
 }
 
 migrate();

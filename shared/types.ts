@@ -153,17 +153,18 @@ export interface ProviderStatus {
 
 /** How the replaceable Pinnacle adapter is currently sourcing prices. */
 export interface PinnacleSourceInfo {
-  strategy: "official-api" | "titan007" | "opticodds-primary";
+  strategy: "pinnapi-primary" | "official-api" | "titan007" | "opticodds-primary";
   officialConfigured: boolean;
+  pinnapiConfigured: boolean;
   lastRowMatchedBy: "name" | "id-hint" | null;
   lastRowCompanyId: string | null;
-  primary: "opticodds";
-  fallback: "titan007";
+  primary: "pinnapi" | "opticodds";
+  fallback: "opticodds-then-titan007" | "titan007";
   opticOk: boolean;
   warnings: string[];
 }
 
-export type ScanResultCode = "NO_WINDOW" | "NO_ALERT" | "ALERT" | "ERROR";
+export type ScanResultCode = "NO_WINDOW" | "NO_ALERT" | "ALERT" | "TARGET_REACHED" | "ERROR";
 
 export interface ScanOutcome {
   result: ScanResultCode;
@@ -187,6 +188,10 @@ export interface ScanConfigInfo {
   maxRuntimeSec: number;
   /** Whether the server-side 30-second schedule check is enabled. */
   scheduleConfigured: boolean;
+  /** 0 means unlimited; a positive value is a strict total simulated-bet cap. */
+  simulationTarget: number;
+  simulationBets: number;
+  simulationTargetReached: boolean;
   lastScan: ScanOutcome | null;
 }
 

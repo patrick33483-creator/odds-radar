@@ -9,13 +9,13 @@
  *   - No match in window -> prints {"result":"NO_WINDOW"} and exits at once,
  *     having made ZERO per-match Pinnacle detail requests.
  *   - Otherwise polls those events densely in-process (interval
- *     RADAR_SCAN_INTERVAL_SEC, default 30 s) and stops the moment a new
- *     arbitrage appears (result ALERT). Total runtime is bounded by
- *     RADAR_SCAN_MAX_RUNTIME_SEC (default 240 s, hard ceiling < 300 s).
+ *     RADAR_SCAN_INTERVAL_SEC, default 30 s) until their kickoff. It stops
+ *     early only when a simulated bet is created (result ALERT).
+ *   - RADAR_SIM_TARGET=30 (or any positive cap) makes a run at the completed
+ *     total return TARGET_REACHED without any fixture or price request.
  *
- * Exit codes: 0 = NO_WINDOW / NO_ALERT, 10 = ALERT, 1 = ERROR.
- * NO SCHEDULE IS CREATED — attach this to a scheduler only when the desired
- * frequency has been decided.
+ * Exit codes: 0 = NO_WINDOW / NO_ALERT / TARGET_REACHED, 10 = ALERT, 1 = ERROR.
+ * This CLI creates no external schedule.
  */
 import "dotenv/config";
 import { engine } from "../server/lib/engine";

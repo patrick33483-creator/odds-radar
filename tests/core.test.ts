@@ -15,6 +15,7 @@ import {
 } from "../server/lib/lines";
 import { findThreeWayArb, findTwoWayArb, planStakes, totalProbability } from "../server/lib/arb";
 import { evaluateEv, margin, noVigProbs, selectBestEv } from "../server/lib/ev";
+import { isSameHandicapRoad, lineKeyOf } from "../server/lib/lines";
 import { buildSynthetic, syntheticCoversCrown } from "../server/lib/synthetic";
 import { leagueSimilarity, matchEvent, normalizeName, similarity } from "../server/lib/matching";
 import { mergeOpportunityState } from "../server/lib/dedupe";
@@ -185,6 +186,13 @@ describe("arbitrage stake math", () => {
 /* ----------------------------------- EV ---------------------------------- */
 
 describe("no-vig EV", () => {
+  it("keeps adjacent Asian quarter-lines distinct for exact-line EV matching", () => {
+    expect(lineKeyOf("AH", -0.25)).toBe("-0.25");
+    expect(lineKeyOf("AH", -0.5)).toBe("-0.50");
+    expect(isSameHandicapRoad(-0.25, -0.5)).toBe(false);
+    expect(isSameHandicapRoad(-0.25, -0.25)).toBe(true);
+  });
+
   it("removes the margin proportionally", () => {
     const p = noVigProbs([1.96, 1.98])!;
     expect(p[0] + p[1]).toBeCloseTo(1, 12);

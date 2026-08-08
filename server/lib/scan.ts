@@ -3,7 +3,7 @@
  *
  * Policy (replaces the old all-match polling loop):
  *   - When triggered, fetch LIGHTWEIGHT fixture/mapping data only (HKJC's single
- *     pre-match GraphQL call + the cached titan007 fixture list).
+ *     pre-match GraphQL call + cached PinnAPI fixture mapping).
  *   - Select ONLY pre-match events with 0 < minutes_to_kickoff <= window
  *     (default 30). Already-started / in-play / finished events are excluded.
  *   - If nothing is in the window: return NO_WINDOW immediately and make ZERO
@@ -51,6 +51,24 @@ export function scanConfig(env: NodeJS.ProcessEnv = process.env): ScanConfig {
   const intervalSec = clamp(Math.round(num(env.RADAR_SCAN_INTERVAL_SEC, 30)), 5, 120);
   const maxRuntimeSec = windowMinutes * 60;
   return { windowMinutes, intervalSec, maxRuntimeSec };
+}
+
+/**
+ * Strict optional simulation cap for controlled test runs. Zero retains the
+ * existing unlimited behavior; positive values are whole-bet limits.
+ */
+export function simulationTarget(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.RADAR_SIM_TARGET);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+
+export function simulationTargetReached(count: number, target = simulationTarget()): boolean {
+  return target > 0 && count >= target;
+}
+
+/** Number of inserts still permitted; Infinity means the default unlimited mode. */
+export function remainingSimulationCapacity(count: number, target = simulationTarget()): number {
+  return target > 0 ? Math.max(0, target - count) : Number.POSITIVE_INFINITY;
 }
 
 export interface ScanCandidate {
@@ -108,7 +126,11 @@ export interface ScanDeps {
   now(): number;
   /** Lightweight fixtures + mapping. MUST NOT make per-match odds detail calls. */
   loadCandidates(): Promise<ScanCandidate[]>;
-  /** One dense pass over the selected events. Returns detail-call count + new arb keys. */
+  /**
+   * One dense pass over the selected events. `bet|...` keys signal that a
+   * simulation was inserted; other opportunity keys are informational only and
+   * must not end the T-30 polling session.
+   */
   pollPass(events: ScanCandidate[]): Promise<{ detailCalls: number; newOpportunityKeys: string[] }>;
   sleep(ms: number): Promise<void>;
   config: ScanConfig;
@@ -181,9 +203,10 @@ export async function runWindowScan(deps: ScanDeps): Promise<ScanOutcome> {
     const pass = await deps.pollPass(live);
     passes++;
     detailCalls += pass.detailCalls;
-    if (pass.newOpportunityKeys.length) {
-      alertKeys = pass.newOpportunityKeys;
-      break; // stop immediately after a simulated bet/opportunity is produced
+    const betKeys = pass.newOpportunityKeys.filter((key) => key.startsWith("bet|"));
+    if (betKeys.length) {
+      alertKeys = betKeys;
+      break; // stop immediately after a simulated bet is produced
     }
     await deps.sleep(cfg.intervalSec * 1000);
   }
@@ -204,7 +227,7 @@ export async function runWindowScan(deps: ScanDeps): Promise<ScanOutcome> {
     detailCalls,
     newOpportunityKeys: alertKeys,
     message: alertKeys.length
-      ? `發現 ${alertKeys.length} 個新機會，已即時停止掃描。`
-      : `已連續密集掃描 ${selectedInfo.length} 場至開賽（${passes} 輪），未發現新機會。`,
+      ? `已建立 ${alertKeys.length} 筆模擬注單，已即時停止掃描。`
+      : `已連續密集掃描 ${selectedInfo.length} 場至開賽（${passes} 輪），沒有建立模擬注單。`,
   };
 }

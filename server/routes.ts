@@ -16,6 +16,21 @@ function installAutoWindowScan(): void {
   if (!autoScanEnabled() || autoScanTimer) return;
   const tick = async () => {
     try {
+      // `runScan` records a clear TARGET_REACHED status and returns before any
+      // fixture or price request if the strict simulation cap is complete.
+      if (engine.scanConfigInfo().simulationTargetReached) {
+        const outcome = await engine.runScan();
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            scope: "radar",
+            event: "auto_window_scan",
+            result: outcome.result,
+            message: outcome.message,
+          }),
+        );
+        return;
+      }
       const inWindow = engine.windowPreview();
       if (!inWindow.length) return;
       const outcome = await engine.runScan();
@@ -172,7 +187,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   /**
    * Dense pre-kickoff window scan helper — the only automated scan path.
-   * Suitable for later scheduling (cron / external trigger). NO SCHEDULE EXISTS.
+   * Suitable for an external trigger. This route creates no external schedule.
    * Returns NO_WINDOW immediately, with zero provider detail calls, when no
    * match is within the window.
    */

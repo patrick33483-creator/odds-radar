@@ -15,9 +15,12 @@ import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
+  remainingSimulationCapacity,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
+  simulationTarget,
+  simulationTargetReached,
   SCAN_HARD_LIMIT_SEC,
   type ScanCandidate,
   type ScanConfig,
@@ -124,6 +127,17 @@ describe("scan configuration", () => {
     expect(cfg.intervalSec).toBe(5);
     expect(cfg.maxRuntimeSec).toBe(SCAN_HARD_LIMIT_SEC);
   });
+
+  it("defaults the simulation cap to unlimited and enforces a strict configured target", () => {
+    expect(simulationTarget({} as NodeJS.ProcessEnv)).toBe(0);
+    expect(simulationTarget({ RADAR_SIM_TARGET: "30" } as NodeJS.ProcessEnv)).toBe(30);
+    expect(simulationTarget({ RADAR_SIM_TARGET: "-1" } as NodeJS.ProcessEnv)).toBe(0);
+    expect(remainingSimulationCapacity(29, 30)).toBe(1);
+    expect(remainingSimulationCapacity(30, 30)).toBe(0);
+    expect(simulationTargetReached(29, 30)).toBe(false);
+    expect(simulationTargetReached(30, 30)).toBe(true);
+    expect(remainingSimulationCapacity(900, 0)).toBe(Number.POSITIVE_INFINITY);
+  });
 });
 
 /* --------------------------------- runner --------------------------------- */
@@ -196,12 +210,26 @@ describe("runWindowScan", () => {
     expect(out.detailCalls).toBe(h.polled.reduce((sum, pass) => sum + pass.length, 0));
   });
 
-  it("stops immediately when a new arb appears", async () => {
+  it("continues after a new arb when no simulated bet is inserted", async () => {
     const { h, deps } = harness([cand({ matchId: "in-1", minutes: 5 })], { arbOnPass: 2 });
     const out = await runWindowScan(deps);
+    expect(out.result).toBe("NO_ALERT");
+    expect(h.passes).toBeGreaterThan(2);
+    expect(out.newOpportunityKeys).toEqual([]);
+  });
+
+  it("stops immediately after a simulated bet is created for a T-30 event", async () => {
+    const { h, deps } = harness([cand({ matchId: "in-1", minutes: 5 })], { arbOnPass: 1 });
+    deps.pollPass = async (events: ScanCandidate[]) => {
+      h.passes++;
+      h.polled.push(events.map((event) => event.matchId));
+      h.detailCalls += events.length;
+      return { detailCalls: events.length, newOpportunityKeys: ["bet|case2_ev|in-1|AH|-0.50|H"] };
+    };
+    const out = await runWindowScan(deps);
     expect(out.result).toBe("ALERT");
-    expect(h.passes).toBe(2);
-    expect(out.newOpportunityKeys).toEqual(["arb|hkjc:10|AH|-0.50|H"]);
+    expect(h.passes).toBe(1);
+    expect(out.newOpportunityKeys).toEqual(["bet|case2_ev|in-1|AH|-0.50|H"]);
   });
 
   it("continues beyond the former short runtime cap until kickoff", async () => {

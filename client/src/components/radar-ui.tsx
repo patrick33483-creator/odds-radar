@@ -230,6 +230,7 @@ export function Sparkline({ values, color }: { values: number[]; color: string }
 /* --------------------------- source / scan status ------------------------- */
 
 const STRATEGY_LABEL: Record<string, string> = {
+  "pinnapi-primary": "PinnAPI Edge 主來源 · OpticOdds／titan007 僅映射後備",
   "official-api": "官方 API（已授權帳戶）",
   titan007: "titan007 公開賠率頁（免憑證）",
   "opticodds-primary": "OpticOdds 主來源 · titan007 後備補漏",
@@ -256,7 +257,7 @@ export function SourceBar({ status }: { status: StatusResponse | undefined }) {
         <span className="mr-1 font-semibold text-pinnacle">EV：Pinnacle</span>
         無水概率基準 · 馬會直接盤／合成盤擇最高 · {STRATEGY_LABEL[src.strategy] ?? src.strategy}
         {rowNote ? ` · ${rowNote}` : ""}
-        {src.strategy === "opticodds-primary" ? "" : src.officialConfigured ? "" : " · 未設定官方憑證（公開 API 於 2025-07-23 起關閉）"}
+        {src.strategy === "pinnapi-primary" && !src.pinnapiConfigured ? " · 未設定 PinnAPI 憑證，PinnAPI 映射及 EV 價格不可用" : ""}
       </span>
       <span data-testid="text-crown-strategy">
         <span className="mr-1 font-semibold text-positive">鎖利：皇冠</span>
@@ -266,6 +267,7 @@ export function SourceBar({ status }: { status: StatusResponse | undefined }) {
         <span className="mr-1 font-semibold">自動掃描</span>
         只在開賽前 {scan.windowMinutes} 分鐘內密集掃描 · 間隔 {scan.intervalSec} 秒 · 持續至開賽或產生注單
         {scan.scheduleConfigured ? " · 賽前 30 分鐘自動觸發" : " · 密集掃描只限手動觸發"}
+        {scan.simulationTarget > 0 ? ` · 模擬目標 ${scan.simulationBets}/${scan.simulationTarget}${scan.simulationTargetReached ? "（已達上限）" : ""}` : ""}
       </span>
       {src.warnings.length ? (
         <span className="text-warning" data-testid="text-source-warning">
@@ -280,6 +282,7 @@ const SCAN_RESULT_LABEL: Record<string, string> = {
   NO_WINDOW: "視窗內無賽事",
   NO_ALERT: "已掃描 · 無新機會",
   ALERT: "發現新機會",
+  TARGET_REACHED: "模擬目標已達",
   ERROR: "掃描失敗",
 };
 

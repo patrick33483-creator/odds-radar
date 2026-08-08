@@ -15,7 +15,7 @@ export const matches = sqliteTable(
   {
     id: text("id").primaryKey(), // canonical id = "hkjc:<hkjcId>"
     hkjcId: text("hkjc_id").notNull(),
-    pinnacleMatchId: text("pinnacle_match_id"), // titan007 sId once mapped
+    pinnacleMatchId: text("pinnacle_match_id"), // active source id, normally pinnapi:<event_id>
     league: text("league").notNull(),
     leagueEn: text("league_en"),
     homeTeam: text("home_team").notNull(),
