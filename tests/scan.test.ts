@@ -13,7 +13,8 @@
 import { describe, expect, it } from "vitest";
 import {
   createAutoScanTickGate,
-  excludeSimulatedMatches,
+  crownLegsWithinLimit,
+  matchCategoryEligible,
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
@@ -140,18 +141,25 @@ describe("automatic scan guards", () => {
     expect(runs).toBe(2);
   });
 
-  it("excludes every match with a simulation from automatic scan candidates", () => {
-    const candidates = [
-      { matchId: "hkjc:case1", category: "case1_arb" },
-      { matchId: "hkjc:case2", category: "case2_ev" },
-      { matchId: "hkjc:synth", category: "synth_arb" },
-      { matchId: "hkjc:open", category: null },
-    ];
-    const simulatedMatchIds = new Set(["hkjc:case1", "hkjc:case2", "hkjc:synth"]);
+  it("keeps one EV per match but permits multiple distinct lock categories", () => {
+    const existing = [{ matchId: "hkjc:1" }];
+    expect(matchCategoryEligible(existing, "hkjc:1", "case2_ev")).toBe(false);
+    expect(matchCategoryEligible(existing, "hkjc:1", "case1_arb")).toBe(true);
+    expect(matchCategoryEligible(existing, "hkjc:1", "synth_arb")).toBe(true);
+    expect(matchCategoryEligible(existing, "hkjc:2", "case2_ev")).toBe(true);
+  });
 
-    expect(excludeSimulatedMatches(candidates, simulatedMatchIds)).toEqual([
-      { matchId: "hkjc:open", category: null },
-    ]);
+  it("caps aggregate Crown exposure at 5,000 per market, line and selection", () => {
+    const existing = [{ matchId: "hkjc:1", market: "AH", lineKey: "-0.25", selection: "A", stake: 3000 }];
+    expect(crownLegsWithinLimit(existing, [
+      { matchId: "hkjc:1", market: "AH", lineKey: "-0.25", selection: "A", stake: 2000 },
+    ])).toBe(true);
+    expect(crownLegsWithinLimit(existing, [
+      { matchId: "hkjc:1", market: "AH", lineKey: "-0.25", selection: "A", stake: 2000.01 },
+    ])).toBe(false);
+    expect(crownLegsWithinLimit(existing, [
+      { matchId: "hkjc:1", market: "AH", lineKey: "-0.50", selection: "A", stake: 5000 },
+    ])).toBe(true);
   });
 });
 

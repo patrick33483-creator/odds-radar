@@ -145,7 +145,11 @@ export const opportunities = sqliteTable(
   }),
 );
 
-/** Simulated bets — one purchase per category|event|line|selection, ever. */
+/**
+ * Simulated bets. EV is limited to one bet per match; direct and synthetic
+ * locks may coexist when their unique keys differ and each Crown selection's
+ * aggregate exposure remains at or below HK$5,000.
+ */
 export const simulationBets = sqliteTable(
   "simulation_bets",
   {

@@ -39,7 +39,8 @@ import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
-  excludeSimulatedMatches,
+  crownLegsWithinLimit,
+  matchCategoryEligible,
   runWindowScan,
   scanConfig,
   selectWindowEvents,
@@ -799,17 +800,16 @@ export class RadarEngine {
   private async loadScanCandidates(): Promise<ScanCandidate[]> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
-    return this.unsimulatedScanCandidates();
+    return this.scanCandidates();
   }
 
   /**
-   * Every simulation category retires its entire match from automatic scans.
-   * This is shared by the preview, initial window load, and later dense passes
-   * so PinnAPI detail is never fetched again after an inserted simulation.
+   * Keep in-window matches available after a simulation. EV placement still
+   * enforces one bet per match, while direct/synthetic locks may add distinct
+   * structures subject to the per-Crown-selection HK$5,000 exposure limit.
    */
-  private unsimulatedScanCandidates(): ScanCandidate[] {
-    const simulatedMatchIds = new Set(db.select().from(simulationBets).all().map((b) => b.matchId));
-    const candidates: ScanCandidate[] = db
+  private scanCandidates(): ScanCandidate[] {
+    return db
       .select()
       .from(matches)
       .all()
@@ -821,7 +821,6 @@ export class RadarEngine {
         status: m.status,
         pinnacleMatchId: m.pinnacleMatchId,
       }));
-    return excludeSimulatedMatches(candidates, simulatedMatchIds);
   }
 
   /** One dense pass: refresh HKJC (1 call) + Pinnacle detail for the window only. */
@@ -841,8 +840,8 @@ export class RadarEngine {
     this.recomputeDegradedReason();
     // Only a newly created simulation ends the session. Newly detected
     // opportunities without an insert must continue to be re-checked every
-    // 30 seconds until kickoff. Once a match has a simulation, future window
-    // scans suppress the entire match.
+    // 30 seconds until kickoff. Future ticks may revisit a match to find a
+    // distinct direct/synthetic lock structure.
     const eventIds = new Set(events.map((e) => e.matchId));
     const newBetKeys = db
       .select()
@@ -910,7 +909,7 @@ export class RadarEngine {
               prepared = true;
               return this.loadScanCandidates();
             }
-            return this.unsimulatedScanCandidates();
+            return this.scanCandidates();
           };
         })(),
         pollPass: (events) => this.densePass(events),
@@ -936,7 +935,7 @@ export class RadarEngine {
   /** Events currently inside the dense window (used by the helper endpoint). */
   windowPreview(): ReturnType<typeof selectWindowEvents> {
     const cfg = scanConfig();
-    return selectWindowEvents(this.unsimulatedScanCandidates(), Date.now(), cfg);
+    return selectWindowEvents(this.scanCandidates(), Date.now(), cfg);
   }
 
   private persistPrices(matchId: string, provider: "hkjc" | "pinnacle" | "crown", prices: ProviderPrice[], now: number): void {
@@ -1459,15 +1458,27 @@ export class RadarEngine {
     const windowMinutes = scanConfig().windowMinutes;
     const target = simulationTarget();
     const currentBets = db.select().from(simulationBets).all().length;
+    const existingBets = db.select().from(simulationBets).all().map((bet) => ({
+      matchId: bet.matchId,
+      category: bet.category,
+    }));
+    const crownExposure = rawDb
+      .prepare(
+        `SELECT b.match_id AS matchId,l.market,l.line_key AS lineKey,l.selection,l.stake
+         FROM simulation_legs l
+         JOIN simulation_bets b ON b.id=l.bet_id
+         WHERE l.provider='crown'`,
+      )
+      .all() as Array<{ matchId: string; market: string; lineKey: string; selection: string; stake: number }>;
     let remaining = remainingSimulationCapacity(currentBets, target);
     if (remaining <= 0) {
       log("simulation_target_reached", { target, current: currentBets });
       return;
     }
-    const eligible = (matchId: string, kickoffUtc: number) =>
+    const eligible = (matchId: string, kickoffUtc: number, category: "case1_arb" | "case2_ev" | "synth_arb") =>
       scannedMatchIds.has(matchId) &&
       isSimulationPurchaseWindow(kickoffUtc, now, windowMinutes) &&
-      !db.select().from(simulationBets).all().some((bet) => bet.matchId === matchId);
+      matchCategoryEligible(existingBets, matchId, category);
     const insertBet = rawDb.prepare(
       `INSERT OR IGNORE INTO simulation_bets(unique_key,category,match_id,market,line_key,selection,match_label,league,kickoff_utc,
         total_stake,expected_payout,expected_profit,roi,ev_pct,q_total,placed_at)
@@ -1481,7 +1492,17 @@ export class RadarEngine {
       /* 情況一 — arb, Crown fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
         if (remaining <= 0) break;
-        if (!eligible(a.matchId, a.kickoffUtc)) continue;
+        if (!eligible(a.matchId, a.kickoffUtc, "case1_arb")) continue;
+        const proposedCrown = a.legs
+          .filter((leg) => leg.provider === "crown")
+          .map((leg) => ({
+            matchId: a.matchId,
+            market: leg.market,
+            lineKey: leg.lineKey,
+            selection: leg.selection,
+            stake: leg.stake,
+          }));
+        if (!crownLegsWithinLimit(crownExposure, proposedCrown, CROWN_FIXED_STAKE)) continue;
         const key = `case1_arb|${a.matchId}|${a.lineKey}|${a.market}:${a.legs.map((l) => l.selection).join("")}`;
         const res = insertBet.run(
           key, "case1_arb", a.matchId, a.market, a.lineKey, a.legs[0]?.selection ?? "", a.matchLabel, a.league,
@@ -1489,6 +1510,8 @@ export class RadarEngine {
         );
         if (res.changes) {
           remaining--;
+          existingBets.push({ matchId: a.matchId, category: "case1_arb" });
+          crownExposure.push(...proposedCrown);
           const betId = Number(res.lastInsertRowid);
           for (const l of a.legs) insertLeg.run(betId, l.provider, l.market, l.lineKey, l.selection, l.decimalOdds, l.stake, 0, null);
         }
@@ -1496,7 +1519,7 @@ export class RadarEngine {
       /* 情況二 — highest direct/synthetic HKJC EV >= 3%, fixed 10,000 */
       for (const e of dash.ev) {
         if (remaining <= 0) break;
-        if (!eligible(e.matchId, e.kickoffUtc)) continue;
+        if (!eligible(e.matchId, e.kickoffUtc, "case2_ev")) continue;
         if (!isSafe(e) || e.edge < EV_THRESHOLD) continue;
         const key = `case2_ev|${e.matchId}|${e.lineKey}|${e.market}:${e.selection}`;
         const payout = round2(HKJC_FIXED_STAKE * e.hkjcOdds);
@@ -1506,6 +1529,7 @@ export class RadarEngine {
         );
         if (res.changes) {
           remaining--;
+          existingBets.push({ matchId: e.matchId, category: "case2_ev" });
           const betId = Number(res.lastInsertRowid);
           if (e.synthetic && e.components?.length) {
             for (const c of e.components) {
@@ -1529,8 +1553,16 @@ export class RadarEngine {
       /* 合成賠率 — Crown fixed 5,000, HKJC split by the synthetic formula */
       for (const s of dash.synthetics) {
         if (remaining <= 0) break;
-        if (!eligible(s.matchId, s.kickoffUtc)) continue;
+        if (!eligible(s.matchId, s.kickoffUtc, "synth_arb")) continue;
         if (!s.isArb || !s.crownOdds || !s.crownSelection) continue;
+        const proposedCrown = [{
+          matchId: s.matchId,
+          market: "AH",
+          lineKey: (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
+          selection: s.crownSelection,
+          stake: CROWN_FIXED_STAKE,
+        }];
+        if (!crownLegsWithinLimit(crownExposure, proposedCrown, CROWN_FIXED_STAKE)) continue;
         const key = `synth_arb|${s.matchId}|${s.targetHandicap}|${s.side}`;
         const res = insertBet.run(
           key, "synth_arb", s.matchId, "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
@@ -1539,6 +1571,8 @@ export class RadarEngine {
         );
         if (res.changes) {
           remaining--;
+          existingBets.push({ matchId: s.matchId, category: "synth_arb" });
+          crownExposure.push(...proposedCrown);
           const betId = Number(res.lastInsertRowid);
           insertLeg.run(
             betId, "crown", "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),

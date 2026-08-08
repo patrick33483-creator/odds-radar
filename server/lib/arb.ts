@@ -8,8 +8,8 @@
  *  - 1X2 requires ALL THREE outcomes to be covered. Two of three is never
  *    treated as full coverage.
  *  - q = Σ 1/O. Arbitrage only when q < 1.
- *  - Crown leg is fixed at HK$5,000 (user preference); the HKJC stake is
- *    back-calculated for equal payout and is uncapped.
+ *  - Every Crown selection is capped at HK$5,000 (user preference); the HKJC
+ *    stake is back-calculated for equal payout and is uncapped.
  */
 
 import type { ArbOpportunity, BetLeg, Market, Provider, Selection } from "@shared/types";
@@ -48,15 +48,16 @@ export interface StakePlan {
 }
 
 /**
- * Size all legs for an equal payout, anchoring the Crown leg at HK$5,000.
- * When several Crown legs exist (only possible in the 3-way structure) the
- * highest-priced Crown leg is the anchor.
+ * Size all legs for an equal payout, with no Crown selection above HK$5,000.
+ * When several Crown legs exist (only possible in the 3-way structure), the
+ * lowest-priced Crown leg is the HK$5,000 anchor. Every other Crown leg then
+ * requires an equal or smaller stake for the same payout.
  */
 export function planStakes(legs: LegInput[], crownStake = CROWN_FIXED_STAKE): StakePlan | null {
   if (legs.length < 2) return null;
   const crownLegs = legs.filter((l) => l.provider === "crown");
   const anchor = crownLegs.length
-    ? crownLegs.reduce((a, b) => (b.decimalOdds > a.decimalOdds ? b : a))
+    ? crownLegs.reduce((a, b) => (b.decimalOdds < a.decimalOdds ? b : a))
     : null;
   if (!anchor) return null; // cross-book structure requires a Crown leg
   const targetPayout = crownStake * anchor.decimalOdds;

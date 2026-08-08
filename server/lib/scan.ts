@@ -10,6 +10,8 @@
  *     per-match Pinnacle detail calls.
  *   - Otherwise poll just those events densely, in-process, and stop when every
  *     selected event has kicked off or the moment a simulated bet is created.
+ *     A later automatic tick may revisit the event because distinct lock
+ *     structures are allowed on one match.
  *   - Re-evaluate the loaded schedule on every pass so newly eligible events can
  *     join an already-running dense session.
  *
@@ -81,15 +83,44 @@ export interface ScanCandidate {
   pinnacleMatchId: string | null;
 }
 
+export type SimulationCategory = "case1_arb" | "case2_ev" | "synth_arb";
+
 /**
- * A simulation bet permanently removes its match from automatic scan scope.
- * The caller intentionally supplies IDs from every simulation category.
+ * EV retains the one-bet-per-match rule. Direct and synthetic lock bets may
+ * coexist on the same match; their Crown exposure is guarded separately.
  */
-export function excludeSimulatedMatches<T extends { matchId: string }>(
-  candidates: T[],
-  simulatedMatchIds: ReadonlySet<string>,
-): T[] {
-  return candidates.filter((candidate) => !simulatedMatchIds.has(candidate.matchId));
+export function matchCategoryEligible(
+  existing: ReadonlyArray<{ matchId: string }>,
+  matchId: string,
+  category: SimulationCategory,
+): boolean {
+  return category !== "case2_ev" || !existing.some((bet) => bet.matchId === matchId);
+}
+
+export interface CrownExposure {
+  matchId: string;
+  market: string;
+  lineKey: string;
+  selection: string;
+  stake: number;
+}
+
+export function crownExposureKey(leg: Omit<CrownExposure, "stake">): string {
+  return [leg.matchId, leg.market, leg.lineKey, leg.selection].join("|");
+}
+
+/** Every Crown market/line/selection is capped across all lock bet records. */
+export function crownLegsWithinLimit(
+  existing: ReadonlyArray<CrownExposure>,
+  proposed: ReadonlyArray<CrownExposure>,
+  limit = 5000,
+): boolean {
+  const exposure = new Map<string, number>();
+  for (const leg of [...existing, ...proposed]) {
+    const key = crownExposureKey(leg);
+    exposure.set(key, (exposure.get(key) ?? 0) + leg.stake);
+  }
+  return [...exposure.values()].every((stake) => stake <= limit + 1e-6);
 }
 
 export interface AutoScanTickGate {

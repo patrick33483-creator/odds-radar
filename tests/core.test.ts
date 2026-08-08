@@ -178,6 +178,7 @@ describe("arbitrage stake math", () => {
     expect(arb!.legs).toHaveLength(3);
     expect(totalProbability(arb!.legs.map((l) => l.decimalOdds))).toBeLessThan(1);
     const payouts = arb!.legs.map((l) => l.stake * l.decimalOdds);
+    expect(arb!.legs.filter((l) => l.provider === "crown").every((l) => l.stake <= 5000)).toBe(true);
     for (const p of payouts) expect(p).toBeCloseTo(payouts[0], 0);
   });
 
