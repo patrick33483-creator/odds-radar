@@ -63,6 +63,31 @@ export interface MatchRow {
   hasEv: boolean;
   hasSynthetic: boolean;
   synthetics: SyntheticOpportunity[];
+  totalClosingModel: ClosingTotalModelDto;
+}
+
+export interface ClosingTotalFairLineDto {
+  lineValue: number;
+  overMarketOdds: number;
+  underMarketOdds: number;
+  overNoVigProbability: number;
+  fairOverOdds: number;
+  fairUnderOdds: number;
+}
+
+export interface ClosingTotalModelDto {
+  status: "available" | "incomplete" | "stale" | "poor_fit";
+  observedAt: number | null;
+  sourceUpdatedAt: number | null;
+  closing: boolean;
+  ageSec: number | null;
+  secondsBeforeKickoff: number | null;
+  requiredLines: number[];
+  availableLines: number[];
+  lambda: number | null;
+  rmse: number | null;
+  lines: ClosingTotalFairLineDto[];
+  warning: string | null;
 }
 
 export interface BetLeg {

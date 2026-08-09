@@ -29,6 +29,11 @@ import { PinnapiProvider, type PinnapiFixture } from "../providers/pinnapi";
 import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
+import {
+  buildClosingTotalModel,
+  CLOSING_TOTAL_LINES,
+  type ClosingTotalQuote,
+} from "./closing-totals";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb, isArbitrageTotal } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
@@ -73,6 +78,7 @@ import {
   matches,
   oddsLatest,
   oddsSnapshots,
+  pinnacleTotalClosingQuotes,
   opportunities,
   providerHealth,
   pruneSnapshots,
@@ -766,6 +772,14 @@ export class RadarEngine {
         }
         if (prices.length) {
           rows++;
+          if (
+            !DEMO
+            && m.kickoffUtc > Date.now()
+            && m.pinnacleMatchId.startsWith("pinnapi:")
+            && source?.pinnapi_id
+          ) {
+            this.captureClosingTotals(m.id, source.pinnapi_id, m.kickoffUtc, prices, Date.now());
+          }
           rawDb.prepare("DELETE FROM odds_latest WHERE match_id=? AND provider='pinnacle'").run(m.id);
           this.persistPrices(m.id, "pinnacle", prices, Date.now());
         }
@@ -1082,6 +1096,57 @@ export class RadarEngine {
     }
   }
 
+  /**
+   * Replace the stored ladder with the complete O/U pairs present in this
+   * response. A partial current response must invalidate an older complete
+   * ladder rather than letting stale lines masquerade as a current fair price.
+   */
+  private captureClosingTotals(
+    matchId: string,
+    pinnacleEventId: string,
+    kickoffUtc: number,
+    prices: ProviderPrice[],
+    fetchedAt: number,
+  ): void {
+    const rows = CLOSING_TOTAL_LINES.flatMap((lineValue) => {
+      const over = prices.find((price) =>
+        price.market === "OU"
+        && price.lineValue === lineValue
+        && price.selection === "O");
+      const under = prices.find((price) =>
+        price.market === "OU"
+        && price.lineValue === lineValue
+        && price.selection === "U");
+      return over && under ? [over, under] : [];
+    });
+    const remove = rawDb.prepare("DELETE FROM pinnacle_total_closing_quotes WHERE match_id=?");
+    const insert = rawDb.prepare(
+      `INSERT INTO pinnacle_total_closing_quotes(
+        key,match_id,pinnacle_event_id,kickoff_utc,line_key,line_value,selection,
+        decimal_odds,source_updated_at,fetched_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+    );
+    const transaction = rawDb.transaction(() => {
+      remove.run(matchId);
+      for (const price of rows) {
+        const lineKey = lineKeyOf("OU", price.lineValue);
+        insert.run(
+          `${matchId}|${lineKey}|${price.selection}`,
+          matchId,
+          pinnacleEventId,
+          kickoffUtc,
+          lineKey,
+          price.lineValue,
+          price.selection,
+          price.decimalOdds,
+          price.sourceUpdatedAt ?? null,
+          fetchedAt,
+        );
+      }
+    });
+    transaction();
+  }
+
   /* ----------------------------- dashboard ------------------------------ */
 
   buildDashboardData(): DashboardResponse {
@@ -1101,6 +1166,13 @@ export class RadarEngine {
       byMatch.set(r.matchId, list);
     }
     const linesRows = db.select().from(marketLines).all();
+    const closingRows = db.select().from(pinnacleTotalClosingQuotes).all();
+    const closingByMatch = new Map<string, typeof closingRows>();
+    for (const row of closingRows) {
+      const list = closingByMatch.get(row.matchId) ?? [];
+      list.push(row);
+      closingByMatch.set(row.matchId, list);
+    }
     const linesByMatch = new Map<string, typeof linesRows>();
     for (const r of linesRows) {
       const list = linesByMatch.get(r.matchId) ?? [];
@@ -1308,6 +1380,17 @@ export class RadarEngine {
         hasEv: matchEvs.length > 0,
         hasSynthetic: syn.some((s) => s.isArb),
         synthetics: syn,
+        totalClosingModel: buildClosingTotalModel(
+          (closingByMatch.get(m.id) ?? []).map((row): ClosingTotalQuote => ({
+            lineValue: row.lineValue,
+            selection: row.selection as "O" | "U",
+            decimalOdds: row.decimalOdds,
+            sourceUpdatedAt: row.sourceUpdatedAt,
+            fetchedAt: row.fetchedAt,
+          })),
+          m.kickoffUtc,
+          now,
+        ),
       });
     }
 

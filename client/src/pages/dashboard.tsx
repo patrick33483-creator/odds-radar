@@ -454,7 +454,7 @@ export default function Dashboard() {
                                 </p>
                               ) : null}
                             </div>
-                            <div className="grid gap-3 sm:grid-cols-2">
+                            <div className={cn("grid gap-3", market === "OU" ? "sm:grid-cols-3" : "sm:grid-cols-2")}>
                               <div>
                                 <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                                   鎖利 / 期望值
@@ -514,6 +514,58 @@ export default function Dashboard() {
                                   ) : (
                                     <p className="text-[11px] text-muted-foreground">
                                       未能砌出合成盤（需要馬會主客和，以及皇冠同盤路的對立單注）。
+                                    </p>
+                                  )}
+                                </div>
+                              ) : null}
+                              {market === "OU" ? (
+                                <div
+                                  className="order-first w-[calc(100vw-1.5rem)] sm:order-none sm:w-auto"
+                                  data-testid={`detail-closing-total-${m.id}`}
+                                >
+                                  <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                    Pinnacle 尾盤四線公平價
+                                  </h3>
+                                  {m.totalClosingModel.lines.length ? (
+                                    <div className="space-y-1 text-[10px]">
+                                      <div className="grid grid-cols-5 gap-1 border-b border-grid pb-1 text-muted-foreground">
+                                        <span>盤</span>
+                                        <span className="text-right">P 大/細</span>
+                                        <span className="text-right">公平大</span>
+                                        <span className="text-right">公平細</span>
+                                        <span className="text-right">去水大率</span>
+                                      </div>
+                                      {m.totalClosingModel.lines.map((fair) => (
+                                        <div key={fair.lineValue} className="tnum grid grid-cols-5 gap-1">
+                                          <span>{fair.lineValue}</span>
+                                          <span className="text-right text-pinnacle">
+                                            {fmtOdds(fair.overMarketOdds)}/{fmtOdds(fair.underMarketOdds)}
+                                          </span>
+                                          <span className="text-right">{fmtOdds(fair.fairOverOdds)}</span>
+                                          <span className="text-right">{fmtOdds(fair.fairUnderOdds)}</span>
+                                          <span className="text-right">{fmtPct(fair.overNoVigProbability)}</span>
+                                        </div>
+                                      ))}
+                                      <p className={cn(
+                                        "pt-1",
+                                        m.totalClosingModel.status === "available" ? "text-positive" : "text-negative",
+                                      )}>
+                                        {m.totalClosingModel.closing ? "已定格尾盤" : "尾盤候選"}
+                                        {" · "}λ {m.totalClosingModel.lambda?.toFixed(3) ?? "—"}
+                                        {" · "}RMSE {m.totalClosingModel.rmse?.toFixed(4) ?? "—"}
+                                        {" · "}{ageLabel(m.totalClosingModel.ageSec ?? 0)}
+                                      </p>
+                                      {m.totalClosingModel.warning ? (
+                                        <p className="text-negative">{m.totalClosingModel.warning}</p>
+                                      ) : (
+                                        <p className="text-muted-foreground">
+                                          四條完整雙邊盤同一批抓取；公平價由去水機率校準總入球分佈反推。暫不參與自動投注。
+                                        </p>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <p className="text-[11px] text-muted-foreground">
+                                      {m.totalClosingModel.warning ?? "尚未捕捉到完整 2.5、3、3.5、4 球雙邊尾盤。"}
                                     </p>
                                   )}
                                 </div>
