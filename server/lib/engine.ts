@@ -607,7 +607,7 @@ export class RadarEngine {
     if (DEMO || !this.pinnapi.status().configured) return;
     const matchesById = new Map(db.select().from(matches).all().map((match) => [match.id, match]));
     const tracked = new Map<string, { eventId: string; matchId: string; reversed: boolean }>();
-    for (const bet of db.select().from(simulationBets).all()) {
+    for (const bet of db.select().from(simulationBets).where(eq(simulationBets.excludedFromStats, 0)).all()) {
       if (bet.settledAt || bet.kickoffUtc > now) continue;
       const match = matchesById.get(bet.matchId);
       if (!match) continue;
@@ -861,7 +861,11 @@ export class RadarEngine {
   scanConfigInfo(): StatusResponse["scan"] {
     const cfg = scanConfig();
     const target = simulationTarget();
-    const simulationBetCount = db.select().from(simulationBets).all().length;
+    const simulationBetCount = db
+      .select()
+      .from(simulationBets)
+      .where(eq(simulationBets.excludedFromStats, 0))
+      .all().length;
     return {
       ...cfg,
       scheduleConfigured: autoScanEnabled(),
@@ -922,6 +926,7 @@ export class RadarEngine {
     const newBetKeys = db
       .select()
       .from(simulationBets)
+      .where(eq(simulationBets.excludedFromStats, 0))
       .all()
       .filter((b) => eventIds.has(b.matchId) && b.placedAt >= now)
       .map((b) => `bet|${b.uniqueKey}`);
@@ -933,7 +938,11 @@ export class RadarEngine {
    * helper endpoint, or an external scheduler. This method creates no schedule.
    */
   async runScan(): Promise<ScanOutcome> {
-    const currentBets = db.select().from(simulationBets).all().length;
+    const currentBets = db
+      .select()
+      .from(simulationBets)
+      .where(eq(simulationBets.excludedFromStats, 0))
+      .all().length;
     const target = simulationTarget();
     if (simulationTargetReached(currentBets, target)) {
       const cfg = scanConfig();
@@ -1224,11 +1233,9 @@ export class RadarEngine {
       /* synthetic quotes from HKJC 1X2 vs Crown handicap singles */
       const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices, now);
       synthetics.push(...syn);
-      /*
-       * Case 2 EV also considers an equivalent HKJC Asian-handicap price
-       * synthesized from 1X2 / official HKJC legs. For the same economic
-       * selection, keep only the higher EV of the direct and synthetic route.
-       */
+      // Standalone 1X2 remains visible for observation only. An AH/OU target
+      // may still use an economically equivalent HKJC 1X2 combination when
+      // that route offers the better return.
       const syntheticEvs = this.buildSyntheticEvsFor(
         m.id,
         matchLabel,
@@ -1600,8 +1607,13 @@ export class RadarEngine {
   private placeSimulations(dash: DashboardResponse, now: number, scannedMatchIds: ReadonlySet<string>): void {
     const windowMinutes = scanConfig().windowMinutes;
     const target = simulationTarget();
-    const currentBets = db.select().from(simulationBets).all().length;
-    const existingBets = db.select().from(simulationBets).all().map((bet) => ({
+    const activeBets = db
+      .select()
+      .from(simulationBets)
+      .where(eq(simulationBets.excludedFromStats, 0))
+      .all();
+    const currentBets = activeBets.length;
+    const existingBets = activeBets.map((bet) => ({
       matchId: bet.matchId,
       category: bet.category,
     }));
@@ -1659,10 +1671,13 @@ export class RadarEngine {
           for (const l of a.legs) insertLeg.run(betId, l.provider, l.market, l.lineKey, l.selection, l.decimalOdds, l.stake, 0, null);
         }
       }
-      /* 情況二 — highest direct/synthetic HKJC EV >= 3%, fixed 10,000 */
+      /* 情況二 — AH/OU target, direct or HKJC-equivalent route, fixed 10,000 */
       for (const e of dash.ev) {
         if (remaining <= 0) break;
         if (!eligible(e.matchId, e.kickoffUtc, "case2_ev")) continue;
+        // Only the target market decides eligibility. A synthetic AH/OU route
+        // is valid; a standalone 1X2 target is observation-only.
+        if (e.market !== "AH" && e.market !== "OU") continue;
         if (!isSafe(e) || e.edge < EV_THRESHOLD) continue;
         const key = `case2_ev|${e.matchId}|${e.lineKey}|${e.market}:${e.selection}`;
         const payout = round2(HKJC_FIXED_STAKE * e.hkjcOdds);
@@ -1685,7 +1700,7 @@ export class RadarEngine {
                 c.decimalOdds,
                 c.stake,
                 1,
-                c.syntheticDetail ?? e.formula ?? "合成 EV",
+                c.syntheticDetail ?? e.formula ?? "主客和等價 EV",
               );
             }
           } else {
@@ -1740,7 +1755,12 @@ export class RadarEngine {
    */
   async settleDue(manual: boolean): Promise<{ settled: number; pending: number; resultsFetched: number }> {
     const now = Date.now();
-    const open = db.select().from(simulationBets).all().filter((b) => !b.settledAt);
+    const open = db
+      .select()
+      .from(simulationBets)
+      .where(eq(simulationBets.excludedFromStats, 0))
+      .all()
+      .filter((b) => !b.settledAt);
     await this.refreshTrackedPinnapiLiveScores(now);
     // Manual settlement may refresh/check results, but cannot bypass the
     // existing 105-minute protection for a final score.

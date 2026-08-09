@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS simulation_bets (
   total_stake REAL NOT NULL, expected_payout REAL NOT NULL, expected_profit REAL NOT NULL,
   roi REAL NOT NULL, ev_pct REAL, q_total REAL, placed_at INTEGER NOT NULL,
   settled_at INTEGER, result_status TEXT, realized_return REAL, realized_pnl REAL,
-  final_score TEXT, settlement_source TEXT, notes TEXT);
+  final_score TEXT, settlement_source TEXT, notes TEXT,
+  excluded_from_stats INTEGER NOT NULL DEFAULT 0, exclusion_reason TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS simulation_bets_uniq ON simulation_bets(unique_key);
 CREATE INDEX IF NOT EXISTS simulation_bets_cat_idx ON simulation_bets(category, placed_at);
 
@@ -143,6 +144,26 @@ CREATE TABLE IF NOT EXISTS app_state (
   if (!simulationBetColumns.some((column) => column.name === "settlement_source")) {
     sqlite.exec("ALTER TABLE simulation_bets ADD COLUMN settlement_source TEXT");
   }
+  if (!simulationBetColumns.some((column) => column.name === "excluded_from_stats")) {
+    sqlite.exec("ALTER TABLE simulation_bets ADD COLUMN excluded_from_stats INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!simulationBetColumns.some((column) => column.name === "exclusion_reason")) {
+    sqlite.exec("ALTER TABLE simulation_bets ADD COLUMN exclusion_reason TEXT");
+  }
+  // Preserve historical direct 1X2 rows for audit while removing them from
+  // the active 30-bet validation cohort. An AH/OU target implemented through
+  // an economically equivalent HKJC 1X2 combination remains eligible.
+  sqlite.exec(`
+    UPDATE simulation_bets
+       SET excluded_from_stats=0, exclusion_reason=NULL
+     WHERE exclusion_reason='SYNTHETIC_EV_DISABLED'
+       AND market IN ('AH','OU');
+    UPDATE simulation_bets
+       SET excluded_from_stats=1, exclusion_reason='1X2_OBSERVATION_ONLY'
+     WHERE category='case2_ev' AND market='1X2';
+    CREATE INDEX IF NOT EXISTS simulation_bets_active_idx
+      ON simulation_bets(excluded_from_stats, category, placed_at);
+  `);
   sqlite.exec("CREATE INDEX IF NOT EXISTS pinnacle_source_map_pinnapi_idx ON pinnacle_source_map(pinnapi_id)");
 }
 

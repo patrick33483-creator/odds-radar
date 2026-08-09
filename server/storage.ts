@@ -22,7 +22,12 @@ export interface IStorage {
 
 export class DatabaseStorage implements IStorage {
   listSimulations() {
-    const bets = db.select().from(simulationBets).orderBy(desc(simulationBets.placedAt)).all();
+    const bets = db
+      .select()
+      .from(simulationBets)
+      .where(eq(simulationBets.excludedFromStats, 0))
+      .orderBy(desc(simulationBets.placedAt))
+      .all();
     const legs = db.select().from(simulationLegs).all();
     return bets.map((bet) => ({ bet, legs: legs.filter((l) => l.betId === bet.id) }));
   }

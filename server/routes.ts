@@ -6,6 +6,8 @@ import { createBackup, listBackups } from "./lib/backup";
 import { storage } from "./storage";
 import { formatLine, formatSelectionLine } from "./lib/lines";
 import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./lib/scan";
+import { readCornerValidationReport, runPinnapiCornerValidation } from "./lib/corner-validation";
+import { PinnapiProvider } from "./providers/pinnapi";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -14,6 +16,7 @@ let autoScanTimer: NodeJS.Timeout | null = null;
 let autoScanStartupTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmStartupTimer: NodeJS.Timeout | null = null;
+let cornerValidationInFlight: Promise<unknown> | null = null;
 
 function installAutoWindowScan(): void {
   if (!autoScanEnabled() || autoScanTimer) return;
@@ -296,6 +299,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/backups", (_req, res) => {
     const info = createBackup();
     res.json({ created: info, backups: listBackups() });
+  });
+
+  app.get("/api/validation/pinnapi-corners", async (_req, res) => {
+    const report = await readCornerValidationReport();
+    if (!report) return res.status(404).json({ message: "尚未執行 PinnAPI 角球市場驗證" });
+    return res.json(report);
+  });
+
+  app.post("/api/validation/pinnapi-corners", async (req, res) => {
+    if (cornerValidationInFlight) {
+      return res.status(409).json({ message: "角球市場驗證正在執行" });
+    }
+    const requested = Number(req.query.limit ?? 20);
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(30, Math.floor(requested))) : 20;
+    try {
+      cornerValidationInFlight = runPinnapiCornerValidation(new PinnapiProvider(), { limit });
+      const report = await cornerValidationInFlight;
+      return res.json(report);
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "pinnapi_corner_validation_error",
+        error: (err as Error).message,
+      }));
+      return res.status(502).json({ message: "PinnAPI 角球市場驗證失敗，未啟用任何角球投注" });
+    } finally {
+      cornerValidationInFlight = null;
+    }
   });
 
   app.get("/api/history", (req, res) => {

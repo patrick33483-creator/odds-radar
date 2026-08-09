@@ -454,14 +454,20 @@ export class PinnapiProvider {
     if (!pinnapiConfig().configured) throw new Error("PinnAPI credentials are not configured");
   }
 
+  /** Raw, read-only payload for bounded market-capability validation. */
+  async fetchFixturePayload(): Promise<unknown> {
+    this.requireConfigured();
+    return fetchJson<unknown>(this.endpoint("/kit/v1/prematch/fixtures?sport_id=1"), {
+      headers: pinnapiHeaders(),
+      timeoutMs: 25_000,
+      retries: 1,
+    });
+  }
+
   async fetchFixtures(): Promise<PinnapiFixture[]> {
     this.requireConfigured();
     try {
-      const payload = await fetchJson<unknown>(this.endpoint("/kit/v1/prematch/fixtures?sport_id=1"), {
-        headers: pinnapiHeaders(),
-        timeoutMs: 25_000,
-        retries: 1,
-      });
+      const payload = await this.fetchFixturePayload();
       const fixtures = parsePinnapiFixtures(payload);
       this.lastSuccessAt = Date.now();
       return fixtures;
@@ -471,15 +477,21 @@ export class PinnapiProvider {
     }
   }
 
-  async fetchEventLines(eventId: string): Promise<PinnapiLines> {
+  /** Raw, read-only event line payload for capability validation. */
+  async fetchEventLinePayload(eventId: string): Promise<unknown> {
     this.requireConfigured();
     const safeId = encodeURIComponent(eventId);
+    return fetchJson<unknown>(this.endpoint(`/kit/v1/prematch/lines?event_id=${safeId}`), {
+      headers: pinnapiHeaders(),
+      timeoutMs: 25_000,
+      retries: 1,
+    });
+  }
+
+  async fetchEventLines(eventId: string): Promise<PinnapiLines> {
+    this.requireConfigured();
     try {
-      const payload = await fetchJson<unknown>(this.endpoint(`/kit/v1/prematch/lines?event_id=${safeId}`), {
-        headers: pinnapiHeaders(),
-        timeoutMs: 25_000,
-        retries: 1,
-      });
+      const payload = await this.fetchEventLinePayload(eventId);
       const result = parsePinnapiLines(payload, eventId);
       this.lastSuccessAt = Date.now();
       return result;

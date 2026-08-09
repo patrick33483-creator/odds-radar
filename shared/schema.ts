@@ -178,6 +178,9 @@ export const simulationBets = sqliteTable(
     /** Final-score provenance, e.g. pinnapi_live or titan_over_YYYYMMDD. */
     settlementSource: text("settlement_source"),
     notes: text("notes"),
+    /** Preserves legacy rows for audit while excluding them from the live test. */
+    excludedFromStats: integer("excluded_from_stats").notNull().default(0),
+    exclusionReason: text("exclusion_reason"),
   },
   (t) => ({
     uniq: uniqueIndex("simulation_bets_uniq").on(t.uniqueKey),

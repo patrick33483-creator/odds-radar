@@ -16,7 +16,7 @@ services:
       RADAR_SCAN_WINDOW_MIN: "30"
       RADAR_SCAN_INTERVAL_SEC: "30"
     ports:
-      - "80:5000"
+      - "127.0.0.1:5001:5000"
     volumes:
       - ./data:/app/data
       - ./backups:/app/backups
@@ -26,4 +26,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 45s
-

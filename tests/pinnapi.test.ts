@@ -7,6 +7,7 @@ import {
   pinnapiConfig,
   pinnapiHeaders,
 } from "../server/providers/pinnapi";
+import { analyzeCornerPayload } from "../server/lib/corner-validation";
 
 describe("PinnAPI Edge fixtures", () => {
   it("maps valid scheduled fixtures and prefers a top-level parent over a duplicate child", () => {
@@ -216,5 +217,34 @@ describe("PinnAPI Edge configuration", () => {
     expect(
       pinnapiConfig({ PINNAPI_BASE_URL: "https://user:secret@edge.example/path?api_key=secret#fragment" } as NodeJS.ProcessEnv),
     ).toEqual({ baseUrl: "https://edge.example/path", configured: false });
+  });
+});
+
+describe("PinnAPI corner-market validation", () => {
+  it("requires explicit corner context and a complete over/under quote", () => {
+    const analysis = analyzeCornerPayload({
+      updated_at: "2026-08-09T02:00:00Z",
+      periods: {
+        num_0: {
+          totals: [{ points: 2.5, over: 1.9, under: 1.95 }],
+          corner_totals: [
+            { points: 9.5, over: 1.91, under: 1.99 },
+            { points: 10.5, over: 1.94 },
+          ],
+        },
+      },
+    });
+    expect(analysis.quotes).toEqual([
+      expect.objectContaining({ line: 9.5, over: 1.91, under: 1.99, sourceTimestamp: "2026-08-09T02:00:00Z" }),
+    ]);
+    expect(analysis.signalPaths.some((path) => path.includes("corner_totals"))).toBe(true);
+  });
+
+  it("does not mistake ordinary match totals for corner markets", () => {
+    const analysis = analyzeCornerPayload({
+      periods: { num_0: { totals: [{ points: 2.75, over: 1.9, under: 1.95 }] } },
+    });
+    expect(analysis.signalPaths).toEqual([]);
+    expect(analysis.quotes).toEqual([]);
   });
 });
