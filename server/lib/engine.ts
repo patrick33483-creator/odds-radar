@@ -32,6 +32,7 @@ import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb, isArbitrageTotal } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
+import { confirmedOpportunityKeys, isHkjcExecutionQuoteFresh } from "./execution-guard";
 import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
@@ -930,18 +931,48 @@ export class RadarEngine {
 
   /** One dense pass: refresh HKJC (1 call) + Pinnacle detail for the window only. */
   private async densePass(events: ScanCandidate[]): Promise<{ detailCalls: number; newOpportunityKeys: string[] }> {
-    const now = Date.now();
     await this.refreshHkjc();
     const res = await this.pollPinnacleDetail(
       events.map((e) => ({ id: e.matchId, pinnacleMatchId: e.pinnacleMatchId, kickoffUtc: e.kickoffUtc })),
       Date.now() + MAX_LOOP_MS,
       true,
     );
-    const dash = this.buildDashboardData();
-    this.recordOpportunities(dash, now);
+    const scannedMatchIds = new Set(events.map((e) => e.matchId));
+    const initialAt = Date.now();
+    const initialDash = this.buildDashboardData();
+    const initialKeys = this.simulationCandidateKeys(initialDash, initialAt, scannedMatchIds);
+
+    // A first-pass signal is never executable. Re-fetch HKJC independently,
+    // rebuild every calculation from the replacement snapshot, and retain only
+    // identical economic opportunities that still qualify.
+    let verifiedDash = initialDash;
+    let allowedKeys = new Set<string>();
+    if (initialKeys.size) {
+      const hkjcVerified = await this.refreshHkjc();
+      if (hkjcVerified) {
+        const verifiedAt = Date.now();
+        verifiedDash = this.buildDashboardData();
+        const secondKeys = this.simulationCandidateKeys(verifiedDash, verifiedAt, scannedMatchIds);
+        allowedKeys = confirmedOpportunityKeys(initialKeys, secondKeys);
+        log("execution_recheck", {
+          initial: initialKeys.size,
+          verified: allowedKeys.size,
+          rejected: initialKeys.size - allowedKeys.size,
+        });
+      } else {
+        log("execution_recheck", {
+          initial: initialKeys.size,
+          verified: 0,
+          rejected: initialKeys.size,
+          reason: "hkjc_refresh_failed",
+        });
+      }
+    }
+    const now = Date.now();
+    this.recordOpportunities(verifiedDash, now);
     // Simulation purchases are exclusive to this dense-scan path and to the
     // events selected for this pass. General/manual refreshes never buy.
-    this.placeSimulations(dash, now, new Set(events.map((e) => e.matchId)));
+    this.placeSimulations(verifiedDash, now, scannedMatchIds, allowedKeys);
     this.recomputeDegradedReason();
     // Only a newly created simulation ends the session. Newly detected
     // opportunities without an insert must continue to be re-checked every
@@ -956,6 +987,33 @@ export class RadarEngine {
       .filter((b) => eventIds.has(b.matchId) && b.placedAt >= now)
       .map((b) => `bet|${b.uniqueKey}`);
     return { detailCalls: res.fetched, newOpportunityKeys: [...new Set(newBetKeys)] };
+  }
+
+  /** Candidate keys that currently pass every pre-bet rule except re-confirmation. */
+  private simulationCandidateKeys(
+    dash: DashboardResponse,
+    now: number,
+    scannedMatchIds: ReadonlySet<string>,
+  ): Set<string> {
+    const windowMinutes = scanConfig().windowMinutes;
+    const inWindow = (matchId: string, kickoffUtc: number) =>
+      scannedMatchIds.has(matchId)
+      && isSimulationPurchaseWindow(kickoffUtc, now, windowMinutes);
+    return new Set([
+      ...dash.arbs
+        .filter((op) => op.market !== "COU" && inWindow(op.matchId, op.kickoffUtc))
+        .map((op) => op.key),
+      ...dash.ev
+        .filter((op) =>
+          (op.market === "AH" || op.market === "OU" || op.market === "COU")
+          && isSafe(op)
+          && op.edge >= EV_THRESHOLD
+          && inWindow(op.matchId, op.kickoffUtc))
+        .map((op) => op.key),
+      ...dash.synthetics
+        .filter((op) => op.isArb && inWindow(op.matchId, op.kickoffUtc))
+        .map((op) => op.key),
+    ]);
   }
 
   /**
@@ -1162,7 +1220,7 @@ export class RadarEngine {
         const hasHk = Object.keys(hk).length === sels.length;
         const hasPin = Object.keys(pin).length === sels.length;
         const hasCrown = Object.keys(crown).length === sels.length;
-        const hasFreshHk = hasHk && sels.every((s) => !hk[s]!.stale);
+        const hasFreshHk = hasHk && sels.every((s) => isHkjcExecutionQuoteFresh(hk[s]!, now));
         const hasFreshPin = hasPin && sels.every((s) => !pin[s]!.stale);
         const hasFreshCrown = hasCrown && sels.every((s) => !crown[s]!.stale);
         const exactLine = hasHk && hasPin;
@@ -1327,6 +1385,7 @@ export class RadarEngine {
       selection: string;
       decimalOdds: number;
       fetchedAt: number;
+      sourceUpdatedAt?: number | null;
     }>,
     mappingConfidence: number,
     now: number,
@@ -1396,7 +1455,12 @@ export class RadarEngine {
             ),
           )
           .filter((price): price is NonNullable<typeof price> => !!price);
-        if (!usedRows.length) continue;
+        if (
+          usedRows.length !== quote.components.length ||
+          usedRows.some((price) => !isHkjcExecutionQuoteFresh(price, now))
+        ) {
+          continue;
+        }
         const evaluated = evaluateEv({
           matchId,
           matchLabel,
@@ -1444,6 +1508,7 @@ export class RadarEngine {
       selection: string;
       decimalOdds: number;
       fetchedAt: number;
+      sourceUpdatedAt?: number | null;
     }>,
     now: number,
   ): SyntheticOpportunity[] {
@@ -1500,7 +1565,7 @@ export class RadarEngine {
           .filter((price): price is NonNullable<typeof price> => !!price);
         if (
           usedRows.length !== quote.components.length ||
-          usedRows.some((price) => now - price.fetchedAt > STALE_MS)
+          usedRows.some((price) => !isHkjcExecutionQuoteFresh(price, now))
         ) {
           continue;
         }
@@ -1639,7 +1704,12 @@ export class RadarEngine {
 
   /* ----------------------------- simulations ---------------------------- */
 
-  private placeSimulations(dash: DashboardResponse, now: number, scannedMatchIds: ReadonlySet<string>): void {
+  private placeSimulations(
+    dash: DashboardResponse,
+    now: number,
+    scannedMatchIds: ReadonlySet<string>,
+    confirmedKeys: ReadonlySet<string>,
+  ): void {
     const windowMinutes = scanConfig().windowMinutes;
     const target = simulationTarget();
     const activeBets = db
@@ -1682,6 +1752,7 @@ export class RadarEngine {
       /* 情況一 — arb, Crown fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
         if (remaining <= 0) break;
+        if (!confirmedKeys.has(a.key)) continue;
         if (a.market === "COU") continue;
         if (!eligible(a.matchId, a.kickoffUtc, "case1_arb")) continue;
         const proposedCrown = a.legs
@@ -1710,6 +1781,7 @@ export class RadarEngine {
       /* 情況二 — AH/OU target, direct or HKJC-equivalent route, fixed 10,000 */
       for (const e of dash.ev) {
         if (remaining <= 0) break;
+        if (!confirmedKeys.has(e.key)) continue;
         if (!eligible(e.matchId, e.kickoffUtc, "case2_ev")) continue;
         // Only the target market decides eligibility. Synthetic AH/OU routes
         // and direct exact-line COU EV are valid; 1X2 is observation-only.
@@ -1747,6 +1819,7 @@ export class RadarEngine {
       /* 合成賠率 — Crown fixed 5,000, HKJC split by the synthetic formula */
       for (const s of dash.synthetics) {
         if (remaining <= 0) break;
+        if (!confirmedKeys.has(s.key)) continue;
         if (!eligible(s.matchId, s.kickoffUtc, "synth_arb")) continue;
         if (!s.isArb || !s.crownOdds || !s.crownSelection) continue;
         const proposedCrown = [{

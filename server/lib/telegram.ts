@@ -94,14 +94,29 @@ function buildMessage(bet: BetRow, legs: LegRow[]): string {
     bet.category === "case2_ev" && bet.ev_pct !== null
       ? `EV：${percent(bet.ev_pct)}`
       : `預期回報率：${percent(bet.roi)}`;
+  // A single direct HKJC leg has a meaningful scalar minimum price. Synthetic
+  // routes are combinations of several stakes, so showing one component's odds
+  // as the minimum would be misleading.
+  const evLeg =
+    bet.category === "case2_ev" && legs.length === 1 && !legs[0]?.synthetic
+      ? legs[0]
+      : undefined;
+  const minimumAcceptableOdds =
+    evLeg && bet.ev_pct !== null && bet.ev_pct > -1
+      ? (evLeg.decimal_odds * 1.03) / (1 + bet.ev_pct)
+      : null;
   return [
     "盤路雷達：發現新模擬注單",
+    "✅ 已用馬會即時盤口完成二次確認",
     `${CATEGORY_LABEL[bet.category] ?? bet.category}｜${bet.league}`,
     bet.match_label,
     `開賽：${hkt(bet.kickoff_utc)} HKT`,
     ...legLines,
     `總注碼：${money(bet.total_stake)}`,
     `${metric}｜預期盈利：${money(bet.expected_profit)}`,
+    ...(minimumAcceptableOdds !== null
+      ? [`最低可接受賠率：${minimumAcceptableOdds.toFixed(3)}（以 EV 3% 門檻計）`]
+      : []),
     "請自行核對即時盤口後才落實投注。",
   ].join("\n");
 }
