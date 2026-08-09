@@ -234,6 +234,14 @@ export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
     const sourceUpdatedAt = toEpoch(pool.updateAt);
     for (const line of pool.lines) {
       if (!isTradableStatus(line.status)) continue;
+      // The public match-list payload can retain an alternate line as
+      // AVAILABLE after the customer-facing betting page has already moved
+      // to a new main line.  A fresh HTTP response therefore does not prove
+      // that a non-main price is still executable.  Fail closed: only the
+      // currently designated main AH/OU/COU line may enter the execution
+      // price store and generate EV, arb, simulation, or Telegram output.
+      // HAD/1X2 is not an alternate-line market and remains unaffected.
+      if (market !== "1X2" && !line.main) continue;
       let lineValue: number | null = null;
       if (market === "AH") {
         lineValue = parseHkjcHandicap(line.condition);

@@ -148,6 +148,16 @@ describe("HKJC CHL and official corner settlement", () => {
                 { combId: "a-old", str: "A", status: "AVAILABLE", currentOdds: "1.70" },
               ],
             },
+            {
+              lineId: "stale-alternate",
+              status: "AVAILABLE",
+              condition: "-1.0",
+              main: false,
+              combinations: [
+                { combId: "h-stale", str: "H", status: "AVAILABLE", currentOdds: "3.35" },
+                { combId: "a-stale", str: "A", status: "AVAILABLE", currentOdds: "1.22" },
+              ],
+            },
           ],
         },
       ],
@@ -158,6 +168,7 @@ describe("HKJC CHL and official corner settlement", () => {
       expect.objectContaining({ market: "AH", lineValue: -0.25, selection: "A", decimalOdds: 2.0 }),
     ]);
     expect(event.prices.some((price) => price.lineValue === -0.75)).toBe(false);
+    expect(event.prices.some((price) => price.lineValue === -1)).toBe(false);
   });
 
   it("maps CHL H/L to the distinct COU O/U market without changing goal totals", () => {
