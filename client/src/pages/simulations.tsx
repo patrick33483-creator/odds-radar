@@ -79,7 +79,7 @@ export default function Simulations() {
               模擬投注紀錄
             </h1>
             <p className="truncate text-[10px] text-muted-foreground">
-              情況一 皇冠固定 $5,000 · 情況二 馬會固定 $10,000（直接盤／主客和等價／合成盤擇最高 Pinnacle EV ≥ 3%）· 合成鎖利 皇冠固定 $5,000
+              鎖利／合成鎖利只需完整覆蓋及 q &lt; 100%，不設 EV 門檻 · 情況二馬會固定 $10,000，Pinnacle EV ≥ 3%
             </p>
           </div>
           <div className="ml-auto flex items-center gap-1">
@@ -201,7 +201,7 @@ export default function Simulations() {
         ) : bets.length === 0 ? (
           <EmptyState
             title="暫時未有模擬注單"
-            hint="出現鎖利、EV ≥ 3% 或合成鎖利機會時，系統會自動落一次飛；同一場、同一個項目永遠只會買一次。"
+            hint="鎖利及合成鎖利只需完整覆蓋且 q < 100%；只有一般 EV 注單要求 Pinnacle EV ≥ 3%。"
             testId="empty-simulations"
           />
         ) : (

@@ -30,7 +30,7 @@ import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
-import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb } from "./arb";
+import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb, isArbitrageTotal } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
 import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
@@ -1490,7 +1490,9 @@ export class RadarEngine {
           crownOdds,
           crownSelection,
           q: Math.round(q * 1e6) / 1e6,
-          isArb: q < 1,
+          // Synthetic locks use the same pure lock rule as direct locks.
+          // The Pinnacle EV threshold applies only to case2_ev.
+          isArb: isArbitrageTotal(q),
           totalStake,
           payout: round2(payout),
           profit,

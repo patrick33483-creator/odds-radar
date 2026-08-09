@@ -14,7 +14,7 @@ import {
   parseHkjcTotal,
   splitLine,
 } from "../server/lib/lines";
-import { findThreeWayArb, findTwoWayArb, planStakes, totalProbability } from "../server/lib/arb";
+import { findThreeWayArb, findTwoWayArb, isArbitrageTotal, planStakes, totalProbability } from "../server/lib/arb";
 import { evaluateEv, margin, noVigProbs, selectBestEv } from "../server/lib/ev";
 import { isSameHandicapRoad, lineKeyOf } from "../server/lib/lines";
 import { buildSynthetic, syntheticCoversCrown } from "../server/lib/synthetic";
@@ -149,6 +149,23 @@ describe("arbitrage stake math", () => {
     expect(
       findTwoWayArb({ ...base, hkjc: { selection: "H", decimalOdds: 1.9 }, crown: { selection: "A", decimalOdds: 1.95 } }),
     ).toBeNull();
+  });
+
+  it("accepts a genuine thin lock even when its ROI is below the 3% EV threshold", () => {
+    const arb = findTwoWayArb({
+      ...base,
+      hkjc: { selection: "H", decimalOdds: 2.01 },
+      crown: { selection: "A", decimalOdds: 2.01 },
+    });
+    expect(arb).not.toBeNull();
+    expect(arb!.roi).toBeGreaterThan(0);
+    expect(arb!.roi).toBeLessThan(0.03);
+  });
+
+  it("uses q below 1 as the sole numerical threshold for direct and synthetic locks", () => {
+    expect(isArbitrageTotal(0.999999)).toBe(true);
+    expect(isArbitrageTotal(1)).toBe(false);
+    expect(isArbitrageTotal(Number.NaN)).toBe(false);
   });
 
   it("refuses non-complementary pairs", () => {

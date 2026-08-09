@@ -25,6 +25,14 @@ export function totalProbability(odds: number[]): number {
   return odds.reduce((acc, o) => acc + impliedProb(o), 0);
 }
 
+/**
+ * Lock bets are governed only by complete outcome coverage and q < 1.
+ * Pinnacle EV and the 3% EV threshold never apply to direct or synthetic locks.
+ */
+export function isArbitrageTotal(q: number): boolean {
+  return Number.isFinite(q) && q < 1;
+}
+
 export function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
@@ -102,7 +110,7 @@ export function findTwoWayArb(input: TwoWayInput, crownStake = CROWN_FIXED_STAKE
   if (!isComplementaryPair(hkjc.selection, crown.selection)) return null;
   if (!(hkjc.decimalOdds > 1) || !(crown.decimalOdds > 1)) return null;
   const q = impliedProb(hkjc.decimalOdds) + impliedProb(crown.decimalOdds);
-  if (!(q < 1)) return null;
+  if (!isArbitrageTotal(q)) return null;
   const plan = planStakes(
     [
       {
@@ -177,7 +185,7 @@ export function findThreeWayArb(input: ThreeWayInput, crownStake = CROWN_FIXED_S
   }
   if (!picks.some((p) => p.provider === "crown")) return null;
   const q = totalProbability(picks.map((p) => p.decimalOdds));
-  if (!(q < 1)) return null;
+  if (!isArbitrageTotal(q)) return null;
   const plan = planStakes(picks, crownStake);
   if (!plan) return null;
   return {
