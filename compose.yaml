@@ -16,6 +16,7 @@ services:
       RADAR_SCAN_WINDOW_MIN: "30"
       RADAR_SCAN_INTERVAL_SEC: "30"
       RADAR_SIM_TARGET: "30"
+      TELEGRAM_CHAT_ID: "-5318899825"
     ports:
       - "127.0.0.1:5001:5000"
     volumes:
