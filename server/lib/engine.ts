@@ -351,6 +351,9 @@ export class RadarEngine {
         : await this.hkjc.fetchPreMatch({});
       this.setHealth("hkjc", { ok: true, latencyMs: res.latencyMs, itemCount: res.events.length, mode: DEMO ? "demo" : "live" });
       const tx = rawDb.transaction(() => {
+        const clearLatest = rawDb.prepare(
+          "DELETE FROM odds_latest WHERE match_id=? AND provider='hkjc'",
+        );
         for (const ev of res.events) {
           const id = `hkjc:${ev.providerMatchId}`;
           rawDb
@@ -374,6 +377,11 @@ export class RadarEngine {
               ev.status,
               now,
             );
+          // This endpoint is a complete pre-match snapshot for each returned
+          // event. Remove lines that disappeared or became suspended before
+          // inserting the currently tradable set, otherwise odds_latest can
+          // keep an unexecutable old line alive until its local TTL expires.
+          clearLatest.run(id);
           this.persistPrices(id, "hkjc", ev.prices, now);
         }
       });

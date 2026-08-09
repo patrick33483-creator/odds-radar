@@ -110,6 +110,56 @@ describe("HKJC official historic result parser", () => {
 });
 
 describe("HKJC CHL and official corner settlement", () => {
+  it("excludes suspended historical lines even when HKJC still returns numeric odds", () => {
+    const event = mapHkjcMatch({
+      id: "50072073",
+      status: "PREEVENT",
+      kickOffTime: "2026-08-09T14:30:00Z",
+      matchDate: "2026-08-09",
+      updateAt: null,
+      homeTeam: { name_ch: "巴素利", name_en: "Basel" },
+      awayTeam: { name_ch: "杜安", name_en: "Thun" },
+      tournament: { name_ch: "瑞士超級聯賽", name_en: "Swiss Super League" },
+      foPools: [
+        {
+          oddsType: "HDC",
+          updateAt: "2026-08-07T19:42:00.896+08:00",
+          id: "hdc",
+          status: "SELLINGSTARTED",
+          inplay: false,
+          lines: [
+            {
+              lineId: "current",
+              status: "AVAILABLE",
+              condition: "0.0/-0.5",
+              main: true,
+              combinations: [
+                { combId: "h-current", str: "H", status: "AVAILABLE", currentOdds: "1.77" },
+                { combId: "a-current", str: "A", status: "AVAILABLE", currentOdds: "2.00" },
+              ],
+            },
+            {
+              lineId: "withdrawn",
+              status: "SUSPENDED",
+              condition: "-0.5/-1.0",
+              main: false,
+              combinations: [
+                { combId: "h-old", str: "H", status: "AVAILABLE", currentOdds: "2.09" },
+                { combId: "a-old", str: "A", status: "AVAILABLE", currentOdds: "1.70" },
+              ],
+            },
+          ],
+        },
+      ],
+    } as Parameters<typeof mapHkjcMatch>[0])!;
+
+    expect(event.prices).toEqual([
+      expect.objectContaining({ market: "AH", lineValue: -0.25, selection: "H", decimalOdds: 1.77 }),
+      expect.objectContaining({ market: "AH", lineValue: -0.25, selection: "A", decimalOdds: 2.0 }),
+    ]);
+    expect(event.prices.some((price) => price.lineValue === -0.75)).toBe(false);
+  });
+
   it("maps CHL H/L to the distinct COU O/U market without changing goal totals", () => {
     const event = mapHkjcMatch({
       id: "corner-1",

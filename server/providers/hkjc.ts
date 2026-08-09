@@ -87,6 +87,11 @@ export interface HkjcOfficialResult {
 
 const SELECTION_MAP: Record<string, Selection> = { H: "H", D: "D", A: "A", L: "U" };
 
+function isTradableStatus(status: string): boolean {
+  const normalized = status.trim().toUpperCase();
+  return normalized === "AVAILABLE" || normalized === "OPEN" || normalized === "SELLINGSTARTED";
+}
+
 function toEpoch(iso: string | null): number | null {
   if (!iso) return null;
   const t = Date.parse(iso);
@@ -207,6 +212,11 @@ export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
   const inplay = m.status !== "PREEVENT";
   const prices: ProviderPrice[] = [];
   for (const pool of m.foPools ?? []) {
+    // HKJC retains withdrawn historical lines in the same pre-event payload.
+    // Their old prices remain populated even after the line becomes SUSPENDED,
+    // so status must be authoritative; a numeric currentOdds is not evidence
+    // that the quote can still be executed.
+    if (!isTradableStatus(pool.status)) continue;
     // NOTE: `pool.inplay` means "this pool is ALSO offered in-play", not that the
     // quoted price is an in-play price. Pre-match/in-play separation is enforced
     // by the match-level `status === 'PREEVENT'` gate below.
@@ -223,6 +233,7 @@ export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
     if (!market) continue;
     const sourceUpdatedAt = toEpoch(pool.updateAt);
     for (const line of pool.lines) {
+      if (!isTradableStatus(line.status)) continue;
       let lineValue: number | null = null;
       if (market === "AH") {
         lineValue = parseHkjcHandicap(line.condition);
@@ -232,6 +243,7 @@ export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
         if (lineValue === null) continue;
       }
       for (const comb of line.combinations) {
+        if (!isTradableStatus(comb.status)) continue;
         if ((market === "OU" || market === "COU") && comb.str !== "H" && comb.str !== "L") continue;
         const sel = SELECTION_MAP[comb.str];
         if (!sel) continue;
