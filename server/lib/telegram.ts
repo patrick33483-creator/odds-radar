@@ -48,6 +48,7 @@ const MARKET_LABEL: Record<string, string> = {
   "1X2": "主客和",
   AH: "讓球",
   OU: "入球大細",
+  COU: "角球大細",
 };
 
 function money(value: number): string {
@@ -83,7 +84,7 @@ function buildMessage(bet: BetRow, legs: LegRow[]): string {
   };
   const legLines = legs.map(
     (leg) => {
-      const market = leg.market as "1X2" | "AH" | "OU";
+      const market = leg.market as import("@shared/types").Market;
       const value = leg.line_key ? Number(leg.line_key) : null;
       const display = formatSelectionLine(market, value, leg.selection);
       return `- ${PROVIDER_LABEL[leg.provider] ?? leg.provider}｜${MARKET_LABEL[leg.market] ?? leg.market}｜${selectionLabel(leg, display)}｜賠率 ${leg.decimal_odds.toFixed(3)}｜注碼 ${money(leg.stake)}${leg.synthetic ? "（合成盤）" : ""}`;

@@ -33,7 +33,7 @@ import {
 } from "@/components/radar-ui";
 import { MARKET_LABEL, SELECTION_LABEL, type DashboardResponse, type LineRow, type Market, type MatchRefreshResponse, type MatchRow, type Selection } from "@shared/types";
 
-const MARKETS: Market[] = ["AH", "OU", "1X2"];
+const MARKETS: Market[] = ["AH", "OU", "COU", "1X2"];
 const WINDOWS = [
   { value: "all", label: "所有時間" },
   { value: "60", label: "1 小時內" },

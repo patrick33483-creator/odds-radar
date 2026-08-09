@@ -40,6 +40,13 @@ export interface PinnapiLines {
   prices: ProviderPrice[];
 }
 
+export interface PinnapiCornerLines extends PinnapiLines {
+  /** The only accepted special-event child. Null when unavailable/ambiguous. */
+  cornerEventId: string | null;
+  /** Auditable count of eligible full-match corner children. */
+  candidateCount: number;
+}
+
 /**
  * A score observed in PinnAPI's bounded all-live-markets response. It is
  * explicitly a live observation, never a final result by itself.
@@ -362,6 +369,108 @@ function values(value: unknown): JsonRecord[] {
   return record ? Object.values(record).map(asRecord).filter((v): v is JsonRecord => !!v) : [];
 }
 
+function cornerEvent(row: JsonRecord): boolean {
+  // PinnAPI returns corners as child fixtures. Never infer corners from an
+  // ordinary parent price tree or from a period/market name alone.
+  const identity = [
+    row.league_name,
+    row.league,
+    row.home,
+    row.away,
+    row.special_category,
+    row.special_units,
+  ]
+    .map(str)
+    .join(" ");
+  return /(^|[^a-z])corners?([^a-z]|$)/i.test(identity.replace(/[_-]+/g, " "));
+}
+
+/** Supports PinnAPI's arrays and its line-keyed special-market maps. */
+function specialLineRows(value: unknown): JsonRecord[] {
+  if (Array.isArray(value)) return value.map(asRecord).filter((row): row is JsonRecord => !!row);
+  const record = asRecord(value);
+  if (!record) return [];
+  return Object.entries(record).flatMap(([line, quote]) => {
+    const row = asRecord(quote);
+    return row ? [{ ...row, line: row.line ?? line }] : [];
+  });
+}
+
+/**
+ * Strict full-match total-corners parser for
+ * `/kit/v1/prematch/markets?event_id=…&include_specials=1`.
+ *
+ * Corners are separate PinnAPI child events. This intentionally fails closed:
+ * exactly one corner child must expose `periods.num_0`, and each emitted total
+ * must be an exact quarter line with both O/U prices on that same line.
+ * First-half/derivative periods and ambiguous children are never merged into
+ * the standard match prices.
+ */
+export function parsePinnapiCornerLines(payload: unknown, requestedEventId = ""): PinnapiCornerLines {
+  const root = asRecord(payload) ?? {};
+  const events = Array.isArray(root.events) ? root.events.map(asRecord).filter((row): row is JsonRecord => !!row) : [];
+  const candidates = events.filter((event) => cornerEvent(event) && asRecord(asRecord(event.periods)?.num_0) !== null);
+  if (candidates.length !== 1) {
+    return {
+      eventId: requestedEventId,
+      cornerEventId: null,
+      candidateCount: candidates.length,
+      marketStatus: candidates.length > 1 ? "ambiguous" : "unavailable",
+      prices: [],
+    };
+  }
+
+  const child = candidates[0];
+  const period = asRecord(asRecord(child.periods)?.num_0);
+  if (!period) {
+    return { eventId: requestedEventId, cornerEventId: null, candidateCount: 0, marketStatus: "unavailable", prices: [] };
+  }
+  const sourceAt = sourceUpdatedAt(child, period);
+  const complete: Array<{ lineValue: number; over: number; under: number; isMain: boolean }> = [];
+  for (const total of specialLineRows(period.totals ?? period.total)) {
+    const lineValue = num(total.points ?? total.total ?? total.line);
+    const over = validDecimal(total.over ?? total.over_odds);
+    const under = validDecimal(total.under ?? total.under_odds);
+    if (lineValue === null || lineValue < 0 || !isQuarterStep(lineValue) || over === null || under === null) continue;
+    complete.push({
+      lineValue,
+      over,
+      under,
+      isMain: total.is_main === true || total.main === true,
+    });
+  }
+  // With no explicit provider main flag, retain all valid lines but identify
+  // the balanced price as main. This never manufactures a line.
+  const balanced = complete.length
+    ? complete.reduce((best, row) => (Math.abs(row.over - row.under) < Math.abs(best.over - best.under) ? row : best))
+    : null;
+  const prices = complete.flatMap((row): ProviderPrice[] => [
+    {
+      market: "COU",
+      lineValue: row.lineValue,
+      isMain: row.isMain || balanced?.lineValue === row.lineValue,
+      selection: "O",
+      decimalOdds: row.over,
+      sourceUpdatedAt: sourceAt,
+    },
+    {
+      market: "COU",
+      lineValue: row.lineValue,
+      isMain: row.isMain || balanced?.lineValue === row.lineValue,
+      selection: "U",
+      decimalOdds: row.under,
+      sourceUpdatedAt: sourceAt,
+    },
+  ]);
+  return {
+    eventId: str(root.event_id ?? root.eventId) || requestedEventId,
+    cornerEventId: str(child.event_id ?? child.eventId ?? child.id) || null,
+    candidateCount: 1,
+    marketStatus: str(period.status ?? child.status ?? root.status) || null,
+    prices,
+  };
+}
+
 function sourceUpdatedAt(payload: JsonRecord, period: JsonRecord): number {
   const raw = period.updated_at ?? period.updatedAt ?? payload.source_timestamp ?? payload.last ?? payload.updated_at;
   if (raw === undefined || raw === null || str(raw) === "") return Date.now();
@@ -488,6 +597,17 @@ export class PinnapiProvider {
     });
   }
 
+  /** Raw special-markets payload. Kept separate from normal match prices. */
+  async fetchEventCornerLinePayload(eventId: string): Promise<unknown> {
+    this.requireConfigured();
+    const safeId = encodeURIComponent(eventId);
+    return fetchJson<unknown>(this.endpoint(`/kit/v1/prematch/markets?event_id=${safeId}&include_specials=1`), {
+      headers: pinnapiHeaders(),
+      timeoutMs: 25_000,
+      retries: 1,
+    });
+  }
+
   async fetchEventLines(eventId: string): Promise<PinnapiLines> {
     this.requireConfigured();
     try {
@@ -497,6 +617,19 @@ export class PinnapiProvider {
       return result;
     } catch (err) {
       this.warn(`PinnAPI lines unavailable: ${(err as Error).message}`);
+      throw err;
+    }
+  }
+
+  async fetchEventCornerLines(eventId: string): Promise<PinnapiCornerLines> {
+    this.requireConfigured();
+    try {
+      const payload = await this.fetchEventCornerLinePayload(eventId);
+      const result = parsePinnapiCornerLines(payload, eventId);
+      this.lastSuccessAt = Date.now();
+      return result;
+    } catch (err) {
+      this.warn(`PinnAPI corner lines unavailable: ${(err as Error).message}`);
       throw err;
     }
   }

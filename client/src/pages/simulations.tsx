@@ -29,7 +29,7 @@ import {
   fmtPct,
   fmtTime,
 } from "@/components/radar-ui";
-import { CATEGORY_LABEL, SELECTION_LABEL, type SimulationsResponse } from "@shared/types";
+import { CATEGORY_LABEL, MARKET_LABEL, SELECTION_LABEL, type SimulationsResponse } from "@shared/types";
 
 const CATS = ["all", "case1_arb", "case2_ev", "synth_arb"] as const;
 type Cat = (typeof CATS)[number];
@@ -255,7 +255,7 @@ export default function Simulations() {
                           <span className={l.provider === "crown" ? "text-positive" : l.provider === "pinnacle" ? "text-pinnacle" : l.synthetic ? "text-synthetic" : "text-hkjc"}>
                             {l.provider === "crown" ? "皇冠" : l.provider === "pinnacle" ? "平博" : l.synthetic ? "馬會合成" : "馬會"}
                           </span>{" "}
-                          {SELECTION_LABEL[l.selection]} {l.lineDisplay} @ {fmtOdds(l.decimalOdds)} · HK${fmtMoney(l.stake)}
+                          {MARKET_LABEL[l.market]} · {SELECTION_LABEL[l.selection]} {l.lineDisplay} @ {fmtOdds(l.decimalOdds)} · HK${fmtMoney(l.stake)}
                           {l.legStatus ? (
                             <span
                               className={cn(
@@ -292,7 +292,9 @@ export default function Simulations() {
                         </span>
                       </>
                     ) : (
-                      <span className="text-[10px] text-muted-foreground">待開賽</span>
+                      <span className="text-[10px] text-muted-foreground">
+                        {b.market === "COU" ? "待官方角球賽果" : "待開賽"}
+                      </span>
                     )}
                   </td>
                 </tr>

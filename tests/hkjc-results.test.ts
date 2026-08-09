@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   hkjcHktDate,
   historicPageRanges,
+  mapHkjcMatch,
   parseHkjcHistoricResults,
 } from "../server/providers/hkjc";
-import { legReturn, settle1X2, settleHandicap } from "../server/lib/settlement";
+import { canSettleCornerMarket, legReturn, settle1X2, settleCornerTotal, settleHandicap, settleLeg } from "../server/lib/settlement";
 
-function officialRow(sequence: number, homeResult: unknown, awayResult: unknown) {
+function officialRow(sequence: number, homeResult: unknown, awayResult: unknown, ttlCornerResult?: unknown) {
   return {
     resultType: 1,
     stageId: 5,
@@ -14,6 +15,7 @@ function officialRow(sequence: number, homeResult: unknown, awayResult: unknown)
     sequence,
     homeResult,
     awayResult,
+    ttlCornerResult,
   };
 }
 
@@ -44,8 +46,8 @@ describe("HKJC official historic result parser", () => {
     );
 
     expect(results).toEqual([
-      { matchId: "50072522", homeScore: 1, awayScore: 3, sequence: 3, source: "hkjc_official" },
-      { matchId: "50072902", homeScore: 2, awayScore: 1, sequence: 4, source: "hkjc_official" },
+      { matchId: "50072522", homeScore: 1, awayScore: 3, cornersTotal: null, sequence: 3, source: "hkjc_official" },
+      { matchId: "50072902", homeScore: 2, awayScore: 1, cornersTotal: null, sequence: 4, source: "hkjc_official" },
     ]);
   });
 
@@ -97,13 +99,105 @@ describe("HKJC official historic result parser", () => {
       ["wanted"],
     );
     expect(results).toEqual([
-      { matchId: "wanted", homeScore: 0, awayScore: 0, sequence: 1, source: "hkjc_official" },
+      { matchId: "wanted", homeScore: 0, awayScore: 0, cornersTotal: null, sequence: 1, source: "hkjc_official" },
     ]);
   });
 
   it("derives HKJC historic date ranges in HKT", () => {
     expect(hkjcHktDate(Date.UTC(2026, 7, 8, 15, 59))).toBe("2026-08-08");
     expect(hkjcHktDate(Date.UTC(2026, 7, 8, 16, 0))).toBe("2026-08-09");
+  });
+});
+
+describe("HKJC CHL and official corner settlement", () => {
+  it("maps CHL H/L to the distinct COU O/U market without changing goal totals", () => {
+    const event = mapHkjcMatch({
+      id: "corner-1",
+      status: "PREEVENT",
+      kickOffTime: "2026-08-09T12:00:00Z",
+      matchDate: "2026-08-09",
+      updateAt: null,
+      homeTeam: { name_ch: "主隊", name_en: "Home" },
+      awayTeam: { name_ch: "客隊", name_en: "Away" },
+      tournament: { name_ch: "測試聯賽", name_en: "Test League" },
+      foPools: [
+        {
+          oddsType: "CHL",
+          updateAt: "2026-08-09T11:00:00Z",
+          id: "chl",
+          status: "OPEN",
+          inplay: false,
+          lines: [
+            {
+              lineId: "line",
+              status: "OPEN",
+              condition: "9.5/10.0",
+              main: true,
+              combinations: [
+                { combId: "h", str: "H", status: "OPEN", currentOdds: "1.91" },
+                { combId: "l", str: "L", status: "OPEN", currentOdds: "1.99" },
+              ],
+            },
+          ],
+        },
+      ],
+    } as Parameters<typeof mapHkjcMatch>[0])!;
+    expect(event.prices).toEqual([
+      expect.objectContaining({ market: "COU", lineValue: 9.75, selection: "O", decimalOdds: 1.91 }),
+      expect.objectContaining({ market: "COU", lineValue: 9.75, selection: "U", decimalOdds: 1.99 }),
+    ]);
+  });
+
+  it("uses only confirmed HKJC ttlCornerResult and leaves its absence ineligible", () => {
+    const withCorners = parseHkjcHistoricResults(
+      {
+        data: {
+          matches: [
+            {
+              id: "corner-result",
+              status: "MATCHENDED",
+              results: [
+                officialRow(1, 2, 1, -1),
+                officialRow(2, 2, 1, 10),
+                { ...officialRow(3, 2, 1, 99), payoutConfirmed: false },
+              ],
+            },
+            { id: "corner-missing", status: "MATCHENDED", results: [officialRow(1, 0, 0)] },
+          ],
+        },
+      },
+      ["corner-result", "corner-missing"],
+    );
+    expect(withCorners).toEqual([
+      expect.objectContaining({ matchId: "corner-result", cornersTotal: 10, source: "hkjc_official" }),
+      expect.objectContaining({ matchId: "corner-missing", cornersTotal: null, source: "hkjc_official" }),
+    ]);
+    expect(canSettleCornerMarket(withCorners[0].source, withCorners[0].cornersTotal)).toBe(true);
+    expect(canSettleCornerMarket(withCorners[1].source, withCorners[1].cornersTotal)).toBe(false);
+    expect(canSettleCornerMarket("titan_over", 10)).toBe(false);
+    expect(settleCornerTotal(10, 9.75, "O")).toBe("half_win");
+    expect(() => settleLeg("COU", 9.75, "O", { homeScore: 0, awayScore: 0 })).toThrow(/official HKJC/i);
+  });
+
+  it("does not fall back to an earlier corner result when the latest official row omits it", () => {
+    const result = parseHkjcHistoricResults(
+      {
+        data: {
+          matches: [{
+            id: "corner-latest-missing",
+            status: "MATCHENDED",
+            results: [
+              officialRow(1, 1, 0, 11),
+              officialRow(2, 2, 0),
+            ],
+          }],
+        },
+      },
+      ["corner-latest-missing"],
+    )[0];
+
+    expect(result.cornersTotal).toBeNull();
+    expect(canSettleCornerMarket(result.source, result.cornersTotal)).toBe(false);
   });
 });
 

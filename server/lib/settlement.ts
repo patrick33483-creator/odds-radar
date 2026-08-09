@@ -84,6 +84,26 @@ export function settleTotal(total: number, selection: "O" | "U", score: Score): 
   return aggregate(outcomes[0], outcomes[1]);
 }
 
+/** Settle a total-corners leg on HKJC's confirmed full-match corner total. */
+export function settleCornerTotal(cornersTotal: number, total: number, selection: "O" | "U"): LegStatus {
+  const halves = splitLine(total);
+  const outcomes = halves.map((line) => halfOutcome(selection === "O" ? cornersTotal - line : line - cornersTotal));
+  if (outcomes.length === 1) {
+    const outcome = outcomes[0];
+    return outcome === 1 ? "win" : outcome === 0 ? "push" : "loss";
+  }
+  return aggregate(outcomes[0], outcomes[1]);
+}
+
+/** COU may settle only from HKJC's exact, confirmed ttlCornerResult. */
+export function canSettleCornerMarket(source: string, cornersTotal: number | null | undefined): cornersTotal is number {
+  return source === "hkjc_official"
+    && cornersTotal !== null
+    && cornersTotal !== undefined
+    && Number.isInteger(cornersTotal)
+    && cornersTotal >= 0;
+}
+
 /** Settle a 1X2 leg on the final result. */
 export function settle1X2(selection: "H" | "D" | "A", score: Score): LegStatus {
   const d = score.homeScore - score.awayScore;
@@ -100,6 +120,9 @@ export function settleLeg(
   if (market === "1X2") return settle1X2(selection as "H" | "D" | "A", score);
   if (lineValue === null || !Number.isFinite(lineValue)) return "push";
   if (market === "AH") return settleHandicap(lineValue, selection as "H" | "A", score);
+  // COU is deliberately not settled from a goals score. The engine calls
+  // settleCornerTotal only after HKJC supplies ttlCornerResult.
+  if (market === "COU") throw new Error("COU requires an official HKJC corner total");
   return settleTotal(lineValue, selection as "O" | "U", score);
 }
 

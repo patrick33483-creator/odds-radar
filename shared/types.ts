@@ -1,6 +1,7 @@
 /* Shared DTO / domain types used by both server and client. */
 
-export type Market = "1X2" | "AH" | "OU";
+/** COU is full-match total corners (角球大細), never a goals-total alias. */
+export type Market = "1X2" | "AH" | "OU" | "COU";
 export type Provider = "hkjc" | "pinnacle" | "crown";
 export type Selection = "H" | "D" | "A" | "O" | "U";
 export type AppMode = "live" | "degraded" | "demo";
@@ -9,6 +10,7 @@ export const MARKET_LABEL: Record<Market, string> = {
   "1X2": "主客和",
   AH: "亞洲讓球",
   OU: "入球大細",
+  COU: "角球大細",
 };
 
 export const SELECTION_LABEL: Record<Selection, string> = {

@@ -3,6 +3,7 @@ import {
   parsePinnapiFixtures,
   parsePinnapiLiveEventIds,
   parsePinnapiLiveScores,
+  parsePinnapiCornerLines,
   parsePinnapiLines,
   pinnapiConfig,
   pinnapiHeaders,
@@ -163,6 +164,68 @@ describe("PinnAPI Edge full-match prices", () => {
         expect.objectContaining({ market: "OU", lineValue: 2.75, selection: "U", decimalOdds: 2.17 }),
       ]),
     );
+  });
+});
+
+describe("PinnAPI Edge full-match corner child prices", () => {
+  it("accepts exactly one num_0 corner child with complete two-sided quarter totals", () => {
+    const parsed = parsePinnapiCornerLines(
+      {
+        event_id: "parent-1",
+        events: [
+          {
+            event_id: "corner-child",
+            league_name: "Premier Test Corners",
+            home: "Alpha Corners",
+            away: "Beta Corners",
+            periods: {
+              num_0: {
+                updated_at: 1_786_190_400,
+                totals: {
+                  "9.75": { points: 9.75, over: 1.91, under: 1.99 },
+                  "10.1": { points: 10.1, over: 1.9, under: 1.9 },
+                  "10.5": { points: 10.5, over: 1.95 },
+                },
+              },
+              num_1: { totals: { "4.5": { points: 4.5, over: 9, under: 9 } } },
+            },
+          },
+        ],
+      },
+      "parent-1",
+    );
+
+    expect(parsed).toMatchObject({ eventId: "parent-1", cornerEventId: "corner-child", candidateCount: 1 });
+    expect(parsed.prices).toEqual([
+      expect.objectContaining({ market: "COU", lineValue: 9.75, selection: "O", decimalOdds: 1.91 }),
+      expect.objectContaining({ market: "COU", lineValue: 9.75, selection: "U", decimalOdds: 1.99 }),
+    ]);
+  });
+
+  it("fails closed for absent num_0, ambiguous corner children, partial sides, and ordinary totals", () => {
+    expect(
+      parsePinnapiCornerLines({
+        events: [{ event_id: "half", league: "Corners", periods: { num_1: { totals: [{ points: 4.5, over: 1.9, under: 1.9 }] } } }],
+      }),
+    ).toMatchObject({ candidateCount: 0, prices: [] });
+    expect(
+      parsePinnapiCornerLines({
+        events: [
+          { event_id: "c1", league: "Corners", periods: { num_0: { totals: [{ points: 9.5, over: 1.9, under: 1.9 }] } } },
+          { event_id: "c2", league: "Corners", periods: { num_0: { totals: [{ points: 9.5, over: 1.9, under: 1.9 }] } } },
+        ],
+      }),
+    ).toMatchObject({ candidateCount: 2, marketStatus: "ambiguous", prices: [] });
+    expect(
+      parsePinnapiCornerLines({
+        events: [{ event_id: "c1", league: "Corners", periods: { num_0: { totals: [{ points: 9.5, over: 1.9 }] } } }],
+      }),
+    ).toMatchObject({ candidateCount: 1, prices: [] });
+    expect(
+      parsePinnapiCornerLines({
+        events: [{ event_id: "ordinary", league: "Premier Test", periods: { num_0: { totals: [{ points: 2.5, over: 1.9, under: 1.9 }] } } }],
+      }),
+    ).toMatchObject({ candidateCount: 0, prices: [] });
   });
 });
 

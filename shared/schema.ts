@@ -39,8 +39,8 @@ export const marketLines = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     matchId: text("match_id").notNull(),
-    market: text("market").notNull(), // '1X2' | 'AH' | 'OU'
-    lineKey: text("line_key").notNull(), // '' for 1X2, '-0.25', '2.75' ...
+    market: text("market").notNull(), // '1X2' | 'AH' | 'OU' | 'COU'
+    lineKey: text("line_key").notNull(), // '' for 1X2, '-0.25', '2.75', '9.75' ...
     lineValue: real("line_value"), // numeric normalized line (quarter steps)
     isMain: integer("is_main").notNull().default(0),
     updatedAt: integer("updated_at").notNull(),
@@ -210,7 +210,7 @@ export const simulationLegs = sqliteTable(
   }),
 );
 
-/** Final results pulled from PinnAPI live cache or titan007 fallback. */
+/** Final results, including HKJC's confirmed total-corners result when present. */
 export const results = sqliteTable(
   "results",
   {
@@ -218,6 +218,7 @@ export const results = sqliteTable(
     pinnacleMatchId: text("pinnacle_match_id"),
     homeScore: integer("home_score").notNull(),
     awayScore: integer("away_score").notNull(),
+    cornersTotal: integer("corners_total"),
     halfHome: integer("half_home"),
     halfAway: integer("half_away"),
     source: text("source").notNull(), // 'titan_today' | 'titan_over'

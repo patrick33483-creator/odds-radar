@@ -4,7 +4,7 @@
  * Endpoint : POST https://info.cld.hkjc.com/graphql/base/
  * Auth     : none, but the query must be one of the gateway's WHITELISTED
  *            queries (see hkjc-query.ts) or it answers WHITELIST_ERROR.
- * Markets  : HAD (主客和 / 1X2), HDC (亞洲讓球), HIL (入球大細)
+ * Markets  : HAD (主客和 / 1X2), HDC (亞洲讓球), HIL (入球大細), CHL (角球大細)
  * Prices   : `currentOdds` are already decimal.
  * Scope    : only `status === 'PREEVENT'` matches are emitted — pre-match only.
  */
@@ -56,6 +56,7 @@ interface GqlMatch {
 interface HistoricResultRow {
   homeResult?: unknown;
   awayResult?: unknown;
+  ttlCornerResult?: unknown;
   payoutConfirmed?: unknown;
   stageId?: unknown;
   resultType?: unknown;
@@ -78,6 +79,8 @@ export interface HkjcOfficialResult {
   matchId: string;
   homeScore: number;
   awayScore: number;
+  /** Confirmed full-match total corners; null means HKJC did not publish it. */
+  cornersTotal: number | null;
   sequence: number;
   source: "hkjc_official";
 }
@@ -180,7 +183,18 @@ export function parseHkjcHistoricResults(
       if (homeScore === null || awayScore === null || sequence === null) continue;
       const existing = best.get(matchId);
       if (!existing || sequence > existing.sequence) {
-        best.set(matchId, { matchId, homeScore, awayScore, sequence, source: "hkjc_official" });
+        // `ttlCornerResult` may be omitted or use -1 as a missing-data
+        // sentinel. Keep that absence explicit: corner simulations must remain
+        // pending instead of using goals or any non-HKJC fallback.
+        const corners = asInt(row.ttlCornerResult);
+        best.set(matchId, {
+          matchId,
+          homeScore,
+          awayScore,
+          cornersTotal: corners !== null && corners >= 0 ? corners : null,
+          sequence,
+          source: "hkjc_official",
+        });
       }
     }
   }
@@ -196,7 +210,16 @@ export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
     // NOTE: `pool.inplay` means "this pool is ALSO offered in-play", not that the
     // quoted price is an in-play price. Pre-match/in-play separation is enforced
     // by the match-level `status === 'PREEVENT'` gate below.
-    const market = pool.oddsType === "HAD" ? "1X2" : pool.oddsType === "HDC" ? "AH" : pool.oddsType === "HIL" ? "OU" : null;
+    const market =
+      pool.oddsType === "HAD"
+        ? "1X2"
+        : pool.oddsType === "HDC"
+          ? "AH"
+          : pool.oddsType === "HIL"
+            ? "OU"
+            : pool.oddsType === "CHL"
+              ? "COU"
+              : null;
     if (!market) continue;
     const sourceUpdatedAt = toEpoch(pool.updateAt);
     for (const line of pool.lines) {
@@ -204,15 +227,16 @@ export function mapHkjcMatch(m: GqlMatch): ProviderEvent | null {
       if (market === "AH") {
         lineValue = parseHkjcHandicap(line.condition);
         if (lineValue === null) continue;
-      } else if (market === "OU") {
+      } else if (market === "OU" || market === "COU") {
         lineValue = parseHkjcTotal(line.condition);
         if (lineValue === null) continue;
       }
       for (const comb of line.combinations) {
+        if ((market === "OU" || market === "COU") && comb.str !== "H" && comb.str !== "L") continue;
         const sel = SELECTION_MAP[comb.str];
         if (!sel) continue;
-        // HIL uses H for 大 and L for 細
-        const selection: Selection = market === "OU" ? (comb.str === "H" ? "O" : "U") : sel;
+        // HIL/CHL use H for 大 and L for 細.
+        const selection: Selection = market === "OU" || market === "COU" ? (comb.str === "H" ? "O" : "U") : sel;
         const odds = Number(comb.currentOdds);
         if (!Number.isFinite(odds) || odds <= 1) continue;
         prices.push({
@@ -249,8 +273,8 @@ export class HkjcProvider implements OddsProvider {
     const body = JSON.stringify({
       query: HKJC_MATCH_LIST_QUERY,
       variables: {
-        fbOddsTypes: ["HAD", "HDC", "HIL"],
-        fbOddsTypesM: ["HAD", "HDC", "HIL"],
+        fbOddsTypes: ["HAD", "HDC", "HIL", "CHL"],
+        fbOddsTypesM: ["HAD", "HDC", "HIL", "CHL"],
         inplayOnly: false,
         featuredMatchesOnly: false,
         startDate: null,

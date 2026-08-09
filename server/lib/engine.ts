@@ -53,11 +53,13 @@ import {
 } from "./scan";
 import {
   aggregateBetStatus,
+  canSettleCornerMarket,
   chooseSettlementSource,
   isSettleEligible,
   legReturn,
   matchFinalResult,
   round2,
+  settleCornerTotal,
   settleLeg,
   type LegStatus,
 } from "./settlement";
@@ -608,7 +610,9 @@ export class RadarEngine {
     const matchesById = new Map(db.select().from(matches).all().map((match) => [match.id, match]));
     const tracked = new Map<string, { eventId: string; matchId: string; reversed: boolean }>();
     for (const bet of db.select().from(simulationBets).where(eq(simulationBets.excludedFromStats, 0)).all()) {
-      if (bet.settledAt || bet.kickoffUtc > now) continue;
+      // COU never uses a live score as a settlement source, including as a
+      // liveness/end signal. Only HKJC's official ttlCornerResult may settle.
+      if (bet.market === "COU" || bet.settledAt || bet.kickoffUtc > now) continue;
       const match = matchesById.get(bet.matchId);
       if (!match) continue;
       const source = this.sourceMap(match.id);
@@ -718,7 +722,20 @@ export class RadarEngine {
               // has a PinnAPI event_id. Price failures deliberately do not
               // substitute another bookmaker/source for that mapped event.
               if (m.pinnacleMatchId.startsWith("pinnapi:") && source?.pinnapi_id) {
-                prices = await this.pinnapi.fetchMatchPrices(source.pinnapi_id);
+                const normalPrices = await this.pinnapi.fetchMatchPrices(source.pinnapi_id);
+                // Corner specials are an independent child-event response.
+                // A missing/ambiguous child is fail-closed for COU only and
+                // must never suppress valid 1X2/AH/OU snapshots.
+                let cornerPrices: ProviderPrice[] = [];
+                try {
+                  cornerPrices = (await this.pinnapi.fetchEventCornerLines(source.pinnapi_id)).prices;
+                } catch (cornerError) {
+                  log("pinnapi_corner_detail_unavailable", {
+                    pinnacleMatchId: m.pinnacleMatchId,
+                    error: (cornerError as Error).message,
+                  });
+                }
+                prices = [...normalPrices, ...cornerPrices];
                 if (source.pinnapi_reversed) prices = this.reversePinnaclePrices(prices);
               } else if (m.pinnacleMatchId.startsWith("optic:") && source?.optic_id) {
                 // Only a PinnAPI-unmapped event may use the OpticOdds fallback.
@@ -1168,7 +1185,9 @@ export class RadarEngine {
         } else {
           const [s1, s2] = sels;
           if (hasFreshPin) totalProbability = 1 / pin[s1]!.decimalOdds + 1 / pin[s2]!.decimalOdds;
-          if (hasFreshHk && hasFreshCrown) {
+          // COU is PinnAPI × HKJC EV only. Crown has neither a valid corner
+          // source nor a permitted arb/synthetic route.
+          if (market !== "COU" && hasFreshHk && hasFreshCrown) {
             const q1 = 1 / hk[s1]!.decimalOdds + 1 / crown[s2]!.decimalOdds;
             const q2 = 1 / hk[s2]!.decimalOdds + 1 / crown[s1]!.decimalOdds;
             bestQ = Math.min(q1, q2);
@@ -1188,7 +1207,13 @@ export class RadarEngine {
         }
 
         let lineEv: EvOpportunity[] = [];
-        if (hasFreshPin && Object.keys(hk).length > 0) {
+        // COU is accepted only where both books quote the complete, fresh
+        // two-sided exact line. Other markets retain their existing behavior.
+        const evComparable =
+          hasFreshPin
+          && Object.keys(hk).length > 0
+          && (market !== "COU" || (exactLine && hasFreshHk));
+        if (evComparable) {
           lineEv = evaluateEv({
             matchId: m.id,
             matchLabel,
@@ -1649,6 +1674,7 @@ export class RadarEngine {
       /* 情況一 — arb, Crown fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
         if (remaining <= 0) break;
+        if (a.market === "COU") continue;
         if (!eligible(a.matchId, a.kickoffUtc, "case1_arb")) continue;
         const proposedCrown = a.legs
           .filter((leg) => leg.provider === "crown")
@@ -1677,9 +1703,9 @@ export class RadarEngine {
       for (const e of dash.ev) {
         if (remaining <= 0) break;
         if (!eligible(e.matchId, e.kickoffUtc, "case2_ev")) continue;
-        // Only the target market decides eligibility. A synthetic AH/OU route
-        // is valid; a standalone 1X2 target is observation-only.
-        if (e.market !== "AH" && e.market !== "OU") continue;
+        // Only the target market decides eligibility. Synthetic AH/OU routes
+        // and direct exact-line COU EV are valid; 1X2 is observation-only.
+        if (e.market !== "AH" && e.market !== "OU" && e.market !== "COU") continue;
         if (!isSafe(e) || e.edge < EV_THRESHOLD) continue;
         const key = `case2_ev|${e.matchId}|${e.lineKey}|${e.market}:${e.selection}`;
         const payout = round2(HKJC_FIXED_STAKE * e.hkjcOdds);
@@ -1770,12 +1796,16 @@ export class RadarEngine {
     if (!due.length) return { settled: 0, pending: open.length, resultsFetched: 0 };
 
     const matchesById = new Map(db.select().from(matches).all().map((match) => [match.id, match]));
-    const cachedLive = rawDb
-      .prepare(
-        `SELECT event_id,match_id,home_score,away_score,seen_live,no_longer_live
-         FROM pinnapi_live_scores WHERE match_id IN (${due.map(() => "?").join(",")})`,
-      )
-      .all(...due.map((bet) => bet.matchId)) as Array<{
+    const cornerDue = due.filter((bet) => bet.market === "COU");
+    const standardDue = due.filter((bet) => bet.market !== "COU");
+    const cachedLive = (standardDue.length
+      ? rawDb
+          .prepare(
+            `SELECT event_id,match_id,home_score,away_score,seen_live,no_longer_live
+             FROM pinnapi_live_scores WHERE match_id IN (${standardDue.map(() => "?").join(",")})`,
+          )
+          .all(...standardDue.map((bet) => bet.matchId))
+      : []) as Array<{
       event_id: string;
       match_id: string;
       home_score: number;
@@ -1784,8 +1814,14 @@ export class RadarEngine {
       no_longer_live: number;
     }>;
     const cacheByEvent = new Map(cachedLive.map((row) => [row.event_id, row]));
-    const chosen = new Map<string, { homeScore: number; awayScore: number; pinnacleId: string; source: string }>();
-    const titanFallback = due.filter((bet) => {
+    const chosen = new Map<string, {
+      homeScore: number;
+      awayScore: number;
+      cornersTotal: number | null;
+      pinnacleId: string;
+      source: string;
+    }>();
+    const titanFallback = standardDue.filter((bet) => {
       const match = matchesById.get(bet.matchId);
       const source = match ? this.sourceMap(match.id) : null;
       const activePinnacleId = match?.pinnacleMatchId ?? null;
@@ -1809,6 +1845,7 @@ export class RadarEngine {
         chosen.set(bet.matchId, {
           homeScore: cache.home_score,
           awayScore: cache.away_score,
+          cornersTotal: null,
           pinnacleId: `pinnapi:${cache.event_id}`,
           source: "pinnapi_live",
         });
@@ -1851,6 +1888,7 @@ export class RadarEngine {
           chosen.set(bet.matchId, {
             homeScore: reversed ? result.awayScore : result.homeScore,
             awayScore: reversed ? result.homeScore : result.awayScore,
+            cornersTotal: null,
             pinnacleId: result.providerMatchId,
             source: result.source,
           });
@@ -1881,6 +1919,7 @@ export class RadarEngine {
           chosen.set(bet.matchId, {
             homeScore: result.homeScore,
             awayScore: result.awayScore,
+            cornersTotal: result.cornersTotal,
             pinnacleId: `hkjc:${result.matchId}`,
             source: result.source,
           });
@@ -1890,10 +1929,37 @@ export class RadarEngine {
       log("hkjc_results_error", { error: (err as Error).message });
     }
 
+    // Corner simulations have an intentionally separate result path. There is
+    // no live-score, goal-score or titan fallback: a missing ttlCornerResult
+    // leaves the bet pending indefinitely.
+    let cornerFetched = 0;
+    try {
+      if (cornerDue.length) {
+        const official = await this.hkjc.fetchHistoricResults(
+          cornerDue.map((bet) => ({ matchId: bet.matchId.replace(/^hkjc:/i, ""), kickoffUtc: bet.kickoffUtc })),
+        );
+        cornerFetched = official.length;
+        const byHkjcId = new Map(official.map((result) => [result.matchId, result]));
+        for (const bet of cornerDue) {
+          const result = byHkjcId.get(bet.matchId.replace(/^hkjc:/i, ""));
+          if (!result || !canSettleCornerMarket(result.source, result.cornersTotal)) continue;
+          chosen.set(bet.matchId, {
+            homeScore: result.homeScore,
+            awayScore: result.awayScore,
+            cornersTotal: result.cornersTotal,
+            pinnacleId: `hkjc:${result.matchId}`,
+            source: result.source,
+          });
+        }
+      }
+    } catch (err) {
+      log("hkjc_corner_results_error", { error: (err as Error).message });
+    }
+
     const resultStmt = rawDb.prepare(
-      `INSERT INTO results(match_id,pinnacle_match_id,home_score,away_score,half_home,half_away,source,fetched_at)
-       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
-       away_score=excluded.away_score, half_home=excluded.half_home, half_away=excluded.half_away,
+      `INSERT INTO results(match_id,pinnacle_match_id,home_score,away_score,corners_total,half_home,half_away,source,fetched_at)
+       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+       away_score=excluded.away_score, corners_total=excluded.corners_total, half_home=excluded.half_home, half_away=excluded.half_away,
        source=excluded.source, fetched_at=excluded.fetched_at`,
     );
     let settled = 0;
@@ -1906,6 +1972,7 @@ export class RadarEngine {
           result.pinnacleId,
           result.homeScore,
           result.awayScore,
+          result.cornersTotal,
           null,
           null,
           result.source,
@@ -1913,12 +1980,30 @@ export class RadarEngine {
         );
         const legs = db.select().from(simulationLegs).where(eq(simulationLegs.betId, b.id)).all();
         if (!legs.length) continue;
+        if (
+          b.market === "COU" &&
+          (!canSettleCornerMarket(result.source, result.cornersTotal) ||
+            legs.some(
+              (leg) =>
+                leg.market !== "COU" ||
+                !leg.lineKey ||
+                !Number.isFinite(Number(leg.lineKey)) ||
+                (leg.selection !== "O" && leg.selection !== "U"),
+            ))
+        ) {
+          // Corrupt/incomplete COU rows stay pending rather than being pushed
+          // or settled from the score fields.
+          continue;
+        }
         const score = { homeScore: result.homeScore, awayScore: result.awayScore };
         const statuses: LegStatus[] = [];
         let totalReturn = 0;
         for (const leg of legs) {
           const lineValue = leg.lineKey ? Number(leg.lineKey) : null;
-          const status = settleLeg(leg.market as Market, lineValue, leg.selection as Selection, score);
+          const status =
+            leg.market === "COU"
+              ? settleCornerTotal(result.cornersTotal!, lineValue!, leg.selection as "O" | "U")
+              : settleLeg(leg.market as Market, lineValue, leg.selection as Selection, score);
           const ret = legReturn(status, leg.stake, leg.decimalOdds);
           statuses.push(status);
           totalReturn += ret;
@@ -1934,7 +2019,7 @@ export class RadarEngine {
             aggregateBetStatus(statuses),
             round2(totalReturn),
             pnl,
-            `${score.homeScore}-${score.awayScore}`,
+            b.market === "COU" ? `角球 ${result.cornersTotal}` : `${score.homeScore}-${score.awayScore}`,
             result.source,
             b.id,
           );
@@ -1942,7 +2027,7 @@ export class RadarEngine {
       }
     });
     tx();
-    const resultsFetched = chosen.size + titanFetched + hkjcFetched;
+    const resultsFetched = chosen.size + titanFetched + hkjcFetched + cornerFetched;
     log("settlement", { settled, due: due.length, resultsFetched, manual });
     return { settled, pending: open.length - settled, resultsFetched };
   }

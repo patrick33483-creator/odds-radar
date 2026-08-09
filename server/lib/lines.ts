@@ -13,6 +13,8 @@
  *  - Home/away direction is NEVER flipped after ingest.
  */
 
+import type { Market } from "@shared/types";
+
 export const QUARTER = 0.25;
 
 export function isQuarterStep(v: number): boolean {
@@ -87,7 +89,7 @@ export function parsePinnacleTotal(goals: string | number): number | null {
 }
 
 /** Canonical, comparison-safe key for a normalized line. */
-export function lineKeyOf(market: "1X2" | "AH" | "OU", value: number | null): string {
+export function lineKeyOf(market: Market, value: number | null): string {
   if (market === "1X2") return "";
   if (value === null || !Number.isFinite(value)) return "";
   return value.toFixed(2);
@@ -136,7 +138,7 @@ export function formatTotal(t: number): string {
   return `${fmt(t - QUARTER)}/${fmt(t + QUARTER)}`;
 }
 
-export function formatLine(market: "1X2" | "AH" | "OU", value: number | null): string {
+export function formatLine(market: Market, value: number | null): string {
   if (market === "1X2" || value === null) return "—";
   return market === "AH" ? formatHandicap(value) : formatTotal(value);
 }
@@ -147,7 +149,7 @@ export function formatLine(market: "1X2" | "AH" | "OU", value: number | null): s
  * so an away selection must invert the sign for user-facing text.
  */
 export function formatSelectionLine(
-  market: "1X2" | "AH" | "OU",
+  market: Market,
   value: number | null,
   selection: string,
 ): string {

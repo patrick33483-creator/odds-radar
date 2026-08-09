@@ -107,7 +107,7 @@ CREATE INDEX IF NOT EXISTS simulation_legs_bet_idx ON simulation_legs(bet_id);
 
 CREATE TABLE IF NOT EXISTS results (
   match_id TEXT PRIMARY KEY, pinnacle_match_id TEXT, home_score INTEGER NOT NULL,
-  away_score INTEGER NOT NULL, half_home INTEGER, half_away INTEGER,
+  away_score INTEGER NOT NULL, corners_total INTEGER, half_home INTEGER, half_away INTEGER,
   source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
@@ -149,6 +149,10 @@ CREATE TABLE IF NOT EXISTS app_state (
   }
   if (!simulationBetColumns.some((column) => column.name === "exclusion_reason")) {
     sqlite.exec("ALTER TABLE simulation_bets ADD COLUMN exclusion_reason TEXT");
+  }
+  const resultColumns = sqlite.prepare("PRAGMA table_info(results)").all() as Array<{ name: string }>;
+  if (!resultColumns.some((column) => column.name === "corners_total")) {
+    sqlite.exec("ALTER TABLE results ADD COLUMN corners_total INTEGER");
   }
   // Preserve historical direct 1X2 rows for audit while removing them from
   // the active 30-bet validation cohort. An AH/OU target implemented through
