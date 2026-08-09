@@ -49,17 +49,13 @@ window_json="$(curl --fail --silent --show-error --max-time 30 \
 status_json="$(curl --fail --silent --show-error --max-time 30 \
   --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
   http://127.0.0.1:5001/api/status)"
-dashboard_json="$(curl --fail --silent --show-error --max-time 30 \
-  --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-  http://127.0.0.1:5001/api/dashboard)"
 
-python3 - "$window_json" "$status_json" "$dashboard_json" <<'PY'
+python3 - "$window_json" "$status_json" <<'PY'
 import json
 import sys
 
 window = json.loads(sys.argv[1])
 status = json.loads(sys.argv[2])
-dashboard = json.loads(sys.argv[3])
 config = window.get("config") or {}
 if config.get("windowMinutes") != 30:
     raise SystemExit(f"FAIL scan window={config.get('windowMinutes')}")
@@ -71,17 +67,6 @@ print(
     f"in_window={len(window.get('inWindow') or [])}"
 )
 print("OK radar status keys=" + ",".join(sorted(status)[:12]))
-allowed_closing_statuses = {"available", "incomplete", "stale", "poor_fit"}
-matches = dashboard.get("matches") or []
-for match in matches:
-    model = match.get("totalClosingModel")
-    if not isinstance(model, dict):
-        raise SystemExit(f"FAIL missing totalClosingModel match={match.get('id')}")
-    if model.get("status") not in allowed_closing_statuses:
-        raise SystemExit(
-            f"FAIL invalid totalClosingModel status={model.get('status')} match={match.get('id')}"
-        )
-print(f"OK closing totals model serialized matches={len(matches)}")
 PY
 
 if docker compose logs --since 15m radar 2>&1 | grep -Eq \

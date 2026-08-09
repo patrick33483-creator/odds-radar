@@ -8,7 +8,6 @@ import {
   matches,
   oddsLatest,
   oddsSnapshots,
-  pinnacleTotalClosingQuotes,
   opportunities,
   pinnapiLiveScores,
   providerHealth,
@@ -60,14 +59,6 @@ CREATE TABLE IF NOT EXISTS odds_latest (
   line_key TEXT NOT NULL, selection TEXT NOT NULL, decimal_odds REAL NOT NULL,
   prev_decimal_odds REAL, source_updated_at INTEGER, fetched_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS odds_latest_match_idx ON odds_latest(match_id);
-
-CREATE TABLE IF NOT EXISTS pinnacle_total_closing_quotes (
-  key TEXT PRIMARY KEY, match_id TEXT NOT NULL, pinnacle_event_id TEXT NOT NULL,
-  kickoff_utc INTEGER NOT NULL, line_key TEXT NOT NULL, line_value REAL NOT NULL,
-  selection TEXT NOT NULL, decimal_odds REAL NOT NULL, source_updated_at INTEGER,
-  fetched_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS pinnacle_total_closing_match_idx ON pinnacle_total_closing_quotes(match_id);
-CREATE INDEX IF NOT EXISTS pinnacle_total_closing_kickoff_idx ON pinnacle_total_closing_quotes(kickoff_utc);
 
 CREATE TABLE IF NOT EXISTS team_aliases (
   id INTEGER PRIMARY KEY AUTOINCREMENT, canonical TEXT NOT NULL, alias TEXT NOT NULL,
@@ -216,7 +207,6 @@ export {
   matches,
   oddsLatest,
   oddsSnapshots,
-  pinnacleTotalClosingQuotes,
   opportunities,
   pinnapiLiveScores,
   providerHealth,

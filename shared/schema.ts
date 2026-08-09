@@ -91,27 +91,6 @@ export const oddsLatest = sqliteTable(
   }),
 );
 
-/** Last complete Pinnacle 2.5/3/3.5/4 full-match totals ladder observed pre-kickoff. */
-export const pinnacleTotalClosingQuotes = sqliteTable(
-  "pinnacle_total_closing_quotes",
-  {
-    key: text("key").primaryKey(),
-    matchId: text("match_id").notNull(),
-    pinnacleEventId: text("pinnacle_event_id").notNull(),
-    kickoffUtc: integer("kickoff_utc").notNull(),
-    lineKey: text("line_key").notNull(),
-    lineValue: real("line_value").notNull(),
-    selection: text("selection").notNull(),
-    decimalOdds: real("decimal_odds").notNull(),
-    sourceUpdatedAt: integer("source_updated_at"),
-    fetchedAt: integer("fetched_at").notNull(),
-  },
-  (t) => ({
-    match: index("pinnacle_total_closing_match_idx").on(t.matchId),
-    kickoff: index("pinnacle_total_closing_kickoff_idx").on(t.kickoffUtc),
-  }),
-);
-
 /** Team name aliases across providers (learned + seeded). */
 export const teamAliases = sqliteTable(
   "team_aliases",
@@ -301,7 +280,6 @@ export type Match = typeof matches.$inferSelect;
 export type MarketLine = typeof marketLines.$inferSelect;
 export type OddsSnapshot = typeof oddsSnapshots.$inferSelect;
 export type OddsLatest = typeof oddsLatest.$inferSelect;
-export type PinnacleTotalClosingQuote = typeof pinnacleTotalClosingQuotes.$inferSelect;
 export type TeamAlias = typeof teamAliases.$inferSelect;
 export type MatchMapping = typeof matchMapping.$inferSelect;
 export type Opportunity = typeof opportunities.$inferSelect;
