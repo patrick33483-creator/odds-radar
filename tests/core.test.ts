@@ -313,6 +313,27 @@ describe("no-vig EV", () => {
     ).toEqual([]);
   });
 
+  it("rejects HKJC and Pinnacle quotes from different scan moments", () => {
+    const now = Date.now();
+    const ops = evaluateEv({
+      matchId: "m-skew",
+      matchLabel: "Home vs Away",
+      league: "League",
+      kickoffUtc: now + 20 * 60_000,
+      market: "OU",
+      lineKey: "3.50",
+      lineDisplay: "3.5",
+      pinnacle: [
+        { selection: "O", decimalOdds: 1.5, fetchedAt: now },
+        { selection: "U", decimalOdds: 2.7, fetchedAt: now },
+      ],
+      hkjc: [{ selection: "O", decimalOdds: 3.35, fetchedAt: now - 31_000 }],
+      now,
+      mappingConfidence: 1,
+    });
+    expect(ops).toEqual([]);
+  });
+
   it("keeps only the highest-EV execution route for the same line and selection", () => {
     const base = {
       key: "ev|m1|AH|-0.25|H",

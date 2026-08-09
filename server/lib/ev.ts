@@ -12,6 +12,8 @@ export const HKJC_FIXED_STAKE = 10000;
 export const OUTLIER_RATIO = 0.35;
 /** Prices older than this are treated as stale and excluded. */
 export const STALE_MS = 90_000;
+/** Execution and reference quotes must come from the same dense-scan pass. */
+export const MAX_QUOTE_SKEW_MS = 30_000;
 export const MIN_MAPPING_CONFIDENCE = 0.8;
 
 /** Remove the bookmaker margin by proportional normalization. */
@@ -68,6 +70,8 @@ export function evaluateEv(input: EvInput): EvOpportunity[] {
     // Keep stale quotes visible in the raw market table, but never turn them
     // into an EV opportunity or simulated order.
     if (input.now - leg.fetchedAt > STALE_MS) continue;
+    const quoteTimes = [...input.pinnacle.map((quote) => quote.fetchedAt), leg.fetchedAt];
+    if (Math.max(...quoteTimes) - Math.min(...quoteTimes) > MAX_QUOTE_SKEW_MS) continue;
     const p = fairBySelection.get(leg.selection);
     if (p === undefined || !(p > 0)) continue;
     if (!(leg.decimalOdds > 1)) continue;

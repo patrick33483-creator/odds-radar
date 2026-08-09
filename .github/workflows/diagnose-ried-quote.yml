@@ -1,0 +1,97 @@
+name: 診斷列特即時盤口
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 抽取列特對維也納迅速只讀時間線
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/odds-radar && python3 -' <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+
+          def hkt(ms):
+              if ms is None:
+                  return None
+              return db.execute(
+                  "SELECT datetime(? / 1000, 'unixepoch', '+8 hours')", (ms,)
+              ).fetchone()[0]
+
+          matches = db.execute(
+              """
+              SELECT id,home_team,away_team,home_team_en,away_team_en,league,kickoff_utc
+              FROM matches
+              WHERE home_team LIKE '%列特%' OR away_team LIKE '%列特%'
+                 OR home_team_en LIKE '%Ried%' OR away_team_en LIKE '%Ried%'
+              ORDER BY kickoff_utc DESC LIMIT 10
+              """
+          ).fetchall()
+          print("MATCHES")
+          for row in matches:
+              print(dict(row) | {"kickoff_hkt": hkt(row["kickoff_utc"])})
+          ids = [row["id"] for row in matches]
+          if not ids:
+              raise SystemExit("No matching production fixture")
+          marks = ",".join("?" for _ in ids)
+
+          print("\nLATEST")
+          for row in db.execute(
+              f"""
+              SELECT match_id,provider,market,line_key,selection,decimal_odds,
+                     prev_decimal_odds,source_updated_at,fetched_at
+              FROM odds_latest WHERE match_id IN ({marks})
+              ORDER BY match_id,provider,market,line_key,selection
+              """, ids
+          ):
+              print(dict(row) | {
+                  "source_hkt": hkt(row["source_updated_at"]),
+                  "fetched_hkt": hkt(row["fetched_at"]),
+              })
+
+          print("\nSNAPSHOTS")
+          for row in db.execute(
+              f"""
+              SELECT match_id,provider,market,line_key,selection,decimal_odds,
+                     source_updated_at,fetched_at
+              FROM odds_snapshots WHERE match_id IN ({marks})
+              ORDER BY fetched_at,provider,market,line_key,selection
+              """, ids
+          ):
+              print(dict(row) | {
+                  "source_hkt": hkt(row["source_updated_at"]),
+                  "fetched_hkt": hkt(row["fetched_at"]),
+              })
+
+          print("\nBETS")
+          for bet in db.execute(
+              f"SELECT * FROM simulation_bets WHERE match_id IN ({marks}) ORDER BY placed_at",
+              ids,
+          ):
+              print("BET", dict(bet) | {
+                  "placed_hkt": hkt(bet["placed_at"]),
+                  "kickoff_hkt": hkt(bet["kickoff_utc"]),
+              })
+              for leg in db.execute(
+                  "SELECT * FROM simulation_legs WHERE bet_id=? ORDER BY id",
+                  (bet["id"],),
+              ):
+                  print("LEG", dict(leg))
+          PY
