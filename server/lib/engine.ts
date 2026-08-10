@@ -33,6 +33,11 @@ import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from 
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb, isArbitrageTotal } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
 import { confirmedOpportunityKeys, isHkjcExecutionQuoteFresh } from "./execution-guard";
+import {
+  crownExecutionPolicy,
+  enforceCrownExecutionGate,
+  type CrownFeedObservation,
+} from "./crown-outage-guard";
 import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
@@ -137,6 +142,7 @@ interface HealthPatch {
 }
 
 export class RadarEngine {
+  private readonly crownFeedByMatch = new Map<string, CrownFeedObservation>();
   private readonly hkjc = new HkjcProvider();
   private readonly pinnapi = new PinnapiProvider();
   private readonly pinnacle = new PinnacleProvider();
@@ -775,7 +781,9 @@ export class RadarEngine {
           const cachedCrown = this.crownDetail.get(source.titan_id);
           let crownPrices =
             !bypassCache && cachedCrown && Date.now() - cachedCrown.at < ttl ? cachedCrown.prices : null;
+          let crownObservedNow = false;
           if (!crownPrices) {
+            crownObservedNow = true;
             try {
               crownPrices = await this.pinnacle.fetchCrownMatchPrices(source.titan_id);
               if (source.titan_reversed) {
@@ -796,6 +804,15 @@ export class RadarEngine {
               log("crown_detail_error", { titanId: source.titan_id, error: (err as Error).message });
               crownPrices = [];
             }
+          }
+          // A cache hit is not evidence that the upstream Crown stream is
+          // currently reachable. Only a real request may open/close the gate.
+          if (crownObservedNow) {
+            this.crownFeedByMatch.set(m.id, {
+              observedAt: Date.now(),
+              available: crownPrices.length > 0,
+              rowCount: crownPrices.length,
+            });
           }
           if (crownPrices.length) {
             rawDb.prepare("DELETE FROM odds_latest WHERE match_id=? AND provider='crown'").run(m.id);
@@ -1174,6 +1191,14 @@ export class RadarEngine {
     for (const m of allMatches) {
       const mapping = mappings.get(m.id);
       const prices = byMatch.get(m.id) ?? [];
+      const historicalCrownRows = prices.some((price) => price.provider === "crown");
+      const crownPolicy = crownExecutionPolicy({
+        now,
+        kickoffUtc: m.kickoffUtc,
+        observation: this.crownFeedByMatch.get(m.id),
+        hasHistoricalCrownRows: historicalCrownRows,
+      });
+      const crownExecutionEnabled = crownPolicy.executionEnabled;
       const matchLabel = `${m.homeTeam} vs ${m.awayTeam}`;
       const directEvs: EvOpportunity[] = [];
       const cell = (provider: string, market: Market, lineKey: string, selection: Selection): PriceCell | undefined => {
@@ -1237,7 +1262,7 @@ export class RadarEngine {
           if (hasFreshPin) {
             totalProbability = sels.reduce((acc, s) => acc + 1 / pin[s]!.decimalOdds, 0);
           }
-          if (hasFreshHk && hasFreshCrown) {
+          if (crownExecutionEnabled && hasFreshHk && hasFreshCrown) {
             bestQ = sels.reduce((acc, s) => acc + 1 / Math.max(hk[s]!.decimalOdds, crown[s]!.decimalOdds), 0);
             arb = findThreeWayArb({
               matchId: m.id,
@@ -1253,7 +1278,7 @@ export class RadarEngine {
           if (hasFreshPin) totalProbability = 1 / pin[s1]!.decimalOdds + 1 / pin[s2]!.decimalOdds;
           // COU is PinnAPI × HKJC EV only. Crown has neither a valid corner
           // source nor a permitted arb/synthetic route.
-          if (market !== "COU" && hasFreshHk && hasFreshCrown) {
+          if (crownExecutionEnabled && market !== "COU" && hasFreshHk && hasFreshCrown) {
             const q1 = 1 / hk[s1]!.decimalOdds + 1 / crown[s2]!.decimalOdds;
             const q2 = 1 / hk[s2]!.decimalOdds + 1 / crown[s1]!.decimalOdds;
             bestQ = Math.min(q1, q2);
@@ -1279,7 +1304,7 @@ export class RadarEngine {
           hasFreshPin
           && Object.keys(hk).length > 0
           && (market !== "COU" || (exactLine && hasFreshHk));
-        if (evComparable) {
+        if (crownExecutionEnabled && evComparable) {
           lineEv = evaluateEv({
             matchId: m.id,
             matchLabel,
@@ -1322,21 +1347,37 @@ export class RadarEngine {
       }
 
       /* synthetic quotes from HKJC 1X2 vs Crown handicap singles */
-      const syn = this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices, now);
-      synthetics.push(...syn);
+      const rawSyn = crownExecutionEnabled
+        ? this.buildSyntheticsFor(m.id, matchLabel, m.league, m.kickoffUtc, prices, now)
+        : [];
       // Standalone 1X2 remains visible for observation only. An AH/OU target
       // may still use an economically equivalent HKJC 1X2 combination when
       // that route offers the better return.
-      const syntheticEvs = this.buildSyntheticEvsFor(
-        m.id,
-        matchLabel,
-        m.league,
-        m.kickoffUtc,
-        prices,
-        mapping?.confidence ?? 0,
-        now,
-      );
-      const matchEvs = selectBestEv([...directEvs, ...syntheticEvs]);
+      const syntheticEvs = crownExecutionEnabled
+        ? this.buildSyntheticEvsFor(
+            m.id,
+            matchLabel,
+            m.league,
+            m.kickoffUtc,
+            prices,
+            mapping?.confidence ?? 0,
+            now,
+          )
+        : [];
+      const gated = enforceCrownExecutionGate(crownPolicy, {
+        arbs: arbs.filter((op) => op.matchId === m.id),
+        ev: selectBestEv([...directEvs, ...syntheticEvs]),
+        synthetics: rawSyn,
+      });
+      // Remove any match-local result that could have been appended before the
+      // final gate, then append only the sanitized execution collections.
+      for (let i = arbs.length - 1; i >= 0; i--) {
+        if (arbs[i].matchId === m.id) arbs.splice(i, 1);
+      }
+      arbs.push(...gated.arbs);
+      const syn = gated.synthetics;
+      synthetics.push(...syn);
+      const matchEvs = gated.ev;
       evs.push(...matchEvs);
       for (const line of lineRows) {
         const selected = matchEvs.filter(
@@ -1366,6 +1407,9 @@ export class RadarEngine {
         hasEv: matchEvs.length > 0,
         hasSynthetic: syn.some((s) => s.isArb),
         synthetics: syn,
+        crownExecutionMode: crownPolicy.mode,
+        crownExecutionReason: crownPolicy.reason,
+        crownPredictionFallback: crownPolicy.predictionFallbackAllowed,
       });
     }
 

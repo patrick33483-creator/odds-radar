@@ -63,6 +63,14 @@ export interface MatchRow {
   hasEv: boolean;
   hasSynthetic: boolean;
   synthetics: SyntheticOpportunity[];
+  /** Old Crown rows may remain for prediction context, never execution. */
+  crownExecutionMode: "live" | "prediction_only";
+  crownExecutionReason:
+    | "live_crown_snapshot"
+    | "no_crown_observation"
+    | "empty_crown_snapshot"
+    | "stale_crown_observation";
+  crownPredictionFallback: boolean;
 }
 
 export interface BetLeg {

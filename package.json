@@ -10,6 +10,7 @@
     "check": "tsc",
     "db:push": "drizzle-kit push",
     "test": "vitest run",
+    "test:crown-outage": "vitest run tests/crown-outage-t10.test.ts --reporter=verbose",
     "backup": "tsx scripts/backup.ts",
     "scan": "tsx scripts/scan-window.ts",
     "prewarm:24h": "tsx scripts/prewarm-24h.ts"
