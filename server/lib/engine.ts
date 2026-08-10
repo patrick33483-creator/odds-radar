@@ -110,6 +110,15 @@ export const FIXTURE_CACHE_MS = 10 * 60_000;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
 
+export function executionVerificationNote(verifiedAt: number): string {
+  return [
+    "execution_recheck=two_pass",
+    `verified_at=${new Date(verifiedAt).toISOString()}`,
+    "hkjc_quote_max_age=30s",
+    "economic_key=confirmed",
+  ].join(";");
+}
+
 /** lightweight = fixtures + HKJC prices only; prewarm24h = future 24 h detail
  *  refresh without bets; window = manual dense pre-kickoff detail refresh;
  *  full = explicit manual all-match detail scan. */
@@ -1785,14 +1794,15 @@ export class RadarEngine {
       matchCategoryEligible(existingBets, matchId, category);
     const insertBet = rawDb.prepare(
       `INSERT OR IGNORE INTO simulation_bets(unique_key,category,match_id,market,line_key,selection,match_label,league,kickoff_utc,
-        total_stake,expected_payout,expected_profit,roi,ev_pct,q_total,placed_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        total_stake,expected_payout,expected_profit,roi,ev_pct,q_total,placed_at,notes)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     );
     const insertLeg = rawDb.prepare(
       `INSERT INTO simulation_legs(bet_id,provider,market,line_key,selection,decimal_odds,stake,synthetic,synthetic_detail)
        VALUES(?,?,?,?,?,?,?,?,?)`,
     );
     const tx = rawDb.transaction(() => {
+      const verificationNote = executionVerificationNote(now);
       /* 情況一 — arb, Crown fixed 5,000, HKJC back-calculated */
       for (const a of dash.arbs) {
         if (remaining <= 0) break;
@@ -1812,7 +1822,7 @@ export class RadarEngine {
         const key = `case1_arb|${a.matchId}|${a.lineKey}|${a.market}:${a.legs.map((l) => l.selection).join("")}`;
         const res = insertBet.run(
           key, "case1_arb", a.matchId, a.market, a.lineKey, a.legs[0]?.selection ?? "", a.matchLabel, a.league,
-          a.kickoffUtc, a.totalStake, a.payout, a.profit, a.roi, null, a.q, now,
+          a.kickoffUtc, a.totalStake, a.payout, a.profit, a.roi, null, a.q, now, verificationNote,
         );
         if (res.changes) {
           remaining--;
@@ -1836,6 +1846,7 @@ export class RadarEngine {
         const res = insertBet.run(
           key, "case2_ev", e.matchId, e.market, e.lineKey, e.selection, e.matchLabel, e.league, e.kickoffUtc,
           HKJC_FIXED_STAKE, payout, round2(HKJC_FIXED_STAKE * e.edge), e.edge, e.edge, null, now,
+          verificationNote,
         );
         if (res.changes) {
           remaining--;
@@ -1878,7 +1889,7 @@ export class RadarEngine {
         const res = insertBet.run(
           key, "synth_arb", s.matchId, "AH", (s.side === "away" ? -s.targetHandicap : s.targetHandicap).toFixed(2),
           s.side === "away" ? "A" : "H", s.matchLabel, s.league, s.kickoffUtc, s.totalStake, s.payout, s.profit, s.roi,
-          null, s.q, now,
+          null, s.q, now, verificationNote,
         );
         if (res.changes) {
           remaining--;

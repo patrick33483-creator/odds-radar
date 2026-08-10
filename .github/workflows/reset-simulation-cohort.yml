@@ -1,0 +1,170 @@
+name: 重設雷達 30 張模擬注單
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "輸入 true 才正式重設；false 只做核對"
+        required: true
+        default: "false"
+
+jobs:
+  reset:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 核對維多利亞女足及重設測試批次
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          APPLY_RESET: ${{ inputs.apply }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd /opt/odds-radar && APPLY_RESET='$APPLY_RESET' python3 -" <<'PY'
+          import json
+          import os
+          import sqlite3
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          path = Path("/opt/odds-radar/data/data.db")
+          db = sqlite3.connect(path)
+          db.row_factory = sqlite3.Row
+
+          def hkt(ms):
+              if ms is None:
+                  return None
+              return db.execute(
+                  "SELECT datetime(? / 1000, 'unixepoch', '+8 hours')", (ms,)
+              ).fetchone()[0]
+
+          targets = db.execute(
+              """
+              SELECT *
+              FROM simulation_bets
+              WHERE match_label LIKE '%維多利亞女足%'
+                AND match_label LIKE '%國際體育會女足%'
+                AND category='case2_ev'
+                AND datetime(placed_at / 1000, 'unixepoch', '+8 hours')
+                    BETWEEN '2026-08-10 01:20:00' AND '2026-08-10 01:40:00'
+              ORDER BY placed_at DESC
+              """
+          ).fetchall()
+          if len(targets) != 1:
+              raise SystemExit(
+                  f"FAIL_CLOSED target_count={len(targets)}; no database rows changed"
+              )
+          target = targets[0]
+          legs = db.execute(
+              "SELECT * FROM simulation_legs WHERE bet_id=? ORDER BY id",
+              (target["id"],),
+          ).fetchall()
+          snapshots = db.execute(
+              """
+              SELECT provider,market,line_key,selection,decimal_odds,
+                     source_updated_at,fetched_at
+              FROM odds_snapshots
+              WHERE match_id=?
+                AND provider='hkjc'
+                AND fetched_at BETWEEN ? AND ?
+              ORDER BY fetched_at,market,line_key,selection
+              """,
+              (target["match_id"], target["placed_at"] - 120_000, target["placed_at"] + 15_000),
+          ).fetchall()
+          fetches = sorted({row["fetched_at"] for row in snapshots})
+          print("TARGET", json.dumps({
+              **dict(target),
+              "placed_hkt": hkt(target["placed_at"]),
+              "kickoff_hkt": hkt(target["kickoff_utc"]),
+          }, ensure_ascii=False))
+          for row in legs:
+              print("LEG", json.dumps(dict(row), ensure_ascii=False))
+          print("HKJC_RECHECK_FETCHES", json.dumps(
+              [{"fetched_at": value, "fetched_hkt": hkt(value)} for value in fetches],
+              ensure_ascii=False,
+          ))
+          for row in snapshots:
+              print("SNAPSHOT", json.dumps({
+                  **dict(row),
+                  "source_hkt": hkt(row["source_updated_at"]),
+                  "fetched_hkt": hkt(row["fetched_at"]),
+              }, ensure_ascii=False))
+
+          # The exact legacy bet predates the audit-note column usage. Require
+          # two independently stored HKJC fetch timestamps around placement.
+          if len(fetches) < 2:
+              raise SystemExit(
+                  f"FAIL_CLOSED only {len(fetches)} HKJC fetch timestamp(s); "
+                  "Victoria bet not accepted as cohort sample"
+              )
+
+          if os.environ.get("APPLY_RESET") != "true":
+              print("DRY_RUN_OK no database rows changed")
+              raise SystemExit(0)
+
+          backup_dir = Path("/opt/odds-radar/backups")
+          backup_dir.mkdir(parents=True, exist_ok=True)
+          stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+          backup_path = backup_dir / f"before-simulation-reset-{stamp}.db"
+          backup = sqlite3.connect(backup_path)
+          db.backup(backup)
+          backup.close()
+
+          with db:
+              db.execute(
+                  """
+                  UPDATE simulation_bets
+                  SET excluded_from_stats=1,
+                      exclusion_reason='legacy_unexecutable_quote_cleanup_2026-08-10'
+                  WHERE excluded_from_stats=0 AND id<>?
+                  """,
+                  (target["id"],),
+              )
+              db.execute(
+                  """
+                  UPDATE simulation_bets
+                  SET excluded_from_stats=0,
+                      exclusion_reason=NULL,
+                      notes=COALESCE(notes || ';', '') ||
+                        'legacy_two_pass_verified_from_snapshots;cohort_sample=1'
+                  WHERE id=?
+                  """,
+                  (target["id"],),
+              )
+              db.execute(
+                  """
+                  INSERT INTO app_state(key,value,updated_at)
+                  VALUES('simulation_cohort_reset_at',?,?)
+                  ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,updated_at=excluded.updated_at
+                  """,
+                  (stamp, int(datetime.now(timezone.utc).timestamp() * 1000)),
+              )
+
+          active = db.execute(
+              """
+              SELECT id,match_label,category,market,line_key,selection,placed_at,notes
+              FROM simulation_bets
+              WHERE excluded_from_stats=0
+              ORDER BY placed_at
+              """
+          ).fetchall()
+          print("BACKUP", backup_path)
+          print("ACTIVE_COUNT", len(active))
+          for row in active:
+              print("ACTIVE", json.dumps({
+                  **dict(row), "placed_hkt": hkt(row["placed_at"])
+              }, ensure_ascii=False))
+          if len(active) != 1 or active[0]["id"] != target["id"]:
+              raise SystemExit("POSTCONDITION_FAILED active cohort is not exactly Victoria 1/30")
+          print("RESET_OK cohort=1/30 target=30")
+          PY
