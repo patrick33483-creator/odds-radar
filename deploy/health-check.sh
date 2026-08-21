@@ -78,3 +78,29 @@ if docker compose logs --since 15m radar 2>&1 | grep -Eq \
 fi
 echo "OK no recent automatic scan errors"
 echo "=== radar production health PASS ==="
+
+# The frontend's board is driven entirely by this authenticated response.  Test
+# three independent full-payload reads rather than treating container health as
+# sufficient: each must arrive within the client-safe bound and include rows.
+tmp_dashboard="$(mktemp)"
+trap 'rm -f "$tmp_dashboard"' EXIT
+for attempt in 1 2 3; do
+  seconds="$(curl --fail --silent --show-error --max-time 8 \
+    --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
+    --output "$tmp_dashboard" --write-out '%{time_total}' \
+    http://127.0.0.1:5001/api/dashboard)"
+  python3 - "$tmp_dashboard" "$attempt" "$seconds" <<'PY'
+import json
+import sys
+
+path, attempt, seconds = sys.argv[1:]
+data = json.load(open(path, encoding="utf-8"))
+matches = data.get("matches") if isinstance(data, dict) else None
+if not isinstance(matches, list) or not matches:
+    raise SystemExit("FAIL dashboard has no frontend rows")
+lines = sum(len(row.get("lines") or []) for row in matches if isinstance(row, dict))
+if lines <= 0:
+    raise SystemExit("FAIL dashboard rows have no market lines")
+print(f"OK dashboard payload attempt={attempt} latency={float(seconds) * 1000:.1f}ms matches={len(matches)} lines={lines}")
+PY
+done

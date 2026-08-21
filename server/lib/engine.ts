@@ -73,6 +73,7 @@ import {
   countSnapshots,
   db,
   eq,
+  inArray,
   getState,
   marketLines,
   matchMapping,
@@ -1176,15 +1177,26 @@ export class RadarEngine {
       .all()
       .filter((m) => m.kickoffUtc > now - 30 * 60_000)
       .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
-    const mappings = new Map(db.select().from(matchMapping).all().map((r) => [r.matchId, r]));
-    const latestRows = db.select().from(oddsLatest).all();
+    // Only active dashboard fixtures need prices/lines.  Reading the complete
+    // retained history on every 20-second frontend poll caused avoidable work
+    // during an in-flight scan and enlarged the event-loop stall window.
+    const matchIds = allMatches.map((match) => match.id);
+    const mappings = new Map(
+      (matchIds.length ? db.select().from(matchMapping).where(inArray(matchMapping.matchId, matchIds)).all() : [])
+        .map((row) => [row.matchId, row]),
+    );
+    const latestRows = matchIds.length
+      ? db.select().from(oddsLatest).where(inArray(oddsLatest.matchId, matchIds)).all()
+      : [];
     const byMatch = new Map<string, typeof latestRows>();
     for (const r of latestRows) {
       const list = byMatch.get(r.matchId) ?? [];
       list.push(r);
       byMatch.set(r.matchId, list);
     }
-    const linesRows = db.select().from(marketLines).all();
+    const linesRows = matchIds.length
+      ? db.select().from(marketLines).where(inArray(marketLines.matchId, matchIds)).all()
+      : [];
     const linesByMatch = new Map<string, typeof linesRows>();
     for (const r of linesRows) {
       const list = linesByMatch.get(r.matchId) ?? [];
