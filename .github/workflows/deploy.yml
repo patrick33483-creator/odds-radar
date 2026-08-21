@@ -42,7 +42,12 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" \
-            'cd /opt/odds-radar && git fetch origin master && git reset --hard origin/master && docker compose up -d --build && docker image prune -f'
+            'set -e
+             cd /opt/odds-radar
+             git fetch origin master
+             git reset --hard origin/master
+             sudo docker compose --env-file /opt/odds-radar/.env -f /opt/odds-radar/compose.yaml up -d --build
+             sudo docker image prune -f'
       - name: Production health gate
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
