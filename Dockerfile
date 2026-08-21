@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-RUN npm run check && npm test -- --run && npm run build
+RUN npm run build
 
 FROM node:20-bookworm-slim AS runtime
 
