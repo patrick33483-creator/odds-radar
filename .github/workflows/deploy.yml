@@ -1,30 +1,8 @@
-name: Deploy odds radar
-
-on:
-  push:
-    branches: [master]
-  workflow_dispatch:
-
-concurrency:
-  group: odds-radar-production
-  cancel-in-progress: false
-
+name: Radar read-only deployment diagnostic
+on: {workflow_dispatch: {}}
+permissions: {contents: read}
 jobs:
-  verify:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-      - run: npm ci
-      - run: npm run check
-      - run: npm test
-      - run: npm run build
-
-  deploy:
-    needs: verify
+  diagnostic:
     runs-on: ubuntu-24.04
     steps:
       - name: Configure SSH
@@ -36,22 +14,10 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
-      - name: Pull and restart
+      - name: Read build and service state
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" \
-            'set -e
-             cd /opt/odds-radar
-             git fetch origin master
-             git reset --hard origin/master
-             timeout 180s sudo docker compose --env-file /opt/odds-radar/.env -f /opt/odds-radar/compose.yaml up -d --build
-             sudo docker image prune -f'
-      - name: Production health gate
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-        run: |
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" \
-            'sleep 50 && sudo /opt/odds-radar/deploy/health-check.sh'
+            'set -e; sudo sh -c "cd /opt/odds-radar; echo ===git===; git rev-parse HEAD; echo ===docker===; docker compose ps; echo ===processes===; ps -eo pid,ppid,etimes,stat,cmd | grep -E \"(docker|buildkit|node|npm|tsx|vite)\" | grep -v grep || true; echo ===disk===; df -h /; echo ===health===; timeout 20 curl -sS -o /dev/null -w \"%{http_code}\\n\" http://127.0.0.1:5001/healthz || true"'
