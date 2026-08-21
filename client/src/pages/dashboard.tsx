@@ -47,7 +47,11 @@ export default function Dashboard() {
   const [league, setLeague] = useState("all");
   const [win, setWin] = useState("all");
   const [search, setSearch] = useState("");
-  const [exactOnly, setExactOnly] = useState(true);
+  // The board must open on its complete market inventory.  Exact-line
+  // comparison remains available as an explicit analyst filter, but making it
+  // the default can make a healthy 163-fixture board look like a one-row
+  // outage whenever only one fixture has both providers on the same road.
+  const [exactOnly, setExactOnly] = useState(false);
   const [arbOnly, setArbOnly] = useState(false);
   const [showSynthetic, setShowSynthetic] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
