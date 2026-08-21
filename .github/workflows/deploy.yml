@@ -46,7 +46,7 @@ jobs:
              cd /opt/odds-radar
              git fetch origin master
              git reset --hard origin/master
-             sudo docker compose --env-file /opt/odds-radar/.env -f /opt/odds-radar/compose.yaml up -d --build
+             timeout 180s sudo docker compose --env-file /opt/odds-radar/.env -f /opt/odds-radar/compose.yaml up -d --build
              sudo docker image prune -f'
       - name: Production health gate
         env:
