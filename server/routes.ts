@@ -208,7 +208,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   installHourlyPrewarm();
 
   app.get("/api/status", (_req, res) => {
-    const dash = engine.buildDashboardData();
+    const dash = engine.dashboardData();
     res.json(dash.status);
   });
 
@@ -217,7 +217,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // refresh is allowed because it makes zero per-match detail requests.
   app.get("/api/dashboard", async (_req, res) => {
     void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
-    res.json(engine.buildDashboardData());
+    res.json(engine.dashboardData());
   });
 
   /**
@@ -239,7 +239,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             ? "lightweight"
             : "window";
     const r = await engine.refresh({ force: true, mode });
-    res.json({ ...r, status: engine.buildDashboardData().status });
+    res.json({ ...r, status: engine.dashboardData().status });
   });
 
   app.post("/api/refresh/match", async (req, res) => {

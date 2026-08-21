@@ -177,6 +177,10 @@ export class RadarEngine {
   private lastScan: ScanOutcome | null = null;
   private scanning = false;
   private matchRefreshes = new Map<string, Promise<MatchRefreshResponse>>();
+  // The board is a read-only projection.  Build it after a refresh and reuse
+  // that immutable object for API polls so a busy provider/scan cannot make a
+  // client request synchronously rebuild every market calculation.
+  private dashboardCache: DashboardResponse | null = null;
 
   constructor() {
     const stored = getState("lastGoodAt");
@@ -885,7 +889,7 @@ export class RadarEngine {
       log("pinnacle_error", { error: message });
     }
 
-    const dash = this.buildDashboardData();
+    const dash = this.rememberDashboard(this.buildDashboardData());
     this.recordOpportunities(dash, now);
     await this.settleDue(false);
     pruneSnapshots(now);
@@ -966,7 +970,8 @@ export class RadarEngine {
     );
     const scannedMatchIds = new Set(events.map((e) => e.matchId));
     const initialAt = Date.now();
-    const initialDash = this.buildDashboardData();
+    this.dashboardCache = null;
+    const initialDash = this.rememberDashboard(this.buildDashboardData());
     const initialKeys = this.simulationCandidateKeys(initialDash, initialAt, scannedMatchIds);
 
     // A first-pass signal is never executable. Re-fetch HKJC independently,
@@ -978,7 +983,7 @@ export class RadarEngine {
       const hkjcVerified = await this.refreshHkjc();
       if (hkjcVerified) {
         const verifiedAt = Date.now();
-        verifiedDash = this.buildDashboardData();
+        verifiedDash = this.rememberDashboard(this.buildDashboardData());
         const secondKeys = this.simulationCandidateKeys(verifiedDash, verifiedAt, scannedMatchIds);
         allowedKeys = confirmedOpportunityKeys(initialKeys, secondKeys);
         log("execution_recheck", {
@@ -1168,6 +1173,17 @@ export class RadarEngine {
   }
 
   /* ----------------------------- dashboard ------------------------------ */
+
+  /** Return the latest completed read-only board without recomputing it per request. */
+  dashboardData(): DashboardResponse {
+    if (this.dashboardCache) return this.dashboardCache;
+    return this.rememberDashboard(this.buildDashboardData());
+  }
+
+  private rememberDashboard(dashboard: DashboardResponse): DashboardResponse {
+    this.dashboardCache = dashboard;
+    return dashboard;
+  }
 
   buildDashboardData(): DashboardResponse {
     const now = Date.now();
