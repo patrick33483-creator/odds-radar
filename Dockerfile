@@ -15,10 +15,13 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-COPY --from=build /app/dist ./dist
-
+# Do not recursively chown production node_modules on every deploy: that
+# creates an enormous image layer and can leave a small production host stuck
+# unpacking the image before the service is restarted. Only writable mounts
+# need ownership; application code is safely readable by the non-root user.
 RUN mkdir -p /app/data /app/backups \
-    && chown -R node:node /app
+    && chown node:node /app/data /app/backups
+COPY --from=build /app/dist ./dist
 USER node
 
 EXPOSE 5000
