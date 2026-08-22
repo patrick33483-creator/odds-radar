@@ -4,6 +4,7 @@ import type { ProviderPrice } from "./types";
 import type { PinnacleFixture } from "./pinnacle";
 
 const execFileAsync = promisify(execFile);
+const OPTIC_ENABLED = process.env.RADAR_OPTIC_ENABLED === "1";
 
 interface OpticFixture {
   id: string;
@@ -206,6 +207,10 @@ export class OpticOddsProvider {
   }
 
   async fetchFixtures(): Promise<PinnacleFixture[]> {
+    if (!OPTIC_ENABLED) {
+      this.warn("OpticOdds disabled (set RADAR_OPTIC_ENABLED=1 to enable)");
+      return [];
+    }
     const all: OpticFixture[] = [];
     let cursor: string | null = null;
     for (let page = 0; page < 25; page++) {
@@ -223,6 +228,10 @@ export class OpticOddsProvider {
   }
 
   async fetchMatchPrices(providerMatchId: string, reversed = false): Promise<ProviderPrice[]> {
+    if (!OPTIC_ENABLED) {
+      this.warn("OpticOdds disabled (set RADAR_OPTIC_ENABLED=1 to enable)");
+      return [];
+    }
     try {
       const res = await callOptic("/fixtures/odds", {
         fixture_id: [providerMatchId],
