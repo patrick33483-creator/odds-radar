@@ -71,14 +71,21 @@ jobs:
               """
               SELECT p.match_id, p.stage, p.target_at, p.captured_at,
                      p.status, p.note, p.created_at, p.updated_at,
-                     m.home_team, m.away_team, m.league, m.kickoff_utc
+                     m.home_team, m.away_team, m.league, m.kickoff_utc,
+                     MIN(s.captured_at) AS first_snapshot_at,
+                     MAX(s.captured_at) AS last_snapshot_at,
+                     COUNT(s.id) AS snapshot_count,
+                     COUNT(DISTINCT s.provider || ':' || s.market) AS pair_count
                 FROM research_timeline_points p
                 JOIN matches m ON m.id=p.match_id
+                LEFT JOIN research_timeline_snapshots s
+                  ON s.match_id=p.match_id AND s.stage=p.stage
                WHERE p.stage IN ('T30','T15','T5')
                  AND (
                    p.created_at >= ?
                    OR p.target_at BETWEEN ? AND ?
                  )
+               GROUP BY p.match_id, p.stage
                ORDER BY p.target_at, p.match_id, p.stage
               """,
               (DEPLOYED_AT_MS, now_ms - 6 * 60 * 60 * 1000, now_ms + 30 * 60 * 60 * 1000),
@@ -88,9 +95,9 @@ jobs:
           for stage in ("T30", "T15", "T5"):
               stage_rows = [row for row in rows if row["stage"] == stage]
               due = [row for row in stage_rows if row["target_at"] <= now_ms]
-              captured = [row for row in due if row["captured_at"] is not None]
+              captured = [row for row in due if row["first_snapshot_at"] is not None]
               delays = sorted(
-                  (row["captured_at"] - row["target_at"]) / 1000
+                  (row["first_snapshot_at"] - row["target_at"]) / 1000
                   for row in captured
               )
               on_time = [delay for delay in delays if 0 <= delay <= 60]
@@ -102,7 +109,7 @@ jobs:
                   "late_over_60s": sum(delay > 60 for delay in delays),
                   "early_negative_delay": sum(delay < 0 for delay in delays),
                   "missing_after_target": sum(
-                      row["captured_at"] is None for row in due
+                      row["first_snapshot_at"] is None for row in due
                   ),
                   "median_delay_sec": (
                       delays[len(delays) // 2] if delays else None
@@ -112,9 +119,14 @@ jobs:
           emit("summary", stages=stage_stats, point_rows=len(rows))
 
           for row in rows:
-              delay_sec = (
-                  round((row["captured_at"] - row["target_at"]) / 1000, 3)
-                  if row["captured_at"] is not None and row["target_at"] is not None
+              first_delay_sec = (
+                  round((row["first_snapshot_at"] - row["target_at"]) / 1000, 3)
+                  if row["first_snapshot_at"] is not None and row["target_at"] is not None
+                  else None
+              )
+              last_delay_sec = (
+                  round((row["last_snapshot_at"] - row["target_at"]) / 1000, 3)
+                  if row["last_snapshot_at"] is not None and row["target_at"] is not None
                   else None
               )
               emit(
@@ -125,8 +137,13 @@ jobs:
                   stage=row["stage"],
                   kickoff_at=iso(row["kickoff_utc"]),
                   target_at=iso(row["target_at"]),
-                  captured_at=iso(row["captured_at"]),
-                  delay_sec=delay_sec,
+                  point_captured_at=iso(row["captured_at"]),
+                  first_snapshot_at=iso(row["first_snapshot_at"]),
+                  last_snapshot_at=iso(row["last_snapshot_at"]),
+                  first_delay_sec=first_delay_sec,
+                  last_delay_sec=last_delay_sec,
+                  snapshot_count=row["snapshot_count"],
+                  pair_count=row["pair_count"],
                   status=row["status"],
                   note=row["note"],
                   due=row["target_at"] <= now_ms,
