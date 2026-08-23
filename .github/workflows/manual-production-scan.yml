@@ -22,13 +22,25 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+          set +e
+          output="$(ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
             docker compose exec -T radar node
-          ' <<'NODE'
+          ' 2>&1 <<'NODE'
+          const fs = require("fs");
           const Database = require("better-sqlite3");
-          const path = process.env.RADAR_DB || "data.db";
+          const candidates = [
+            process.env.RADAR_DB,
+            "data.db",
+            "/app/data.db",
+            "/app/data/data.db",
+            "/data/data.db",
+          ].filter(Boolean);
+          const path = candidates.find(candidate => fs.existsSync(candidate));
+          if (!path) {
+            throw new Error(`RADAR_DB_NOT_FOUND candidates=${candidates.join(",")}`);
+          }
           const db = new Database(path, { readonly: true, fileMustExist: true });
           const now = Date.now();
           const futureCutoff = now + 24 * 60 * 60 * 1000;
@@ -98,3 +110,15 @@ jobs:
           console.log(JSON.stringify(result));
           db.close();
           NODE
+          )"
+          rc=$?
+          set -e
+          {
+            echo '## Crown odds freshness audit'
+            echo
+            echo '```json'
+            printf '%s\n' "$output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$output"
+          exit "$rc"
