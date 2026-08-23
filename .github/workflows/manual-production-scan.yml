@@ -17,7 +17,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 唯讀核對皇冠賠率新鮮度
+      - name: 唯讀核對平博與馬會賠率新鮮度
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -26,7 +26,7 @@ jobs:
           output="$(ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
-            docker compose exec -T radar node
+            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar node
           ' 2>&1 <<'NODE'
           const fs = require("fs");
           const Database = require("better-sqlite3");
@@ -38,73 +38,92 @@ jobs:
             "/data/data.db",
           ].filter(Boolean);
           const path = candidates.find(candidate => fs.existsSync(candidate));
-          if (!path) {
-            throw new Error(`RADAR_DB_NOT_FOUND candidates=${candidates.join(",")}`);
-          }
+          if (!path) throw new Error(`RADAR_DB_NOT_FOUND candidates=${candidates.join(",")}`);
           const db = new Database(path, { readonly: true, fileMustExist: true });
           const now = Date.now();
-          const futureCutoff = now + 24 * 60 * 60 * 1000;
           const rows = db.prepare(`
             SELECT
               m.id AS match_id,
               m.kickoff_utc,
-              COUNT(o.key) AS crown_rows,
-              MAX(o.fetched_at) AS latest_fetched_at,
-              MAX(o.source_updated_at) AS latest_source_updated_at
+              SUM(CASE WHEN o.provider = 'hkjc' THEN 1 ELSE 0 END) AS hkjc_rows,
+              SUM(CASE WHEN o.provider = 'pinnacle' THEN 1 ELSE 0 END) AS pinnacle_rows,
+              MAX(CASE WHEN o.provider = 'hkjc' THEN o.fetched_at END) AS hkjc_fetched_at,
+              MAX(CASE WHEN o.provider = 'pinnacle' THEN o.fetched_at END) AS pinnacle_fetched_at,
+              MAX(CASE WHEN o.provider = 'pinnacle' THEN o.source_updated_at END) AS pinnacle_source_updated_at
             FROM matches m
             LEFT JOIN odds_latest o
-              ON o.match_id = m.id AND o.provider = 'crown'
+              ON o.match_id = m.id AND o.provider IN ('hkjc', 'pinnacle')
             WHERE m.kickoff_utc > ? AND m.kickoff_utc <= ?
             GROUP BY m.id, m.kickoff_utc
             ORDER BY m.kickoff_utc, m.id
-          `).all(now, futureCutoff);
-          const ages = rows
-            .filter(r => Number.isFinite(r.latest_fetched_at))
-            .map(r => Math.max(0, (now - r.latest_fetched_at) / 1000));
-          const sorted = [...ages].sort((a, b) => a - b);
-          const percentile = p => sorted.length
-            ? sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))]
-            : null;
-          const bucket = max => ages.filter(x => x <= max).length;
+          `).all(now, now + 24 * 60 * 60 * 1000);
+          const pct = (values, p) => {
+            if (!values.length) return null;
+            const sorted = [...values].sort((a, b) => a - b);
+            return Math.round(sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))]);
+          };
+          const summarize = scoped => {
+            const paired = scoped.filter(r => r.hkjc_fetched_at && r.pinnacle_fetched_at);
+            const pAges = scoped.filter(r => r.pinnacle_fetched_at)
+              .map(r => Math.max(0, (now - r.pinnacle_fetched_at) / 1000));
+            const hAges = scoped.filter(r => r.hkjc_fetched_at)
+              .map(r => Math.max(0, (now - r.hkjc_fetched_at) / 1000));
+            const gaps = paired.map(r => Math.abs(r.pinnacle_fetched_at - r.hkjc_fetched_at) / 1000);
+            return {
+              matches: scoped.length,
+              paired: paired.length,
+              missing_hkjc: scoped.filter(r => !r.hkjc_fetched_at).length,
+              missing_pinnacle: scoped.filter(r => !r.pinnacle_fetched_at).length,
+              pinnacle_age_seconds: {
+                median: pct(pAges, 0.5),
+                p90: pct(pAges, 0.9),
+                max: pct(pAges, 1),
+                within_5m: pAges.filter(x => x <= 300).length,
+                older_than_15m: pAges.filter(x => x > 900).length,
+              },
+              hkjc_age_seconds: {
+                median: pct(hAges, 0.5),
+                p90: pct(hAges, 0.9),
+                max: pct(hAges, 1),
+                within_5m: hAges.filter(x => x <= 300).length,
+                older_than_15m: hAges.filter(x => x > 900).length,
+              },
+              paired_fetch_gap_seconds: {
+                median: pct(gaps, 0.5),
+                p90: pct(gaps, 0.9),
+                max: pct(gaps, 1),
+                within_60s: gaps.filter(x => x <= 60).length,
+                within_5m: gaps.filter(x => x <= 300).length,
+                over_15m: gaps.filter(x => x > 900).length,
+              },
+            };
+          };
           const result = {
-            schema: "radar-crown-freshness-audit-v1",
+            schema: "radar-pinnacle-hkjc-freshness-audit-v1",
             audit_only: true,
             provider_calls: 0,
             writes: 0,
             now_utc: new Date(now).toISOString(),
-            future_24h_matches: rows.length,
-            matches_with_crown_rows: rows.filter(r => r.crown_rows > 0).length,
-            matches_without_crown_rows: rows.filter(r => r.crown_rows === 0).length,
-            latest_crown_fetched_at_utc: rows.some(r => r.latest_fetched_at)
-              ? new Date(Math.max(...rows.filter(r => r.latest_fetched_at).map(r => r.latest_fetched_at))).toISOString()
-              : null,
-            fetched_age_seconds: {
-              min: sorted.length ? sorted[0] : null,
-              median: percentile(0.5),
-              p90: percentile(0.9),
-              max: sorted.length ? sorted[sorted.length - 1] : null,
+            scopes: {
+              next_30m: summarize(rows.filter(r => r.kickoff_utc <= now + 30 * 60 * 1000)),
+              next_3h: summarize(rows.filter(r => r.kickoff_utc <= now + 3 * 60 * 60 * 1000)),
+              next_24h: summarize(rows),
             },
-            freshness_counts: {
-              within_60s: bucket(60),
-              within_5m: bucket(300),
-              within_15m: bucket(900),
-              older_than_15m: ages.filter(x => x > 900).length,
-            },
-            next_3h: rows
+            next_3h_rows: rows
               .filter(r => r.kickoff_utc <= now + 3 * 60 * 60 * 1000)
               .map(r => ({
                 match_id: r.match_id,
                 kickoff_utc: new Date(r.kickoff_utc).toISOString(),
-                crown_rows: r.crown_rows,
-                latest_fetched_at_utc: r.latest_fetched_at
-                  ? new Date(r.latest_fetched_at).toISOString()
-                  : null,
-                fetched_age_seconds: r.latest_fetched_at
-                  ? Math.max(0, Math.round((now - r.latest_fetched_at) / 1000))
-                  : null,
-                latest_source_updated_at_utc: r.latest_source_updated_at
-                  ? new Date(r.latest_source_updated_at).toISOString()
-                  : null,
+                hkjc_rows: r.hkjc_rows,
+                pinnacle_rows: r.pinnacle_rows,
+                hkjc_fetched_at_utc: r.hkjc_fetched_at
+                  ? new Date(r.hkjc_fetched_at).toISOString() : null,
+                pinnacle_fetched_at_utc: r.pinnacle_fetched_at
+                  ? new Date(r.pinnacle_fetched_at).toISOString() : null,
+                pinnacle_source_updated_at_utc: r.pinnacle_source_updated_at
+                  ? new Date(r.pinnacle_source_updated_at).toISOString() : null,
+                fetch_gap_seconds: r.hkjc_fetched_at && r.pinnacle_fetched_at
+                  ? Math.round(Math.abs(r.pinnacle_fetched_at - r.hkjc_fetched_at) / 1000) : null,
               })),
           };
           console.log(JSON.stringify(result));
@@ -113,14 +132,7 @@ jobs:
           )"
           rc=$?
           set -e
-          {
-            echo '## Crown odds freshness audit'
-            echo
-            echo '```json'
-            printf '%s\n' "$output"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$output"
           single_line="$(printf '%s' "$output" | tr '\n' ' ')"
-          echo "::error title=Crown freshness audit rc=$rc::$single_line"
+          echo "::error title=Pinnacle HKJC freshness audit rc=$rc::$single_line"
           exit 1
