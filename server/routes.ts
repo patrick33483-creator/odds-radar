@@ -9,7 +9,13 @@ import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./l
 import { readCornerValidationReport, runPinnapiCornerValidation } from "./lib/corner-validation";
 import { PinnapiProvider } from "./providers/pinnapi";
 import { HkjcProvider } from "./providers/hkjc";
-import { collectResearchResults, parseResearchFilters, researchCsv, researchDataset } from "./lib/research";
+import {
+  collectResearchInitialSnapshots,
+  collectResearchResults,
+  parseResearchFilters,
+  researchCsv,
+  researchDataset,
+} from "./lib/research";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -22,6 +28,9 @@ let cornerValidationInFlight: Promise<unknown> | null = null;
 let researchResultsTimer: NodeJS.Timeout | null = null;
 let researchResultsStartupTimer: NodeJS.Timeout | null = null;
 let researchResultsInFlight: Promise<{ candidates: number; collected: number }> | null = null;
+let researchOpeningsTimer: NodeJS.Timeout | null = null;
+let researchOpeningsStartupTimer: NodeJS.Timeout | null = null;
+let researchOpeningsInFlight: Promise<Awaited<ReturnType<typeof collectResearchInitialSnapshots>>> | null = null;
 const researchHkjc = new HkjcProvider();
 
 function installResearchResultCollection(): void {
@@ -54,23 +63,58 @@ function installResearchResultCollection(): void {
   researchResultsTimer.unref();
 }
 
+/**
+ * The opening-history job is deliberately separate from window scans and
+ * betting.  It has no dependency on simulation targets and only invokes the
+ * research-only Tipsme collector.
+ */
+function installResearchOpeningCollection(): void {
+  if (process.env.RADAR_RESEARCH_OPENINGS === "0" || researchOpeningsTimer) return;
+  const configuredMinutes = Number(process.env.RADAR_RESEARCH_OPENING_INTERVAL_MINUTES ?? 30);
+  const intervalMs = Math.max(5, Math.min(24 * 60, Number.isFinite(configuredMinutes) ? configuredMinutes : 30)) * 60_000;
+  const run = async () => {
+    if (researchOpeningsInFlight) return;
+    researchOpeningsInFlight = collectResearchInitialSnapshots();
+    try {
+      const outcome = await researchOpeningsInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_openings",
+        ...outcome,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_openings_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      researchOpeningsInFlight = null;
+    }
+  };
+  researchOpeningsStartupTimer = setTimeout(() => void run(), 90_000);
+  researchOpeningsStartupTimer.unref();
+  researchOpeningsTimer = setInterval(() => void run(), intervalMs);
+  researchOpeningsTimer.unref();
+}
+
 function installAutoWindowScan(): void {
   if (!autoScanEnabled() || autoScanTimer) return;
   const tickGate = createAutoScanTickGate();
   const tick = () => {
     void tickGate.run(async () => {
       try {
-        // `runScan` records a clear TARGET_REACHED status and returns before any
-        // fixture or price request if the strict simulation cap is complete.
         if (engine.scanConfigInfo().simulationTargetReached) {
-          const outcome = await engine.runScan();
+          const outcome = await engine.runResearchTimelineTick();
           console.log(
             JSON.stringify({
               ts: new Date().toISOString(),
               scope: "radar",
-              event: "auto_window_scan",
-              result: outcome.result,
-              message: outcome.message,
+              event: "auto_research_timeline",
+              selected: outcome.selected,
+              detailCalls: outcome.detailCalls,
             }),
           );
           return;
@@ -242,6 +286,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   }
   installAutoWindowScan();
   installHourlyPrewarm();
+  installResearchOpeningCollection();
   installResearchResultCollection();
 
   app.get("/api/status", (_req, res) => {
@@ -380,7 +425,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.get("/api/research/export", (req, res) => {
-    const kind = req.query.kind === "results" ? "results" : "snapshots";
+    const kind = req.query.kind === "results" ? "results" : "timeline";
     const filters = parseResearchFilters(req.query as Record<string, unknown>);
     const date = new Date().toISOString().slice(0, 10);
     res.setHeader("Content-Type", "text/csv; charset=utf-8");

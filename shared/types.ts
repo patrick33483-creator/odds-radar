@@ -323,6 +323,38 @@ export interface ResearchResultCollectorStatus {
   lastCollected: number;
 }
 
+export type ResearchStage = "initial" | "T30" | "T15" | "T5";
+export type ResearchMarket = "AH" | "OU" | "COU";
+export type ResearchProvider = "hkjc" | "pinnacle";
+
+export interface ResearchTimelineQuote {
+  provider: ResearchProvider;
+  market: ResearchMarket;
+  stage: ResearchStage;
+  lineKey: string;
+  selection: string;
+  decimalOdds: number;
+  isMain: boolean;
+  sourceUpdatedAt: number | null;
+  capturedAt: number;
+  targetAt: number | null;
+  /** How this immutable observation was collected. */
+  origin: string;
+  sourceName: string | null;
+  sourceMatchId: string | null;
+  sourceUrl: string | null;
+}
+
+export interface ResearchStageSnapshot {
+  stage: ResearchStage;
+  status: "captured" | "partial" | "pending" | "missing";
+  targetAt: number | null;
+  capturedAt: number | null;
+  /** Includes known unavailable source/market combinations. */
+  note: string | null;
+  quotes: ResearchTimelineQuote[];
+}
+
 export interface ResearchMatchRow {
   matchId: string;
   league: string;
@@ -330,13 +362,9 @@ export interface ResearchMatchRow {
   awayTeam: string;
   kickoffUtc: number;
   snapshotCount: number;
-  providerCount: number;
-  marketCount: number;
-  providers: Provider[];
-  latestByProvider: Partial<Record<Provider, number>>;
-  markets: Market[];
-  firstSnapshotAt: number;
-  lastSnapshotAt: number;
+  firstSnapshotAt: number | null;
+  lastSnapshotAt: number | null;
+  timeline: Record<ResearchStage, ResearchStageSnapshot>;
   result: {
     homeScore: number;
     awayScore: number;
@@ -350,8 +378,8 @@ export interface ResearchDatasetResponse {
   generatedAt: number;
   filters: {
     days: number;
-    provider: Provider | "all";
-    market: Market | "all";
+    provider: ResearchProvider | "all";
+    market: ResearchMarket | "all";
   };
   summary: {
     snapshots: number;
@@ -360,8 +388,13 @@ export interface ResearchDatasetResponse {
     resultEligibleMatches: number;
     firstSnapshotAt: number | null;
     lastSnapshotAt: number | null;
-    providerCounts: Array<{ name: Provider; count: number }>;
-    marketCounts: Array<{ name: Market; count: number }>;
+    providerCounts: Array<{ name: ResearchProvider; count: number }>;
+    marketCounts: Array<{ name: ResearchMarket; count: number }>;
+    stageCoverage: Array<{
+      stage: ResearchStage;
+      capturedMatches: number;
+      totalMatches: number;
+    }>;
   };
   collector: ResearchResultCollectorStatus;
   matches: ResearchMatchRow[];

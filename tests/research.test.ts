@@ -7,18 +7,29 @@ process.env.RADAR_RESEARCH_RESULTS = "1";
 
 let rawDb: typeof import("../server/lib/store").rawDb;
 let collectResearchResults: typeof import("../server/lib/research").collectResearchResults;
+let collectResearchInitialSnapshots: typeof import("../server/lib/research").collectResearchInitialSnapshots;
+let captureResearchTimelinePrices: typeof import("../server/lib/research").captureResearchTimelinePrices;
 let parseResearchFilters: typeof import("../server/lib/research").parseResearchFilters;
+let parseTipsmeOpeningQuotes: typeof import("../server/providers/tipsme-opening").parseTipsmeOpeningQuotes;
+let researchStageFor: typeof import("../server/lib/research").researchStageFor;
 let researchCsv: typeof import("../server/lib/research").researchCsv;
 let researchDataset: typeof import("../server/lib/research").researchDataset;
+let saveResearchInitialSnapshots: typeof import("../server/lib/research").saveResearchInitialSnapshots;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
   const research = await import("../server/lib/research");
+  const tipsme = await import("../server/providers/tipsme-opening");
   rawDb = store.rawDb;
+  captureResearchTimelinePrices = research.captureResearchTimelinePrices;
+  collectResearchInitialSnapshots = research.collectResearchInitialSnapshots;
   collectResearchResults = research.collectResearchResults;
   parseResearchFilters = research.parseResearchFilters;
+  researchStageFor = research.researchStageFor;
   researchCsv = research.researchCsv;
   researchDataset = research.researchDataset;
+  saveResearchInitialSnapshots = research.saveResearchInitialSnapshots;
+  parseTipsmeOpeningQuotes = tipsme.parseTipsmeOpeningQuotes;
   store.migrate();
 });
 
@@ -33,7 +44,35 @@ afterAll(() => {
   }
 });
 
+function addMatch(id: string, kickoff: number, home = "甲隊", away = "乙隊"): void {
+  rawDb.prepare(
+    `INSERT INTO matches(
+      id,hkjc_id,league,home_team,away_team,kickoff_utc,status,inplay,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?)`,
+  ).run(id, id.replace(/\D/g, "") || id, "研究聯賽", home, away, kickoff, "PREEVENT", 0, Date.now());
+}
+
+const twoWayPrices = [
+  { market: "AH", lineValue: -0.25, isMain: true, selection: "H", decimalOdds: 1.91 },
+  { market: "AH", lineValue: -0.25, isMain: true, selection: "A", decimalOdds: 1.99 },
+  { market: "OU", lineValue: 2.5, isMain: true, selection: "O", decimalOdds: 1.92 },
+  { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 1.98 },
+  { market: "COU", lineValue: 9.5, isMain: true, selection: "O", decimalOdds: 1.93 },
+  { market: "COU", lineValue: 9.5, isMain: true, selection: "U", decimalOdds: 1.97 },
+] as const;
+
 describe("research data collection", () => {
+  it("assigns the first post-target observation to each research checkpoint", () => {
+    const kickoff = 1_000_000_000;
+    expect(researchStageFor(kickoff, kickoff - 30 * 60_000)).toBe("T30");
+    expect(researchStageFor(kickoff, kickoff - 20 * 60_000)).toBe("T30");
+    expect(researchStageFor(kickoff, kickoff - 15 * 60_000)).toBe("T15");
+    expect(researchStageFor(kickoff, kickoff - 10 * 60_000)).toBe("T15");
+    expect(researchStageFor(kickoff, kickoff - 5 * 60_000)).toBe("T5");
+    expect(researchStageFor(kickoff, kickoff - 60_000)).toBe("T5");
+    expect(researchStageFor(kickoff, kickoff)).toBeNull();
+  });
+
   it("bounds lookback and accepts only supported provider and market filters", () => {
     expect(parseResearchFilters({ days: "999", provider: "pinnacle", market: "OU" })).toEqual({
       days: 120,
@@ -47,34 +86,33 @@ describe("research data collection", () => {
     });
   });
 
+  it("never treats the first live observation as an initial opening", () => {
+    const now = Date.now();
+    const kickoff = now + 25 * 60_000;
+    addMatch("no-first-seen-initial", kickoff);
+    captureResearchTimelinePrices("no-first-seen-initial", "hkjc", twoWayPrices as never, kickoff, now);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=? AND stage='initial'",
+    ).get("no-first-seen-initial")).toEqual({ count: 0 });
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=? AND stage='T30'",
+    ).get("no-first-seen-initial")).toEqual({ count: 6 });
+  });
+
   it("stores official results in the isolated research table without touching settlement results", async () => {
     const now = Date.now();
-    rawDb
-      .prepare(
-        `INSERT INTO matches(
-          id,hkjc_id,league,home_team,away_team,kickoff_utc,status,inplay,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?)`,
-      )
-      .run("research-only", "123", "測試聯賽", "主隊", "客隊", now - 2 * 60 * 60_000, "MATCHENDED", 0, now);
-    rawDb
-      .prepare(
-        `INSERT INTO odds_snapshots(
-          match_id,provider,market,line_key,selection,decimal_odds,source_updated_at,fetched_at,phase
-        ) VALUES(?,?,?,?,?,?,?,?,?)`,
-      )
-      .run("research-only", "hkjc", "OU", "2.50", "O", 1.91, now - 60_000, now - 60_000, "prematch");
+    addMatch("research-only", now - 2 * 60 * 60_000, "主隊", "客隊");
+    rawDb.prepare("UPDATE matches SET hkjc_id='123' WHERE id='research-only'").run();
 
     const provider = {
-      fetchHistoricResults: async () => [
-        {
-          matchId: "123",
-          homeScore: 2,
-          awayScore: 1,
-          cornersTotal: 9,
-          sequence: 1,
-          source: "hkjc_official",
-        },
-      ],
+      fetchHistoricResults: async () => [{
+        matchId: "123",
+        homeScore: 2,
+        awayScore: 1,
+        cornersTotal: 9,
+        sequence: 1,
+        source: "hkjc_official",
+      }],
     };
     await expect(collectResearchResults(provider as never, now)).resolves.toEqual({
       candidates: 1,
@@ -82,22 +120,147 @@ describe("research data collection", () => {
     });
 
     expect(rawDb.prepare("SELECT COUNT(*) count FROM results").get()).toEqual({ count: 0 });
-    expect(
-      rawDb
-        .prepare("SELECT match_id,home_score,away_score,corners_total FROM research_results")
-        .get(),
-    ).toEqual({ match_id: "research-only", home_score: 2, away_score: 1, corners_total: 9 });
-
+    expect(rawDb.prepare("SELECT match_id,home_score,away_score,corners_total FROM research_results").get()).toEqual({
+      match_id: "research-only", home_score: 2, away_score: 1, corners_total: 9,
+    });
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id='research-only'",
+    ).get()).toEqual({ count: 0 });
     const dataset = researchDataset({ days: 7, provider: "all", market: "all" });
     expect(dataset.summary.completedResults).toBe(1);
-    expect(dataset.matches[0].result).toMatchObject({
-      homeScore: 2,
-      awayScore: 1,
-      cornersTotal: 9,
-      source: "hkjc_official",
+    expect(dataset.matches.find((match) => match.matchId === "research-only")?.result).toMatchObject({
+      homeScore: 2, awayScore: 1, cornersTotal: 9, source: "hkjc_official",
+    });
+    expect(dataset.matches.find((match) => match.matchId === "research-only")).toMatchObject({
+      snapshotCount: 0,
+      firstSnapshotAt: null,
+      lastSnapshotAt: null,
     });
     expect(researchCsv("results", { days: 7, provider: "all", market: "all" })).toContain(
-      "research-only,123,測試聯賽,主隊,客隊",
+      "research-only,123,研究聯賽,主隊,客隊",
     );
+  });
+
+  it("locks a complete checkpoint and does not overwrite it on later scans", () => {
+    const now = Date.now();
+    const kickoff = now + 30 * 60_000;
+    addMatch("timeline-lock", kickoff);
+    captureResearchTimelinePrices("timeline-lock", "hkjc", twoWayPrices as never, kickoff, now);
+    expect(rawDb.prepare(
+      "SELECT status FROM research_timeline_points WHERE match_id=? AND stage='T30'",
+    ).get("timeline-lock")).toEqual({ status: "partial" });
+    captureResearchTimelinePrices("timeline-lock", "pinnacle", twoWayPrices as never, kickoff, now + 1_000);
+    expect(rawDb.prepare(
+      "SELECT status FROM research_timeline_points WHERE match_id=? AND stage='T30'",
+    ).get("timeline-lock")).toEqual({ status: "captured" });
+
+    const changed = twoWayPrices.map((price) => ({ ...price, decimalOdds: 2.5 }));
+    captureResearchTimelinePrices("timeline-lock", "hkjc", changed as never, kickoff, now + 2_000);
+    expect(rawDb.prepare(
+      `SELECT decimal_odds FROM research_timeline_snapshots
+        WHERE match_id=? AND stage='T30' AND provider='hkjc'
+          AND market='AH' AND selection='H'`,
+    ).get("timeline-lock")).toEqual({ decimal_odds: 1.91 });
+  });
+
+  it("parses HKJC first records and converts Pinnacle Hong Kong water to decimal", () => {
+    const parsed = parseTipsmeOpeningQuotes("tipsme-1", {
+      hdpOdds: [
+        { home_cap: "[+0/+0.5]", home_win_odds: 1.91, away_win_odds: 1.99, create_time: "2026-08-20T10:00:00Z" },
+        { home_cap: "[+0/+0.5]", home_win_odds: 2.1, away_win_odds: 1.8, create_time: "2026-08-20T11:00:00Z" },
+      ],
+      hiloOdds: [{ number_of_goals: "[2.5]", big_odds: "1.80", small_odds: "2.00", create_time: "2026-08-20T10:00:00Z" }],
+      chiloOdds: [{ number_of_corners: "[9.5]", big_odds: "1.90", small_odds: "1.90", create_time: "2026-08-20T10:00:00Z" }],
+    }, {
+      hdpDetails: [{ companyName: "平*", hdpBeginCap: "半/一", hdpBeginHomeOdds: "0.77", hdpBeginAwayOdds: "1.07" }],
+      hiloDetails: [{ companyName: "平*", hiloBeginCap: "2.5/3", hiloBeginBigOdds: "0.81", hiloBeginSmallOdds: "1.00" }],
+    });
+    expect(parsed.quotes.find((quote) => quote.provider === "hkjc" && quote.market === "AH" && quote.selection === "H"))
+      .toMatchObject({ lineValue: 0.25, decimalOdds: 1.91, sourceUpdatedAt: Date.parse("2026-08-20T10:00:00Z") });
+    expect(parsed.quotes.find((quote) => quote.provider === "pinnacle" && quote.market === "AH" && quote.selection === "H"))
+      .toMatchObject({ lineValue: -0.75, decimalOdds: 1.77, sourceUpdatedAt: null });
+    expect(parsed.quotes.find((quote) => quote.provider === "pinnacle" && quote.market === "OU" && quote.selection === "O"))
+      .toMatchObject({ lineValue: 2.75, decimalOdds: 1.81 });
+  });
+
+  it("keeps external initial rows immutable and records the missing Pinnacle COU source", () => {
+    const now = Date.now();
+    addMatch("external-initial-lock", now + 3 * 60 * 60_000);
+    const source = (decimalOdds: number) => ({
+      quotes: [{
+        provider: "hkjc" as const,
+        market: "AH" as const,
+        lineValue: 0.25,
+        isMain: false,
+        selection: "H" as const,
+        decimalOdds,
+        sourceUpdatedAt: now - 1000,
+        origin: "external_opening" as const,
+        sourceName: "tipsme" as const,
+        sourceMatchId: "source-99",
+        sourceUrl: "https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/source-99",
+      }],
+      missing: [{ provider: "pinnacle" as const, market: "COU" as const, note: "Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source." }],
+    });
+    expect(saveResearchInitialSnapshots("external-initial-lock", source(1.91), now)).toBe(1);
+    expect(saveResearchInitialSnapshots("external-initial-lock", source(2.4), now + 1_000)).toBe(0);
+    expect(rawDb.prepare(
+      `SELECT decimal_odds,origin,source_name,source_match_id,source_url
+         FROM research_timeline_snapshots WHERE match_id=? AND stage='initial'`,
+    ).get("external-initial-lock")).toEqual({
+      decimal_odds: 1.91,
+      origin: "external_opening",
+      source_name: "tipsme",
+      source_match_id: "source-99",
+      source_url: "https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/source-99",
+    });
+    expect(rawDb.prepare(
+      "SELECT note FROM research_timeline_points WHERE match_id=? AND stage='initial'",
+    ).get("external-initial-lock")).toEqual({
+      note: "Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source.",
+    });
+    expect(
+      researchDataset({ days: 7, provider: "all", market: "all" })
+        .matches.find((match) => match.matchId === "external-initial-lock")?.timeline.initial.note,
+    ).toBe("Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source.");
+    expect(researchCsv("timeline", { days: 7, provider: "all", market: "all" })).toContain("source_match_id");
+  });
+
+  it("matches public schedules and cannot write simulation or live snapshot tables", async () => {
+    const now = Date.now();
+    const kickoff = now + 90 * 60_000;
+    addMatch("opening-isolated-7", kickoff, "主隊", "客隊");
+    const beforeBets = rawDb.prepare("SELECT COUNT(*) count FROM simulation_bets").get() as { count: number };
+    const beforeLive = rawDb.prepare("SELECT COUNT(*) count FROM odds_snapshots").get() as { count: number };
+    const outcome = await collectResearchInitialSnapshots({
+      fetchSchedule: async () => [{
+        sourceMatchId: "tipsme-7",
+        league: "研究聯賽",
+        homeTeam: "主隊",
+        awayTeam: "客隊",
+        kickoffUtc: kickoff + 2 * 60_000,
+      }],
+      fetchOpening: async () => ({
+        quotes: [
+          {
+            provider: "hkjc" as const, market: "AH" as const, lineValue: 0.25, isMain: false,
+            selection: "H" as const, decimalOdds: 1.91, sourceUpdatedAt: now - 10_000,
+            origin: "external_opening" as const, sourceName: "tipsme" as const,
+            sourceMatchId: "tipsme-7", sourceUrl: "https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/tipsme-7",
+          },
+          {
+            provider: "hkjc" as const, market: "AH" as const, lineValue: 0.25, isMain: false,
+            selection: "A" as const, decimalOdds: 1.99, sourceUpdatedAt: now - 10_000,
+            origin: "external_opening" as const, sourceName: "tipsme" as const,
+            sourceMatchId: "tipsme-7", sourceUrl: "https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/tipsme-7",
+          },
+        ],
+        missing: [{ provider: "pinnacle" as const, market: "COU" as const, note: "Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source." }],
+      }),
+    }, now);
+    expect(outcome).toMatchObject({ matched: 1, fetched: 1, inserted: 2 });
+    expect(outcome.candidates).toBeGreaterThanOrEqual(1);
+    expect(rawDb.prepare("SELECT COUNT(*) count FROM simulation_bets").get()).toEqual(beforeBets);
+    expect(rawDb.prepare("SELECT COUNT(*) count FROM odds_snapshots").get()).toEqual(beforeLive);
   });
 });
