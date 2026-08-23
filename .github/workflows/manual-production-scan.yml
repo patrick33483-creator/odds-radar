@@ -20,7 +20,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 只讀重建目前可顯示 EV
+      - name: 只讀核對全部歷史 EV 注單賠率同步
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -42,154 +42,121 @@ jobs:
           const dbPath = paths.find(path => fs.existsSync(path));
           if (!dbPath) throw new Error(`RADAR_DB_NOT_FOUND candidates=${paths.join(",")}`);
           const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-          const now = Date.now();
-          const STALE_MS = 90_000;
-          const MAX_QUOTE_SKEW_MS = 30_000;
-          const EV_THRESHOLD = 0.03;
-          const OUTLIER_RATIO = 0.35;
-          const MIN_MAPPING_CONFIDENCE = 0.8;
-          const selectionSet = market =>
+          const MAX_AGE_MS = 90_000;
+          const MAX_SKEW_MS = 30_000;
+          const selectionsFor = market =>
             market === "1X2" ? ["H", "D", "A"] :
             market === "AH" ? ["H", "A"] : ["O", "U"];
-          const rows = db.prepare(`
-            SELECT
-              m.id AS match_id,
-              m.kickoff_utc,
-              m.league,
-              m.home_team,
-              m.away_team,
-              ml.market,
-              ml.line_key,
-              COALESCE(mm.confidence, 0) AS mapping_confidence,
-              o.provider,
-              o.selection,
-              o.decimal_odds,
-              o.fetched_at,
-              o.source_updated_at
-            FROM matches m
-            JOIN market_lines ml ON ml.match_id = m.id
-            LEFT JOIN match_mapping mm ON mm.match_id = m.id
-            LEFT JOIN odds_latest o
-              ON o.match_id = m.id
-             AND o.market = ml.market
-             AND o.line_key = ml.line_key
-             AND o.provider IN ('hkjc', 'pinnacle')
-            WHERE m.kickoff_utc > ?
-              AND m.kickoff_utc <= ?
-            ORDER BY m.kickoff_utc, m.id, ml.market, ml.line_key, o.provider, o.selection
-          `).all(now, now + 24 * 60 * 60 * 1000);
-          const groups = new Map();
-          for (const row of rows) {
-            const key = [row.match_id, row.market, row.line_key].join("|");
-            if (!groups.has(key)) groups.set(key, {
-              match_id: row.match_id,
-              kickoff_utc: row.kickoff_utc,
-              league: row.league,
-              home_team: row.home_team,
-              away_team: row.away_team,
-              market: row.market,
-              line_key: row.line_key,
-              mapping_confidence: row.mapping_confidence,
-              quotes: [],
-            });
-            if (row.provider) groups.get(key).quotes.push(row);
-          }
-          const candidates = [];
-          const rejected = {
-            incomplete_pinnacle: 0,
-            stale_pinnacle: 0,
-            no_hkjc_quote: 0,
-            stale_hkjc: 0,
-            quote_skew: 0,
-            below_ev_threshold: 0,
-          };
-          for (const group of groups.values()) {
-            const selections = selectionSet(group.market);
-            const pin = selections.map(selection =>
-              group.quotes.find(q => q.provider === "pinnacle" && q.selection === selection)
+          const bets = db.prepare(`
+            SELECT b.*, l.provider AS leg_provider, l.decimal_odds AS leg_odds
+            FROM simulation_bets b
+            LEFT JOIN simulation_legs l
+              ON l.bet_id = b.id
+             AND l.provider = 'hkjc'
+             AND l.market = b.market
+             AND l.line_key = b.line_key
+             AND l.selection = b.selection
+            WHERE b.category = 'case2_ev'
+            ORDER BY b.placed_at, b.id
+          `).all();
+          const latestSnapshot = db.prepare(`
+            SELECT decimal_odds, fetched_at, source_updated_at
+            FROM odds_snapshots
+            WHERE match_id = ?
+              AND provider = ?
+              AND market = ?
+              AND line_key = ?
+              AND selection = ?
+              AND fetched_at <= ?
+            ORDER BY fetched_at DESC, id DESC
+            LIMIT 1
+          `);
+          const results = [];
+          for (const bet of bets) {
+            const selections = selectionsFor(bet.market);
+            const hkjc = latestSnapshot.get(
+              bet.match_id, "hkjc", bet.market, bet.line_key, bet.selection, bet.placed_at
             );
-            if (pin.some(q => !q)) {
-              rejected.incomplete_pinnacle += 1;
-              continue;
+            const pinnacle = selections.map(selection => ({
+              selection,
+              row: latestSnapshot.get(
+                bet.match_id, "pinnacle", bet.market, bet.line_key, selection, bet.placed_at
+              ),
+            }));
+            const missing = [];
+            if (!hkjc) missing.push("hkjc_execution_quote");
+            for (const item of pinnacle) {
+              if (!item.row) missing.push(`pinnacle_${item.selection}`);
             }
-            if (pin.some(q => now - q.fetched_at > STALE_MS)) {
-              rejected.stale_pinnacle += 1;
-              continue;
+            let maxAgeMs = null;
+            let skewMs = null;
+            let recomputedEv = null;
+            let synchronized = false;
+            if (!missing.length) {
+              const timestamps = [hkjc.fetched_at, ...pinnacle.map(item => item.row.fetched_at)];
+              const ages = timestamps.map(timestamp => bet.placed_at - timestamp);
+              maxAgeMs = Math.max(...ages);
+              skewMs = Math.max(...timestamps) - Math.min(...timestamps);
+              const inverse = pinnacle.map(item => 1 / item.row.decimal_odds);
+              const total = inverse.reduce((a, b) => a + b, 0);
+              const index = selections.indexOf(bet.selection);
+              const probability = inverse[index] / total;
+              recomputedEv = probability * hkjc.decimal_odds - 1;
+              synchronized =
+                ages.every(age => age >= 0 && age <= MAX_AGE_MS)
+                && skewMs <= MAX_SKEW_MS;
             }
-            const raw = pin.map(q => 1 / q.decimal_odds);
-            const total = raw.reduce((a, b) => a + b, 0);
-            if (!(total > 0)) continue;
-            const fair = new Map(selections.map((selection, index) => [selection, raw[index] / total]));
-            const hk = selections
-              .map(selection => group.quotes.find(q => q.provider === "hkjc" && q.selection === selection))
-              .filter(Boolean);
-            if (!hk.length) {
-              rejected.no_hkjc_quote += 1;
-              continue;
-            }
-            for (const quote of hk) {
-              if (now - quote.fetched_at > STALE_MS) {
-                rejected.stale_hkjc += 1;
-                continue;
-              }
-              const times = [...pin.map(q => q.fetched_at), quote.fetched_at];
-              const skew = Math.max(...times) - Math.min(...times);
-              if (skew > MAX_QUOTE_SKEW_MS) {
-                rejected.quote_skew += 1;
-                continue;
-              }
-              const probability = fair.get(quote.selection);
-              const edge = probability * quote.decimal_odds - 1;
-              if (edge < EV_THRESHOLD) {
-                rejected.below_ev_threshold += 1;
-                continue;
-              }
-              const fairOdds = 1 / probability;
-              const flags = [];
-              if (quote.decimal_odds / fairOdds - 1 > OUTLIER_RATIO) flags.push("outlier");
-              if (group.mapping_confidence < MIN_MAPPING_CONFIDENCE) flags.push("low_confidence");
-              candidates.push({
-                match_id: group.match_id,
-                kickoff_utc: new Date(group.kickoff_utc).toISOString(),
-                league: group.league,
-                match: `${group.home_team} vs ${group.away_team}`,
-                market: group.market,
-                line_key: group.line_key,
-                selection: quote.selection,
-                edge: Math.round(edge * 1e6) / 1e6,
-                hkjc_odds: quote.decimal_odds,
-                fair_odds: Math.round(fairOdds * 1000) / 1000,
-                hkjc_age_seconds: Math.round((now - quote.fetched_at) / 1000),
-                pinnacle_age_seconds: Math.round((now - Math.max(...pin.map(q => q.fetched_at))) / 1000),
-                quote_skew_seconds: Math.round(skew / 1000),
-                flags,
-                synchronized: true,
-              });
-            }
+            results.push({
+              bet_id: bet.id,
+              match_id: bet.match_id,
+              match: bet.match_label,
+              league: bet.league,
+              kickoff_utc: new Date(bet.kickoff_utc).toISOString(),
+              placed_at_utc: new Date(bet.placed_at).toISOString(),
+              market: bet.market,
+              line_key: bet.line_key,
+              selection: bet.selection,
+              stored_hkjc_odds: bet.leg_odds,
+              stored_ev: bet.ev_pct,
+              evidence_hkjc_odds: hkjc?.decimal_odds ?? null,
+              evidence_pinnacle_odds: Object.fromEntries(
+                pinnacle.map(item => [item.selection, item.row?.decimal_odds ?? null])
+              ),
+              max_quote_age_seconds: maxAgeMs === null ? null : Math.round(maxAgeMs / 1000),
+              quote_skew_seconds: skewMs === null ? null : Math.round(skewMs / 1000),
+              recomputed_ev: recomputedEv === null
+                ? null : Math.round(recomputedEv * 1e6) / 1e6,
+              ev_difference: recomputedEv === null || bet.ev_pct === null
+                ? null : Math.round((recomputedEv - bet.ev_pct) * 1e6) / 1e6,
+              missing,
+              synchronized,
+            });
           }
+          const complete = results.filter(row => row.missing.length === 0);
+          const synchronized = complete.filter(row => row.synchronized);
           const result = {
-            schema: "radar-dashboard-ev-sync-audit-v1",
+            schema: "radar-historical-ev-sync-audit-v1",
             audit_only: true,
             provider_calls: 0,
             writes: 0,
-            now_utc: new Date(now).toISOString(),
+            now_utc: new Date().toISOString(),
             thresholds: {
-              max_quote_age_seconds: STALE_MS / 1000,
-              max_quote_skew_seconds: MAX_QUOTE_SKEW_MS / 1000,
-              minimum_ev: EV_THRESHOLD,
+              max_quote_age_seconds: MAX_AGE_MS / 1000,
+              max_quote_skew_seconds: MAX_SKEW_MS / 1000,
             },
-            future_lines_checked: groups.size,
-            display_eligible_ev_count: candidates.length,
-            safe_ev_count: candidates.filter(row => row.flags.length === 0).length,
-            all_display_eligible_ev_synchronized: candidates.every(row => row.synchronized),
-            max_observed_quote_skew_seconds: candidates.length
-              ? Math.max(...candidates.map(row => row.quote_skew_seconds)) : null,
-            max_observed_hkjc_age_seconds: candidates.length
-              ? Math.max(...candidates.map(row => row.hkjc_age_seconds)) : null,
-            max_observed_pinnacle_age_seconds: candidates.length
-              ? Math.max(...candidates.map(row => row.pinnacle_age_seconds)) : null,
-            rejected,
-            candidates,
+            total_historical_ev_bets: results.length,
+            complete_quote_evidence: complete.length,
+            missing_quote_evidence: results.length - complete.length,
+            synchronized_bets: synchronized.length,
+            unsynchronized_bets: complete.length - synchronized.length,
+            all_complete_bets_synchronized: complete.every(row => row.synchronized),
+            max_quote_age_seconds: synchronized.length
+              ? Math.max(...synchronized.map(row => row.max_quote_age_seconds)) : null,
+            max_quote_skew_seconds: synchronized.length
+              ? Math.max(...synchronized.map(row => row.quote_skew_seconds)) : null,
+            evidence_missing_rows: results.filter(row => row.missing.length > 0),
+            unsynchronized_rows: complete.filter(row => !row.synchronized),
+            synchronized_rows: synchronized,
           };
           console.log(JSON.stringify(result));
           db.close();
