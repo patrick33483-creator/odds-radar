@@ -101,7 +101,7 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 * **模擬與結算**：每個 `類別|賽事|盤口|選項` 只落一次；比分由 titan007 完場頁取得（中性比分資料，不涉賠率），支援全中／半中／走盤／半輸／輸。
 * **去重**（`server/lib/dedupe.ts`）：機會狀態以合併方式更新，窄視窗掃描永不覆蓋整體狀態，`firstSeen` 保留 7 天。
 * **介面**：繁體中文儀表板、深／淺色主題、冷啟動與降級橫幅、市場分頁、聯賽／時間／搜尋篩選、同盤路與只看機會開關、模擬投注紀錄頁，以及研究數據頁。
-* **研究時間線**：以獨立資料表鎖定馬會 × Pinnacle 的初盤、T-30、T-15、T-5，涵蓋亞洲讓球、入球大細及角球大細；每筆保留來源時間與收集時間，完整及部分樣本分開標示。隔離收集器另行補上 HKJC 官方比分及角球結果，不會改動模擬結算、Wilson、Telegram 或落注流程。
+* **研究數據**：所有賠率快照繼續按既有掃描節奏自動留存；隔離收集器每小時把已開賽場次的 HKJC 官方賽果及角球數寫入獨立 `research_results` 表，不會改動模擬結算資料。研究頁可按日數、供應商、市場及關鍵字篩選，並匯出快照或賽果 CSV。
 
 ---
 
@@ -119,8 +119,8 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 | `POST` | `/api/simulations/clear` | 清除（分類或全部） |
 | `GET` | `/api/opportunities` | 機會去重狀態 |
 | `GET` | `/api/history` | 單一盤路的賠率快照歷史 |
-| `GET` | `/api/research` | 四階段研究時間線、完整度、來源時間及最終賽果 |
-| `GET` | `/api/research/export?kind=timeline` | 按研究頁篩選條件匯出時間線 CSV；`kind=results` 匯出賽果 |
+| `GET` | `/api/research` | 研究數據摘要、收集器健康狀態、賽事及賽果覆蓋率 |
+| `GET` | `/api/research/export?kind=snapshots` | 按研究頁篩選條件匯出賠率快照 CSV；`kind=results` 匯出賽果 |
 | `GET`/`POST` | `/api/backups` | 列出／建立 SQLite 備份 |
 
 ---

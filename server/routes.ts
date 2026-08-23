@@ -9,13 +9,7 @@ import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./l
 import { readCornerValidationReport, runPinnapiCornerValidation } from "./lib/corner-validation";
 import { PinnapiProvider } from "./providers/pinnapi";
 import { HkjcProvider } from "./providers/hkjc";
-import {
-  backfillResearchInitialSnapshots,
-  collectResearchResults,
-  parseResearchFilters,
-  researchCsv,
-  researchDataset,
-} from "./lib/research";
+import { collectResearchResults, parseResearchFilters, researchCsv, researchDataset } from "./lib/research";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -66,15 +60,17 @@ function installAutoWindowScan(): void {
   const tick = () => {
     void tickGate.run(async () => {
       try {
+        // `runScan` records a clear TARGET_REACHED status and returns before any
+        // fixture or price request if the strict simulation cap is complete.
         if (engine.scanConfigInfo().simulationTargetReached) {
-          const outcome = await engine.runResearchTimelineTick();
+          const outcome = await engine.runScan();
           console.log(
             JSON.stringify({
               ts: new Date().toISOString(),
               scope: "radar",
-              event: "auto_research_timeline",
-              selected: outcome.selected,
-              detailCalls: outcome.detailCalls,
+              event: "auto_window_scan",
+              result: outcome.result,
+              message: outcome.message,
             }),
           );
           return;
@@ -244,15 +240,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   if (process.env.RADAR_BOOTSTRAP !== "0") {
     void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
   }
-  const initialRows = backfillResearchInitialSnapshots();
-  if (initialRows) {
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      scope: "radar",
-      event: "research_initial_backfill",
-      rows: initialRows,
-    }));
-  }
   installAutoWindowScan();
   installHourlyPrewarm();
   installResearchResultCollection();
@@ -393,7 +380,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.get("/api/research/export", (req, res) => {
-    const kind = req.query.kind === "results" ? "results" : "timeline";
+    const kind = req.query.kind === "results" ? "results" : "snapshots";
     const filters = parseResearchFilters(req.query as Record<string, unknown>);
     const date = new Date().toISOString().slice(0, 10);
     res.setHeader("Content-Type", "text/csv; charset=utf-8");

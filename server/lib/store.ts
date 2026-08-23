@@ -116,27 +116,6 @@ CREATE TABLE IF NOT EXISTS research_results (
   source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS research_results_fetched_idx ON research_results(fetched_at);
 
-CREATE TABLE IF NOT EXISTS research_timeline_points (
-  match_id TEXT NOT NULL, stage TEXT NOT NULL, target_at INTEGER,
-  captured_at INTEGER, status TEXT NOT NULL DEFAULT 'pending', note TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-  PRIMARY KEY(match_id,stage));
-CREATE INDEX IF NOT EXISTS research_timeline_due_idx
-  ON research_timeline_points(status,target_at);
-
-CREATE TABLE IF NOT EXISTS research_timeline_snapshots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT NOT NULL,
-  provider TEXT NOT NULL, market TEXT NOT NULL, stage TEXT NOT NULL,
-  line_key TEXT NOT NULL, selection TEXT NOT NULL, decimal_odds REAL NOT NULL,
-  is_main INTEGER NOT NULL DEFAULT 0, source_updated_at INTEGER,
-  captured_at INTEGER NOT NULL, target_at INTEGER, status TEXT NOT NULL DEFAULT 'captured');
-CREATE UNIQUE INDEX IF NOT EXISTS research_timeline_uniq
-  ON research_timeline_snapshots(match_id,provider,market,stage,line_key,selection);
-CREATE INDEX IF NOT EXISTS research_timeline_match_idx
-  ON research_timeline_snapshots(match_id,stage,provider,market);
-CREATE INDEX IF NOT EXISTS research_timeline_captured_idx
-  ON research_timeline_snapshots(captured_at);
-
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,
@@ -215,18 +194,11 @@ export function setState(key: string, value: string): void {
 }
 
 export function pruneSnapshots(now = Date.now()): number {
-  const cutoff = now - SNAPSHOT_RETENTION_MS;
   const res = db
     .delete(oddsSnapshots)
-    .where(lt(oddsSnapshots.fetchedAt, cutoff))
+    .where(lt(oddsSnapshots.fetchedAt, now - SNAPSHOT_RETENTION_MS))
     .run();
-  const timeline = rawDb
-    .prepare("DELETE FROM research_timeline_snapshots WHERE captured_at<?")
-    .run(cutoff);
-  rawDb
-    .prepare("DELETE FROM research_timeline_points WHERE match_id NOT IN (SELECT DISTINCT match_id FROM research_timeline_snapshots)")
-    .run();
-  return res.changes + timeline.changes;
+  return res.changes;
 }
 
 export function countSnapshots(): number {

@@ -91,56 +91,6 @@ export const oddsLatest = sqliteTable(
   }),
 );
 
-/** Immutable research checkpoints and their copied pre-match price rows. */
-export const researchTimelinePoints = sqliteTable(
-  "research_timeline_points",
-  {
-    matchId: text("match_id").notNull(),
-    stage: text("stage").notNull(), // initial | T30 | T15 | T5
-    targetAt: integer("target_at"),
-    capturedAt: integer("captured_at"),
-    status: text("status").notNull().default("pending"), // pending | partial | captured
-    note: text("note"),
-    createdAt: integer("created_at").notNull(),
-    updatedAt: integer("updated_at").notNull(),
-  },
-  (t) => ({
-    uniq: uniqueIndex("research_timeline_points_uniq").on(t.matchId, t.stage),
-    due: index("research_timeline_due_idx").on(t.status, t.targetAt),
-  }),
-);
-
-export const researchTimelineSnapshots = sqliteTable(
-  "research_timeline_snapshots",
-  {
-    id: integer("id").primaryKey({ autoIncrement: true }),
-    matchId: text("match_id").notNull(),
-    provider: text("provider").notNull(), // hkjc | pinnacle
-    market: text("market").notNull(), // AH | OU | COU
-    stage: text("stage").notNull(),
-    lineKey: text("line_key").notNull(),
-    selection: text("selection").notNull(),
-    decimalOdds: real("decimal_odds").notNull(),
-    isMain: integer("is_main").notNull().default(0),
-    sourceUpdatedAt: integer("source_updated_at"),
-    capturedAt: integer("captured_at").notNull(),
-    targetAt: integer("target_at"),
-    status: text("status").notNull().default("captured"),
-  },
-  (t) => ({
-    uniq: uniqueIndex("research_timeline_uniq").on(
-      t.matchId,
-      t.provider,
-      t.market,
-      t.stage,
-      t.lineKey,
-      t.selection,
-    ),
-    match: index("research_timeline_match_idx").on(t.matchId, t.stage, t.provider, t.market),
-    captured: index("research_timeline_captured_idx").on(t.capturedAt),
-  }),
-);
-
 /** Team name aliases across providers (learned + seeded). */
 export const teamAliases = sqliteTable(
   "team_aliases",

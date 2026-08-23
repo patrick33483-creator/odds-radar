@@ -42,7 +42,6 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifySimulationBets } from "./telegram";
-import { captureResearchTimelinePrices } from "./research";
 import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
@@ -404,7 +403,7 @@ export class RadarEngine {
           // inserting the currently tradable set, otherwise odds_latest can
           // keep an unexecutable old line alive until its local TTL expires.
           clearLatest.run(id);
-          this.persistPrices(id, "hkjc", ev.prices, now, ev.kickoffUtc);
+          this.persistPrices(id, "hkjc", ev.prices, now);
         }
       });
       tx();
@@ -789,7 +788,7 @@ export class RadarEngine {
         if (prices.length) {
           rows++;
           rawDb.prepare("DELETE FROM odds_latest WHERE match_id=? AND provider='pinnacle'").run(m.id);
-          this.persistPrices(m.id, "pinnacle", prices, Date.now(), m.kickoffUtc);
+          this.persistPrices(m.id, "pinnacle", prices, Date.now());
         }
 
         if (!DEMO && source?.titan_id) {
@@ -1147,30 +1146,7 @@ export class RadarEngine {
     return selectWindowEvents(this.scanCandidates(), Date.now(), cfg);
   }
 
-  /** Read-only research pass used after the simulation target has been reached. */
-  async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
-    const candidates = await this.loadScanCandidates();
-    const events = selectWindowEvents(candidates, Date.now(), scanConfig());
-    if (!events.length) return { selected: 0, detailCalls: 0 };
-    const result = await this.pollPinnacleDetail(
-      events.map((event) => ({
-        id: event.matchId,
-        pinnacleMatchId: event.pinnacleMatchId,
-        kickoffUtc: event.kickoffUtc,
-      })),
-      Date.now() + MAX_LOOP_MS,
-      true,
-    );
-    return { selected: events.length, detailCalls: result.fetched };
-  }
-
-  private persistPrices(
-    matchId: string,
-    provider: "hkjc" | "pinnacle" | "crown",
-    prices: ProviderPrice[],
-    now: number,
-    kickoffUtc?: number,
-  ): void {
+  private persistPrices(matchId: string, provider: "hkjc" | "pinnacle" | "crown", prices: ProviderPrice[], now: number): void {
     const insertSnap = rawDb.prepare(
       "INSERT INTO odds_snapshots(match_id,provider,market,line_key,selection,decimal_odds,source_updated_at,fetched_at,phase) VALUES(?,?,?,?,?,?,?,?,'prematch')",
     );
@@ -1193,9 +1169,6 @@ export class RadarEngine {
         insertSnap.run(matchId, provider, p.market, lineKey, p.selection, p.decimalOdds, p.sourceUpdatedAt ?? null, now);
       }
       upsertLatest.run(key, matchId, provider, p.market, lineKey, p.selection, p.decimalOdds, prev, p.sourceUpdatedAt ?? null, now);
-    }
-    if (kickoffUtc !== undefined) {
-      captureResearchTimelinePrices(matchId, provider, prices, kickoffUtc, now);
     }
   }
 
