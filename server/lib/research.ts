@@ -92,12 +92,12 @@ export function captureResearchTimelinePrices(
   );
   const ensurePoint = rawDb.prepare(
     `INSERT INTO research_timeline_points(
-      match_id,stage,target_at,captured_at,status,note,created_at,updated_at
-    ) VALUES(?,?,?,NULL,'pending',NULL,?,?)
+      match_id,stage,target_at,first_captured_at,last_retry_at,captured_at,status,note,created_at,updated_at
+    ) VALUES(?,?,?,NULL,NULL,NULL,'pending',NULL,?,?)
     ON CONFLICT(match_id,stage) DO NOTHING`,
   );
   const pointStatus = rawDb.prepare(
-    "SELECT status FROM research_timeline_points WHERE match_id=? AND stage=?",
+    "SELECT status,first_captured_at FROM research_timeline_points WHERE match_id=? AND stage=?",
   );
   const completeGroups = rawDb.prepare(
     `SELECT COUNT(*) count FROM (
@@ -110,14 +110,20 @@ export function captureResearchTimelinePrices(
   );
   const updatePoint = rawDb.prepare(
     `UPDATE research_timeline_points
-        SET captured_at=?,status=?,note=?,updated_at=?
+        SET first_captured_at=COALESCE(first_captured_at,?),
+            last_retry_at=COALESCE(?,last_retry_at),
+            captured_at=COALESCE(captured_at,?),
+            status=?,note=?,updated_at=?
       WHERE match_id=? AND stage=?`,
   );
   let inserted = 0;
   const tx = rawDb.transaction(() => {
     for (const stage of stages) {
       ensurePoint.run(matchId, stage, stageTargetAt(stage, kickoffUtc), observedAt, observedAt);
-      const current = pointStatus.get(matchId, stage) as { status: string } | undefined;
+      const current = pointStatus.get(matchId, stage) as {
+        status: string;
+        first_captured_at: number | null;
+      } | undefined;
       if (current?.status === "captured") continue;
       for (const price of accepted) {
         const lineKey = lineKeyOf(price.market, price.lineValue);
@@ -141,7 +147,10 @@ export function captureResearchTimelinePrices(
       const complete = (completeGroups.get(matchId, stage) as { count: number }).count;
       const status = complete >= RESEARCH_MARKETS.length * RESEARCH_PROVIDERS.length ? "captured" : "partial";
       const note = status === "captured" ? null : `${complete}/6 provider-market pairs complete`;
-      updatePoint.run(observedAt, status, note, observedAt, matchId, stage);
+      const retryAt = current?.first_captured_at === null || current?.first_captured_at === undefined
+        ? null
+        : observedAt;
+      updatePoint.run(observedAt, retryAt, observedAt, status, note, observedAt, matchId, stage);
     }
   });
   tx();
@@ -210,17 +219,20 @@ export function saveResearchInitialSnapshots(
   );
   const ensurePoint = rawDb.prepare(
     `INSERT INTO research_timeline_points(
-      match_id,stage,target_at,captured_at,status,note,created_at,updated_at
-    ) VALUES(?,'initial',NULL,NULL,'pending',NULL,?,?)
+      match_id,stage,target_at,first_captured_at,last_retry_at,captured_at,status,note,created_at,updated_at
+    ) VALUES(?,'initial',NULL,NULL,NULL,NULL,'pending',NULL,?,?)
     ON CONFLICT(match_id,stage) DO NOTHING`,
   );
   const updatePoint = rawDb.prepare(
     `UPDATE research_timeline_points
-        SET captured_at=?,status=?,note=?,updated_at=?
+        SET first_captured_at=COALESCE(first_captured_at,?),
+            last_retry_at=COALESCE(?,last_retry_at),
+            captured_at=COALESCE(captured_at,?),
+            status=?,note=?,updated_at=?
       WHERE match_id=? AND stage='initial'`,
   );
   const pointStatus = rawDb.prepare(
-    "SELECT status FROM research_timeline_points WHERE match_id=? AND stage='initial'",
+    "SELECT status,first_captured_at FROM research_timeline_points WHERE match_id=? AND stage='initial'",
   );
   let inserted = 0;
   rawDb.transaction(() => {
@@ -245,13 +257,23 @@ export function saveResearchInitialSnapshots(
     }
     // A completed external opening checkpoint, including its capture time and
     // missing-source note, is frozen with the immutable source rows.
-    const current = pointStatus.get(matchId) as { status: string } | undefined;
+    const current = pointStatus.get(matchId) as {
+      status: string;
+      first_captured_at: number | null;
+    } | undefined;
     if (current?.status === "captured") return;
     const complete = initialPairCount(matchId);
+    const hasCapturedQuotes = opening.quotes.length > 0;
+    const firstCapturedAt = hasCapturedQuotes ? capturedAt : null;
+    const retryAt = hasCapturedQuotes && current?.first_captured_at !== null && current?.first_captured_at !== undefined
+      ? capturedAt
+      : null;
     const note = opening.missing.find((item) => item.provider === "pinnacle" && item.market === "COU")?.note
       ?? PINNACLE_COU_NOTE;
     updatePoint.run(
-      complete >= INITIAL_AVAILABLE_PAIRS ? capturedAt : null,
+      firstCapturedAt,
+      retryAt,
+      firstCapturedAt,
       complete >= INITIAL_AVAILABLE_PAIRS ? "captured" : opening.quotes.length ? "partial" : "pending",
       note,
       capturedAt,
@@ -609,7 +631,7 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
   }
   const pointRows = matchIds.length
     ? rawDb.prepare(
-        `SELECT match_id,stage,status,captured_at,target_at,note
+        `SELECT match_id,stage,status,first_captured_at,last_retry_at,captured_at,target_at,note
            FROM research_timeline_points
           WHERE match_id IN (${matchIds.map(() => "?").join(",")})`,
       ).all(...matchIds) as Array<Record<string, unknown>>
@@ -654,9 +676,16 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
           RESEARCH_STAGES.map((stage) => {
             const stageQuotes = quotes.filter((quote) => quote.stage === stage);
             const point = pointsByMatch.get(matchId)?.get(stage);
-            const capturedAt = point?.captured_at === null || point?.captured_at === undefined
-              ? (stageQuotes.length ? Math.max(...stageQuotes.map((quote) => quote.capturedAt)) : null)
-              : Number(point.captured_at);
+            const firstCapturedAt = point?.first_captured_at === null || point?.first_captured_at === undefined
+              ? (stageQuotes.length
+                  ? Math.min(...stageQuotes.map((quote) => quote.capturedAt))
+                  : point?.captured_at === null || point?.captured_at === undefined
+                    ? null
+                    : Number(point.captured_at))
+              : Number(point.first_captured_at);
+            const lastRetryAt = point?.last_retry_at === null || point?.last_retry_at === undefined
+              ? null
+              : Number(point.last_retry_at);
             return [
               stage,
               {
@@ -665,7 +694,9 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
                 targetAt: point?.target_at === null || point?.target_at === undefined
                   ? stageTargetAt(stage, kickoffUtc)
                   : Number(point.target_at),
-                capturedAt,
+                firstCapturedAt,
+                lastRetryAt,
+                capturedAt: firstCapturedAt,
                 note: point?.note === null || point?.note === undefined ? null : String(point.note),
                 quotes: stageQuotes,
               },
@@ -740,16 +771,19 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
     .prepare(
       `SELECT q.id,q.match_id,m.hkjc_id,m.league,m.home_team,m.away_team,m.kickoff_utc,
               q.provider,q.market,q.stage,q.target_at,q.line_key,q.selection,q.decimal_odds,
-              q.is_main,q.source_updated_at,q.captured_at,q.status,q.origin,q.source_name,
+              q.is_main,q.source_updated_at,q.captured_at,p.first_captured_at,p.last_retry_at,
+              q.status,q.origin,q.source_name,
               q.source_match_id,q.source_url
-         FROM research_timeline_snapshots q JOIN matches m ON m.id=q.match_id
+         FROM research_timeline_snapshots q
+         JOIN matches m ON m.id=q.match_id
+         LEFT JOIN research_timeline_points p ON p.match_id=q.match_id AND p.stage=q.stage
         WHERE ${clause}
         ORDER BY m.kickoff_utc DESC,q.stage,q.provider,q.market,q.line_key,q.selection
         LIMIT ?`,
     )
     .all(...params, MAX_EXPORT_ROWS) as Array<Record<string, unknown>>;
   return toCsv(
-    ["id", "match_id", "hkjc_id", "league", "home_team", "away_team", "kickoff_utc", "provider", "market", "stage", "target_at", "line_key", "selection", "decimal_odds", "is_main", "source_updated_at", "captured_at", "status", "origin", "source_name", "source_match_id", "source_url"],
+    ["id", "match_id", "hkjc_id", "league", "home_team", "away_team", "kickoff_utc", "provider", "market", "stage", "target_at", "line_key", "selection", "decimal_odds", "is_main", "source_updated_at", "captured_at", "first_captured_at", "last_retry_at", "status", "origin", "source_name", "source_match_id", "source_url"],
     rows.map((row) => [
       row.id,
       row.match_id,
@@ -768,6 +802,8 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
       row.is_main,
       row.source_updated_at,
       row.captured_at,
+      row.first_captured_at,
+      row.last_retry_at,
       row.status,
       row.origin,
       row.source_name,

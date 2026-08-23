@@ -118,7 +118,8 @@ CREATE INDEX IF NOT EXISTS research_results_fetched_idx ON research_results(fetc
 
 CREATE TABLE IF NOT EXISTS research_timeline_points (
   match_id TEXT NOT NULL, stage TEXT NOT NULL, target_at INTEGER,
-  captured_at INTEGER, status TEXT NOT NULL DEFAULT 'pending', note TEXT,
+  first_captured_at INTEGER, last_retry_at INTEGER, captured_at INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending', note TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY(match_id,stage));
 CREATE INDEX IF NOT EXISTS research_timeline_due_idx
@@ -201,6 +202,42 @@ CREATE TABLE IF NOT EXISTS app_state (
   if (!timelineNames.has("source_url")) {
     sqlite.exec("ALTER TABLE research_timeline_snapshots ADD COLUMN source_url TEXT");
   }
+  const timelinePointColumns = sqlite
+    .prepare("PRAGMA table_info(research_timeline_points)")
+    .all() as Array<{ name: string }>;
+  const timelinePointNames = new Set(timelinePointColumns.map((column) => column.name));
+  if (!timelinePointNames.has("first_captured_at")) {
+    sqlite.exec("ALTER TABLE research_timeline_points ADD COLUMN first_captured_at INTEGER");
+  }
+  if (!timelinePointNames.has("last_retry_at")) {
+    sqlite.exec("ALTER TABLE research_timeline_points ADD COLUMN last_retry_at INTEGER");
+  }
+  // Recover the immutable first capture from quote rows rather than the legacy
+  // point timestamp, which older partial retries could overwrite.  updated_at
+  // is the best available historical retry timestamp when it is later.
+  sqlite.exec(`
+    UPDATE research_timeline_points
+       SET first_captured_at=COALESCE(
+         first_captured_at,
+         (
+           SELECT MIN(s.captured_at)
+             FROM research_timeline_snapshots s
+            WHERE s.match_id=research_timeline_points.match_id
+              AND s.stage=research_timeline_points.stage
+         ),
+         captured_at
+       )
+     WHERE first_captured_at IS NULL;
+    UPDATE research_timeline_points
+       SET last_retry_at=updated_at
+     WHERE last_retry_at IS NULL
+       AND first_captured_at IS NOT NULL
+       AND updated_at>first_captured_at;
+    UPDATE research_timeline_points
+       SET captured_at=first_captured_at
+     WHERE first_captured_at IS NOT NULL
+       AND (captured_at IS NULL OR captured_at<>first_captured_at);
+  `);
   // Initial rows created by the retired first-seen backfill were not true
   // openings.  Drop only those legacy rows, then remove their empty points;
   // future initial rows can only be inserted by the external opening source.

@@ -147,12 +147,24 @@ describe("research data collection", () => {
     addMatch("timeline-lock", kickoff);
     captureResearchTimelinePrices("timeline-lock", "hkjc", twoWayPrices as never, kickoff, now);
     expect(rawDb.prepare(
-      "SELECT status FROM research_timeline_points WHERE match_id=? AND stage='T30'",
-    ).get("timeline-lock")).toEqual({ status: "partial" });
+      `SELECT status,first_captured_at,last_retry_at,captured_at
+         FROM research_timeline_points WHERE match_id=? AND stage='T30'`,
+    ).get("timeline-lock")).toEqual({
+      status: "partial",
+      first_captured_at: now,
+      last_retry_at: null,
+      captured_at: now,
+    });
     captureResearchTimelinePrices("timeline-lock", "pinnacle", twoWayPrices as never, kickoff, now + 1_000);
     expect(rawDb.prepare(
-      "SELECT status FROM research_timeline_points WHERE match_id=? AND stage='T30'",
-    ).get("timeline-lock")).toEqual({ status: "captured" });
+      `SELECT status,first_captured_at,last_retry_at,captured_at
+         FROM research_timeline_points WHERE match_id=? AND stage='T30'`,
+    ).get("timeline-lock")).toEqual({
+      status: "captured",
+      first_captured_at: now,
+      last_retry_at: now + 1_000,
+      captured_at: now,
+    });
 
     const changed = twoWayPrices.map((price) => ({ ...price, decimalOdds: 2.5 }));
     captureResearchTimelinePrices("timeline-lock", "hkjc", changed as never, kickoff, now + 2_000);
@@ -161,6 +173,22 @@ describe("research data collection", () => {
         WHERE match_id=? AND stage='T30' AND provider='hkjc'
           AND market='AH' AND selection='H'`,
     ).get("timeline-lock")).toEqual({ decimal_odds: 1.91 });
+    expect(rawDb.prepare(
+      `SELECT first_captured_at,last_retry_at,captured_at
+         FROM research_timeline_points WHERE match_id=? AND stage='T30'`,
+    ).get("timeline-lock")).toEqual({
+      first_captured_at: now,
+      last_retry_at: now + 1_000,
+      captured_at: now,
+    });
+    expect(
+      researchDataset({ days: 7, provider: "all", market: "all" })
+        .matches.find((match) => match.matchId === "timeline-lock")?.timeline.T30,
+    ).toMatchObject({
+      firstCapturedAt: now,
+      lastRetryAt: now + 1_000,
+      capturedAt: now,
+    });
   });
 
   it("parses HKJC first records and converts Pinnacle Hong Kong water to decimal", () => {
@@ -215,15 +243,21 @@ describe("research data collection", () => {
       source_url: "https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/source-99",
     });
     expect(rawDb.prepare(
-      "SELECT note FROM research_timeline_points WHERE match_id=? AND stage='initial'",
+      `SELECT note,first_captured_at,last_retry_at,captured_at
+         FROM research_timeline_points WHERE match_id=? AND stage='initial'`,
     ).get("external-initial-lock")).toEqual({
       note: "Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source.",
+      first_captured_at: now,
+      last_retry_at: now + 1_000,
+      captured_at: now,
     });
     expect(
       researchDataset({ days: 7, provider: "all", market: "all" })
         .matches.find((match) => match.matchId === "external-initial-lock")?.timeline.initial.note,
     ).toBe("Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source.");
-    expect(researchCsv("timeline", { days: 7, provider: "all", market: "all" })).toContain("source_match_id");
+    const timelineCsv = researchCsv("timeline", { days: 7, provider: "all", market: "all" });
+    expect(timelineCsv).toContain("first_captured_at,last_retry_at");
+    expect(timelineCsv).toContain("source_match_id");
   });
 
   it("matches public schedules and cannot write simulation or live snapshot tables", async () => {

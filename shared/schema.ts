@@ -98,6 +98,11 @@ export const researchTimelinePoints = sqliteTable(
     matchId: text("match_id").notNull(),
     stage: text("stage").notNull(), // initial | T30 | T15 | T5
     targetAt: integer("target_at"),
+    /** Immutable timestamp of the first quote row captured for this checkpoint. */
+    firstCapturedAt: integer("first_captured_at"),
+    /** Most recent later attempt to complete a still-partial checkpoint. */
+    lastRetryAt: integer("last_retry_at"),
+    /** Legacy compatibility alias. Frozen to the same value as firstCapturedAt. */
     capturedAt: integer("captured_at"),
     status: text("status").notNull().default("pending"), // pending | partial | captured
     note: text("note"),

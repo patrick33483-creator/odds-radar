@@ -349,6 +349,11 @@ export interface ResearchStageSnapshot {
   stage: ResearchStage;
   status: "captured" | "partial" | "pending" | "missing";
   targetAt: number | null;
+  /** Immutable time when this checkpoint first obtained at least one quote. */
+  firstCapturedAt: number | null;
+  /** Latest later attempt to complete the checkpoint, if any. */
+  lastRetryAt: number | null;
+  /** Compatibility alias for firstCapturedAt. */
   capturedAt: number | null;
   /** Includes known unavailable source/market combinations. */
   note: string | null;

@@ -58,7 +58,13 @@ function StageBadge({ snapshot }: { snapshot: ResearchStageSnapshot }) {
   const Icon = snapshot.status === "captured" ? Check : snapshot.status === "pending" ? CircleDashed : TriangleAlert;
   const text = snapshot.status === "captured" ? "已收集" : snapshot.status === "partial" ? "部分" : snapshot.status === "pending" ? "待收集" : "缺失";
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]", stageTone(snapshot.status))}>
+    <span
+      className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]", stageTone(snapshot.status))}
+      title={[
+        snapshot.firstCapturedAt ? `首次收集 ${fmtTime(snapshot.firstCapturedAt)}` : null,
+        snapshot.lastRetryAt ? `最後補收 ${fmtTime(snapshot.lastRetryAt)}` : null,
+      ].filter(Boolean).join("；") || undefined}
+    >
       <Icon className="h-3 w-3" />
       {STAGE_LABEL[snapshot.stage]} {text}
     </span>
@@ -188,9 +194,19 @@ function MatchTimeline({ row }: { row: ResearchMatchRow }) {
               <th className="sticky left-28 z-[2] w-24 border-b border-r border-grid bg-muted px-3 py-2 font-medium">來源</th>
               {STAGES.map((stage) => (
                 <th key={stage} className="min-w-[180px] border-b border-r border-grid px-2 py-2 font-medium">
-                  {stage === "initial" ? "莊家真初盤" : STAGE_LABEL[stage]}
-                  {row.timeline[stage].targetAt ? (
-                    <span className="ml-1 font-normal">{fmtTime(row.timeline[stage].targetAt)}</span>
+                  <span className="block">
+                    {stage === "initial" ? "莊家真初盤" : STAGE_LABEL[stage]}
+                    {row.timeline[stage].targetAt ? (
+                      <span className="ml-1 font-normal">{fmtTime(row.timeline[stage].targetAt)}</span>
+                    ) : null}
+                  </span>
+                  {row.timeline[stage].firstCapturedAt ? (
+                    <span className="mt-0.5 block font-normal">
+                      首次 {fmtTime(row.timeline[stage].firstCapturedAt)}
+                      {row.timeline[stage].lastRetryAt
+                        ? ` · 補收 ${fmtTime(row.timeline[stage].lastRetryAt)}`
+                        : ""}
+                    </span>
                   ) : null}
                 </th>
               ))}
