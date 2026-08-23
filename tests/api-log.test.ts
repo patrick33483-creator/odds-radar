@@ -16,4 +16,19 @@ describe("dashboard API logging", () => {
     const body = { ok: true, rows: [1, 2] };
     expect(apiLogBody("/api/status", body)).toBe(body);
   });
+
+  it("summarizes research rows without logging the complete dataset", () => {
+    const body = {
+      matches: [{ matchId: "one" }, { matchId: "two" }],
+      summary: { snapshots: 450, matches: 2, completedResults: 1, resultEligibleMatches: 2 },
+    };
+    expect(apiLogBody("/api/research", body)).toEqual({
+      research: true,
+      rows: 2,
+      snapshots: 450,
+      matches: 2,
+      results: 1,
+      resultCoveragePct: 0.5,
+    });
+  });
 });

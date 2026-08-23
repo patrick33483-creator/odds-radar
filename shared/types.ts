@@ -315,6 +315,58 @@ export interface SimulationsResponse {
   };
 }
 
+export interface ResearchResultCollectorStatus {
+  enabled: boolean;
+  lastRunAt: number | null;
+  lastSuccessAt: number | null;
+  lastError: string | null;
+  lastCollected: number;
+}
+
+export interface ResearchMatchRow {
+  matchId: string;
+  league: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoffUtc: number;
+  snapshotCount: number;
+  providerCount: number;
+  marketCount: number;
+  providers: Provider[];
+  latestByProvider: Partial<Record<Provider, number>>;
+  markets: Market[];
+  firstSnapshotAt: number;
+  lastSnapshotAt: number;
+  result: {
+    homeScore: number;
+    awayScore: number;
+    cornersTotal: number | null;
+    source: string;
+    fetchedAt: number;
+  } | null;
+}
+
+export interface ResearchDatasetResponse {
+  generatedAt: number;
+  filters: {
+    days: number;
+    provider: Provider | "all";
+    market: Market | "all";
+  };
+  summary: {
+    snapshots: number;
+    matches: number;
+    completedResults: number;
+    resultEligibleMatches: number;
+    firstSnapshotAt: number | null;
+    lastSnapshotAt: number | null;
+    providerCounts: Array<{ name: Provider; count: number }>;
+    marketCounts: Array<{ name: Market; count: number }>;
+  };
+  collector: ResearchResultCollectorStatus;
+  matches: ResearchMatchRow[];
+}
+
 export const CATEGORY_LABEL: Record<string, string> = {
   case1_arb: "情況一 · 兩邊鎖利",
   case2_ev: "情況二 · 正期望值",

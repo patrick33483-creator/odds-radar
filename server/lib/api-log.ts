@@ -5,7 +5,31 @@
  * into a client timeout.  The response itself is unchanged.
  */
 export function apiLogBody(path: string, body: unknown): unknown {
-  if (path !== "/api/dashboard" || !body || typeof body !== "object") return body;
+  if (!body || typeof body !== "object") return body;
+
+  if (path === "/api/research") {
+    const research = body as {
+      matches?: unknown;
+      summary?: {
+        snapshots?: unknown;
+        matches?: unknown;
+        completedResults?: unknown;
+        resultEligibleMatches?: unknown;
+      };
+    };
+    const completedResults = Number(research.summary?.completedResults ?? 0);
+    const resultEligibleMatches = Number(research.summary?.resultEligibleMatches ?? 0);
+    return {
+      research: true,
+      rows: Array.isArray(research.matches) ? research.matches.length : 0,
+      snapshots: research.summary?.snapshots ?? 0,
+      matches: research.summary?.matches ?? 0,
+      results: completedResults,
+      resultCoveragePct: resultEligibleMatches > 0 ? completedResults / resultEligibleMatches : 0,
+    };
+  }
+
+  if (path !== "/api/dashboard") return body;
   const dashboard = body as {
     matches?: unknown;
     status?: { refreshing?: unknown; mode?: unknown; degradedReason?: unknown };

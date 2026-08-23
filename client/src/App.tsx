@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeProvider } from "@/components/radar-ui";
 import Dashboard from "@/pages/dashboard";
 import Simulations from "@/pages/simulations";
+import Research from "@/pages/research";
 import NotFound from "@/pages/not-found";
 
 function AppRouter() {
@@ -14,6 +15,7 @@ function AppRouter() {
     <Switch>
       <Route path="/" component={Dashboard} />
       <Route path="/simulations" component={Simulations} />
+      <Route path="/research" component={Research} />
       <Route component={NotFound} />
     </Switch>
   );

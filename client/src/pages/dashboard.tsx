@@ -162,6 +162,13 @@ export default function Dashboard() {
               >
                 模擬投注紀錄
               </Link>
+              <Link
+                href="/research"
+                className="whitespace-nowrap rounded px-2 py-1 text-muted-foreground hover-elevate"
+                data-testid="link-tab-research"
+              >
+                研究數據
+              </Link>
             </nav>
             <ThemeToggle />
             <ScanButton onClick={() => scan.mutate()} busy={scan.isPending} last={status?.scan.lastScan ?? null} />

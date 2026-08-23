@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS results (
   away_score INTEGER NOT NULL, corners_total INTEGER, half_home INTEGER, half_away INTEGER,
   source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 
+CREATE TABLE IF NOT EXISTS research_results (
+  match_id TEXT PRIMARY KEY, hkjc_id TEXT NOT NULL, home_score INTEGER NOT NULL,
+  away_score INTEGER NOT NULL, corners_total INTEGER,
+  source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS research_results_fetched_idx ON research_results(fetched_at);
+
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,

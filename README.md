@@ -100,7 +100,8 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 * **合成賠率**（`server/lib/synthetic.ts`）：純數學，重用已抓取的馬會主客和／讓球價，砌出 `+0 / +0.25 / +0.5 / +0.75`，再與 **Crown 對立單注**在完全相同的鏡像盤口上比較。
 * **模擬與結算**：每個 `類別|賽事|盤口|選項` 只落一次；比分由 titan007 完場頁取得（中性比分資料，不涉賠率），支援全中／半中／走盤／半輸／輸。
 * **去重**（`server/lib/dedupe.ts`）：機會狀態以合併方式更新，窄視窗掃描永不覆蓋整體狀態，`firstSeen` 保留 7 天。
-* **介面**：繁體中文儀表板、深／淺色主題、冷啟動與降級橫幅、市場分頁、聯賽／時間／搜尋篩選、同盤路與只看機會開關、模擬投注紀錄頁。
+* **介面**：繁體中文儀表板、深／淺色主題、冷啟動與降級橫幅、市場分頁、聯賽／時間／搜尋篩選、同盤路與只看機會開關、模擬投注紀錄頁，以及研究數據頁。
+* **研究數據**：所有賠率快照繼續按既有掃描節奏自動留存；隔離收集器每小時把已開賽場次的 HKJC 官方賽果及角球數寫入獨立 `research_results` 表，不會改動模擬結算資料。研究頁可按日數、供應商、市場及關鍵字篩選，並匯出快照或賽果 CSV。
 
 ---
 
@@ -118,6 +119,8 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 | `POST` | `/api/simulations/clear` | 清除（分類或全部） |
 | `GET` | `/api/opportunities` | 機會去重狀態 |
 | `GET` | `/api/history` | 單一盤路的賠率快照歷史 |
+| `GET` | `/api/research` | 研究數據摘要、收集器健康狀態、賽事及賽果覆蓋率 |
+| `GET` | `/api/research/export?kind=snapshots` | 按研究頁篩選條件匯出賠率快照 CSV；`kind=results` 匯出賽果 |
 | `GET`/`POST` | `/api/backups` | 列出／建立 SQLite 備份 |
 
 ---
@@ -132,6 +135,8 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 | `RADAR_BOOTSTRAP` | 啟用 | 設 `0` 可關閉啟動時的輕量暖機 |
 | `RADAR_AUTO_SCAN` | 啟用 | `0` 可關閉每 30 秒視窗檢查 |
 | `RADAR_HOURLY_PREWARM` | 啟用 | `0` 可關閉每小時 24 小時預熱配對 |
+| `RADAR_RESEARCH_RESULTS` | 啟用 | `0` 可關閉每小時 HKJC 官方賽果補抓 |
+| `RADAR_RESEARCH_RESULT_LOOKBACK_DAYS` | `7` | 每輪賽果補抓向後檢查日數，最多 30 日 |
 | `RADAR_DEMO` | 關閉 | `1` = 明確示範模式 |
 | `RADAR_SCAN_WINDOW_MIN` / `RADAR_SCAN_INTERVAL_SEC` | `30` / `30` | 密集掃描設定（見上） |
 | `RADAR_SIM_TARGET` | `0` | 嚴格的模擬注單總數上限；`0` = 無上限 |

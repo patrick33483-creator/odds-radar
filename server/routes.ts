@@ -8,6 +8,8 @@ import { formatLine, formatSelectionLine } from "./lib/lines";
 import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./lib/scan";
 import { readCornerValidationReport, runPinnapiCornerValidation } from "./lib/corner-validation";
 import { PinnapiProvider } from "./providers/pinnapi";
+import { HkjcProvider } from "./providers/hkjc";
+import { collectResearchResults, parseResearchFilters, researchCsv, researchDataset } from "./lib/research";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -17,6 +19,40 @@ let autoScanStartupTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmStartupTimer: NodeJS.Timeout | null = null;
 let cornerValidationInFlight: Promise<unknown> | null = null;
+let researchResultsTimer: NodeJS.Timeout | null = null;
+let researchResultsStartupTimer: NodeJS.Timeout | null = null;
+let researchResultsInFlight: Promise<{ candidates: number; collected: number }> | null = null;
+const researchHkjc = new HkjcProvider();
+
+function installResearchResultCollection(): void {
+  if (process.env.RADAR_RESEARCH_RESULTS === "0" || researchResultsTimer) return;
+  const run = async () => {
+    if (researchResultsInFlight) return;
+    researchResultsInFlight = collectResearchResults(researchHkjc);
+    try {
+      const outcome = await researchResultsInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_results",
+        ...outcome,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_results_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      researchResultsInFlight = null;
+    }
+  };
+  researchResultsStartupTimer = setTimeout(() => void run(), 10 * 60_000);
+  researchResultsStartupTimer.unref();
+  researchResultsTimer = setInterval(() => void run(), 60 * 60_000);
+  researchResultsTimer.unref();
+}
 
 function installAutoWindowScan(): void {
   if (!autoScanEnabled() || autoScanTimer) return;
@@ -206,6 +242,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   }
   installAutoWindowScan();
   installHourlyPrewarm();
+  installResearchResultCollection();
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.dashboardData();
@@ -336,6 +373,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const lineKey = String(req.query.lineKey ?? "");
     if (!matchId) return res.status(400).json({ message: "matchId required" });
     return res.json(storage.priceHistory(matchId, market, lineKey));
+  });
+
+  app.get("/api/research", (req, res) => {
+    return res.json(researchDataset(parseResearchFilters(req.query as Record<string, unknown>)));
+  });
+
+  app.get("/api/research/export", (req, res) => {
+    const kind = req.query.kind === "results" ? "results" : "snapshots";
+    const filters = parseResearchFilters(req.query as Record<string, unknown>);
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="odds-radar-${kind}-${date}.csv"`);
+    return res.send(researchCsv(kind, filters));
   });
 
   return httpServer;

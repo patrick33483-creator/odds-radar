@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
-import { ArrowLeft, Trash2 } from "lucide-react";
+import { ArrowLeft, Database, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
@@ -90,6 +90,14 @@ export default function Simulations() {
             >
               <ArrowLeft className="h-3 w-3" />
               賠率對比
+            </Link>
+            <Link
+              href="/research"
+              className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover-elevate"
+              data-testid="link-tab-research"
+            >
+              <Database className="h-3 w-3" />
+              研究數據
             </Link>
             <ThemeToggle />
             <Button size="sm" variant="outline" onClick={() => settle.mutate()} disabled={settle.isPending} data-testid="button-settle">
