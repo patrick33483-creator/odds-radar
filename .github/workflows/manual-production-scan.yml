@@ -3,8 +3,11 @@ name: 手動掃描盤路雷達
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  scan:
+  audit:
     runs-on: ubuntu-24.04
     steps:
       - name: 設定 SSH
@@ -17,122 +20,177 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 唯讀核對平博與馬會賠率新鮮度
+      - name: 只讀重建目前可顯示 EV
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          set +e
-          output="$(ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
             sudo docker compose --env-file /opt/odds-radar/.env exec -T radar node
-          ' 2>&1 <<'NODE'
+          ' <<'NODE'
           const fs = require("fs");
           const Database = require("better-sqlite3");
-          const candidates = [
+          const paths = [
             process.env.RADAR_DB,
             "data.db",
             "/app/data.db",
             "/app/data/data.db",
             "/data/data.db",
           ].filter(Boolean);
-          const path = candidates.find(candidate => fs.existsSync(candidate));
-          if (!path) throw new Error(`RADAR_DB_NOT_FOUND candidates=${candidates.join(",")}`);
-          const db = new Database(path, { readonly: true, fileMustExist: true });
+          const dbPath = paths.find(path => fs.existsSync(path));
+          if (!dbPath) throw new Error(`RADAR_DB_NOT_FOUND candidates=${paths.join(",")}`);
+          const db = new Database(dbPath, { readonly: true, fileMustExist: true });
           const now = Date.now();
+          const STALE_MS = 90_000;
+          const MAX_QUOTE_SKEW_MS = 30_000;
+          const EV_THRESHOLD = 0.03;
+          const OUTLIER_RATIO = 0.35;
+          const MIN_MAPPING_CONFIDENCE = 0.8;
+          const selectionSet = market =>
+            market === "1X2" ? ["H", "D", "A"] :
+            market === "AH" ? ["H", "A"] : ["O", "U"];
           const rows = db.prepare(`
             SELECT
               m.id AS match_id,
               m.kickoff_utc,
-              SUM(CASE WHEN o.provider = 'hkjc' THEN 1 ELSE 0 END) AS hkjc_rows,
-              SUM(CASE WHEN o.provider = 'pinnacle' THEN 1 ELSE 0 END) AS pinnacle_rows,
-              MAX(CASE WHEN o.provider = 'hkjc' THEN o.fetched_at END) AS hkjc_fetched_at,
-              MAX(CASE WHEN o.provider = 'pinnacle' THEN o.fetched_at END) AS pinnacle_fetched_at,
-              MAX(CASE WHEN o.provider = 'pinnacle' THEN o.source_updated_at END) AS pinnacle_source_updated_at
+              m.league,
+              m.home_team,
+              m.away_team,
+              ml.market,
+              ml.line_key,
+              COALESCE(mm.confidence, 0) AS mapping_confidence,
+              o.provider,
+              o.selection,
+              o.decimal_odds,
+              o.fetched_at,
+              o.source_updated_at
             FROM matches m
+            JOIN market_lines ml ON ml.match_id = m.id
+            LEFT JOIN match_mapping mm ON mm.match_id = m.id
             LEFT JOIN odds_latest o
-              ON o.match_id = m.id AND o.provider IN ('hkjc', 'pinnacle')
-            WHERE m.kickoff_utc > ? AND m.kickoff_utc <= ?
-            GROUP BY m.id, m.kickoff_utc
-            ORDER BY m.kickoff_utc, m.id
+              ON o.match_id = m.id
+             AND o.market = ml.market
+             AND o.line_key = ml.line_key
+             AND o.provider IN ('hkjc', 'pinnacle')
+            WHERE m.kickoff_utc > ?
+              AND m.kickoff_utc <= ?
+            ORDER BY m.kickoff_utc, m.id, ml.market, ml.line_key, o.provider, o.selection
           `).all(now, now + 24 * 60 * 60 * 1000);
-          const pct = (values, p) => {
-            if (!values.length) return null;
-            const sorted = [...values].sort((a, b) => a - b);
-            return Math.round(sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))]);
+          const groups = new Map();
+          for (const row of rows) {
+            const key = [row.match_id, row.market, row.line_key].join("|");
+            if (!groups.has(key)) groups.set(key, {
+              match_id: row.match_id,
+              kickoff_utc: row.kickoff_utc,
+              league: row.league,
+              home_team: row.home_team,
+              away_team: row.away_team,
+              market: row.market,
+              line_key: row.line_key,
+              mapping_confidence: row.mapping_confidence,
+              quotes: [],
+            });
+            if (row.provider) groups.get(key).quotes.push(row);
+          }
+          const candidates = [];
+          const rejected = {
+            incomplete_pinnacle: 0,
+            stale_pinnacle: 0,
+            no_hkjc_quote: 0,
+            stale_hkjc: 0,
+            quote_skew: 0,
+            below_ev_threshold: 0,
           };
-          const summarize = scoped => {
-            const paired = scoped.filter(r => r.hkjc_fetched_at && r.pinnacle_fetched_at);
-            const pAges = scoped.filter(r => r.pinnacle_fetched_at)
-              .map(r => Math.max(0, (now - r.pinnacle_fetched_at) / 1000));
-            const hAges = scoped.filter(r => r.hkjc_fetched_at)
-              .map(r => Math.max(0, (now - r.hkjc_fetched_at) / 1000));
-            const gaps = paired.map(r => Math.abs(r.pinnacle_fetched_at - r.hkjc_fetched_at) / 1000);
-            return {
-              matches: scoped.length,
-              paired: paired.length,
-              missing_hkjc: scoped.filter(r => !r.hkjc_fetched_at).length,
-              missing_pinnacle: scoped.filter(r => !r.pinnacle_fetched_at).length,
-              pinnacle_age_seconds: {
-                median: pct(pAges, 0.5),
-                p90: pct(pAges, 0.9),
-                max: pct(pAges, 1),
-                within_5m: pAges.filter(x => x <= 300).length,
-                older_than_15m: pAges.filter(x => x > 900).length,
-              },
-              hkjc_age_seconds: {
-                median: pct(hAges, 0.5),
-                p90: pct(hAges, 0.9),
-                max: pct(hAges, 1),
-                within_5m: hAges.filter(x => x <= 300).length,
-                older_than_15m: hAges.filter(x => x > 900).length,
-              },
-              paired_fetch_gap_seconds: {
-                median: pct(gaps, 0.5),
-                p90: pct(gaps, 0.9),
-                max: pct(gaps, 1),
-                within_60s: gaps.filter(x => x <= 60).length,
-                within_5m: gaps.filter(x => x <= 300).length,
-                over_15m: gaps.filter(x => x > 900).length,
-              },
-            };
-          };
+          for (const group of groups.values()) {
+            const selections = selectionSet(group.market);
+            const pin = selections.map(selection =>
+              group.quotes.find(q => q.provider === "pinnacle" && q.selection === selection)
+            );
+            if (pin.some(q => !q)) {
+              rejected.incomplete_pinnacle += 1;
+              continue;
+            }
+            if (pin.some(q => now - q.fetched_at > STALE_MS)) {
+              rejected.stale_pinnacle += 1;
+              continue;
+            }
+            const raw = pin.map(q => 1 / q.decimal_odds);
+            const total = raw.reduce((a, b) => a + b, 0);
+            if (!(total > 0)) continue;
+            const fair = new Map(selections.map((selection, index) => [selection, raw[index] / total]));
+            const hk = selections
+              .map(selection => group.quotes.find(q => q.provider === "hkjc" && q.selection === selection))
+              .filter(Boolean);
+            if (!hk.length) {
+              rejected.no_hkjc_quote += 1;
+              continue;
+            }
+            for (const quote of hk) {
+              if (now - quote.fetched_at > STALE_MS) {
+                rejected.stale_hkjc += 1;
+                continue;
+              }
+              const times = [...pin.map(q => q.fetched_at), quote.fetched_at];
+              const skew = Math.max(...times) - Math.min(...times);
+              if (skew > MAX_QUOTE_SKEW_MS) {
+                rejected.quote_skew += 1;
+                continue;
+              }
+              const probability = fair.get(quote.selection);
+              const edge = probability * quote.decimal_odds - 1;
+              if (edge < EV_THRESHOLD) {
+                rejected.below_ev_threshold += 1;
+                continue;
+              }
+              const fairOdds = 1 / probability;
+              const flags = [];
+              if (quote.decimal_odds / fairOdds - 1 > OUTLIER_RATIO) flags.push("outlier");
+              if (group.mapping_confidence < MIN_MAPPING_CONFIDENCE) flags.push("low_confidence");
+              candidates.push({
+                match_id: group.match_id,
+                kickoff_utc: new Date(group.kickoff_utc).toISOString(),
+                league: group.league,
+                match: `${group.home_team} vs ${group.away_team}`,
+                market: group.market,
+                line_key: group.line_key,
+                selection: quote.selection,
+                edge: Math.round(edge * 1e6) / 1e6,
+                hkjc_odds: quote.decimal_odds,
+                fair_odds: Math.round(fairOdds * 1000) / 1000,
+                hkjc_age_seconds: Math.round((now - quote.fetched_at) / 1000),
+                pinnacle_age_seconds: Math.round((now - Math.max(...pin.map(q => q.fetched_at))) / 1000),
+                quote_skew_seconds: Math.round(skew / 1000),
+                flags,
+                synchronized: true,
+              });
+            }
+          }
           const result = {
-            schema: "radar-pinnacle-hkjc-freshness-audit-v1",
+            schema: "radar-dashboard-ev-sync-audit-v1",
             audit_only: true,
             provider_calls: 0,
             writes: 0,
             now_utc: new Date(now).toISOString(),
-            scopes: {
-              next_30m: summarize(rows.filter(r => r.kickoff_utc <= now + 30 * 60 * 1000)),
-              next_3h: summarize(rows.filter(r => r.kickoff_utc <= now + 3 * 60 * 60 * 1000)),
-              next_24h: summarize(rows),
+            thresholds: {
+              max_quote_age_seconds: STALE_MS / 1000,
+              max_quote_skew_seconds: MAX_QUOTE_SKEW_MS / 1000,
+              minimum_ev: EV_THRESHOLD,
             },
-            next_3h_rows: rows
-              .filter(r => r.kickoff_utc <= now + 3 * 60 * 60 * 1000)
-              .map(r => ({
-                match_id: r.match_id,
-                kickoff_utc: new Date(r.kickoff_utc).toISOString(),
-                hkjc_rows: r.hkjc_rows,
-                pinnacle_rows: r.pinnacle_rows,
-                hkjc_fetched_at_utc: r.hkjc_fetched_at
-                  ? new Date(r.hkjc_fetched_at).toISOString() : null,
-                pinnacle_fetched_at_utc: r.pinnacle_fetched_at
-                  ? new Date(r.pinnacle_fetched_at).toISOString() : null,
-                pinnacle_source_updated_at_utc: r.pinnacle_source_updated_at
-                  ? new Date(r.pinnacle_source_updated_at).toISOString() : null,
-                fetch_gap_seconds: r.hkjc_fetched_at && r.pinnacle_fetched_at
-                  ? Math.round(Math.abs(r.pinnacle_fetched_at - r.hkjc_fetched_at) / 1000) : null,
-              })),
+            future_lines_checked: groups.size,
+            display_eligible_ev_count: candidates.length,
+            safe_ev_count: candidates.filter(row => row.flags.length === 0).length,
+            all_display_eligible_ev_synchronized: candidates.every(row => row.synchronized),
+            max_observed_quote_skew_seconds: candidates.length
+              ? Math.max(...candidates.map(row => row.quote_skew_seconds)) : null,
+            max_observed_hkjc_age_seconds: candidates.length
+              ? Math.max(...candidates.map(row => row.hkjc_age_seconds)) : null,
+            max_observed_pinnacle_age_seconds: candidates.length
+              ? Math.max(...candidates.map(row => row.pinnacle_age_seconds)) : null,
+            rejected,
+            candidates,
           };
           console.log(JSON.stringify(result));
           db.close();
           NODE
-          )"
-          rc=$?
-          set -e
-          printf '%s\n' "$output"
-          single_line="$(printf '%s' "$output" | tr '\n' ' ')"
-          echo "::error title=Pinnacle HKJC freshness audit rc=$rc::$single_line"
-          exit 1
