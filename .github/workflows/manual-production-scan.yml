@@ -121,4 +121,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$output"
-          exit "$rc"
+          single_line="$(printf '%s' "$output" | tr '\n' ' ')"
+          echo "::error title=Crown freshness audit rc=$rc::$single_line"
+          exit 1
