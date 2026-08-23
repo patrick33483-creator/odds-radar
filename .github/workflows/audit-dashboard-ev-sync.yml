@@ -1,0 +1,196 @@
+name: 唯讀核對雷達 EV 同步賠率
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 只讀重建目前可顯示 EV
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /opt/odds-radar
+            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar node
+          ' <<'NODE'
+          const fs = require("fs");
+          const Database = require("better-sqlite3");
+          const paths = [
+            process.env.RADAR_DB,
+            "data.db",
+            "/app/data.db",
+            "/app/data/data.db",
+            "/data/data.db",
+          ].filter(Boolean);
+          const dbPath = paths.find(path => fs.existsSync(path));
+          if (!dbPath) throw new Error(`RADAR_DB_NOT_FOUND candidates=${paths.join(",")}`);
+          const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+          const now = Date.now();
+          const STALE_MS = 90_000;
+          const MAX_QUOTE_SKEW_MS = 30_000;
+          const EV_THRESHOLD = 0.03;
+          const OUTLIER_RATIO = 0.35;
+          const MIN_MAPPING_CONFIDENCE = 0.8;
+          const selectionSet = market =>
+            market === "1X2" ? ["H", "D", "A"] :
+            market === "AH" ? ["H", "A"] : ["O", "U"];
+          const rows = db.prepare(`
+            SELECT
+              m.id AS match_id,
+              m.kickoff_utc,
+              m.league,
+              m.home_team,
+              m.away_team,
+              ml.market,
+              ml.line_key,
+              COALESCE(mm.confidence, 0) AS mapping_confidence,
+              o.provider,
+              o.selection,
+              o.decimal_odds,
+              o.fetched_at,
+              o.source_updated_at
+            FROM matches m
+            JOIN market_lines ml ON ml.match_id = m.id
+            LEFT JOIN match_mapping mm ON mm.match_id = m.id
+            LEFT JOIN odds_latest o
+              ON o.match_id = m.id
+             AND o.market = ml.market
+             AND o.line_key = ml.line_key
+             AND o.provider IN ('hkjc', 'pinnacle')
+            WHERE m.kickoff_utc > ?
+              AND m.kickoff_utc <= ?
+            ORDER BY m.kickoff_utc, m.id, ml.market, ml.line_key, o.provider, o.selection
+          `).all(now, now + 24 * 60 * 60 * 1000);
+          const groups = new Map();
+          for (const row of rows) {
+            const key = [row.match_id, row.market, row.line_key].join("|");
+            if (!groups.has(key)) groups.set(key, {
+              match_id: row.match_id,
+              kickoff_utc: row.kickoff_utc,
+              league: row.league,
+              home_team: row.home_team,
+              away_team: row.away_team,
+              market: row.market,
+              line_key: row.line_key,
+              mapping_confidence: row.mapping_confidence,
+              quotes: [],
+            });
+            if (row.provider) groups.get(key).quotes.push(row);
+          }
+          const candidates = [];
+          const rejected = {
+            incomplete_pinnacle: 0,
+            stale_pinnacle: 0,
+            no_hkjc_quote: 0,
+            stale_hkjc: 0,
+            quote_skew: 0,
+            below_ev_threshold: 0,
+          };
+          for (const group of groups.values()) {
+            const selections = selectionSet(group.market);
+            const pin = selections.map(selection =>
+              group.quotes.find(q => q.provider === "pinnacle" && q.selection === selection)
+            );
+            if (pin.some(q => !q)) {
+              rejected.incomplete_pinnacle += 1;
+              continue;
+            }
+            if (pin.some(q => now - q.fetched_at > STALE_MS)) {
+              rejected.stale_pinnacle += 1;
+              continue;
+            }
+            const raw = pin.map(q => 1 / q.decimal_odds);
+            const total = raw.reduce((a, b) => a + b, 0);
+            if (!(total > 0)) continue;
+            const fair = new Map(selections.map((selection, index) => [selection, raw[index] / total]));
+            const hk = selections
+              .map(selection => group.quotes.find(q => q.provider === "hkjc" && q.selection === selection))
+              .filter(Boolean);
+            if (!hk.length) {
+              rejected.no_hkjc_quote += 1;
+              continue;
+            }
+            for (const quote of hk) {
+              if (now - quote.fetched_at > STALE_MS) {
+                rejected.stale_hkjc += 1;
+                continue;
+              }
+              const times = [...pin.map(q => q.fetched_at), quote.fetched_at];
+              const skew = Math.max(...times) - Math.min(...times);
+              if (skew > MAX_QUOTE_SKEW_MS) {
+                rejected.quote_skew += 1;
+                continue;
+              }
+              const probability = fair.get(quote.selection);
+              const edge = probability * quote.decimal_odds - 1;
+              if (edge < EV_THRESHOLD) {
+                rejected.below_ev_threshold += 1;
+                continue;
+              }
+              const fairOdds = 1 / probability;
+              const flags = [];
+              if (quote.decimal_odds / fairOdds - 1 > OUTLIER_RATIO) flags.push("outlier");
+              if (group.mapping_confidence < MIN_MAPPING_CONFIDENCE) flags.push("low_confidence");
+              candidates.push({
+                match_id: group.match_id,
+                kickoff_utc: new Date(group.kickoff_utc).toISOString(),
+                league: group.league,
+                match: `${group.home_team} vs ${group.away_team}`,
+                market: group.market,
+                line_key: group.line_key,
+                selection: quote.selection,
+                edge: Math.round(edge * 1e6) / 1e6,
+                hkjc_odds: quote.decimal_odds,
+                fair_odds: Math.round(fairOdds * 1000) / 1000,
+                hkjc_age_seconds: Math.round((now - quote.fetched_at) / 1000),
+                pinnacle_age_seconds: Math.round((now - Math.max(...pin.map(q => q.fetched_at))) / 1000),
+                quote_skew_seconds: Math.round(skew / 1000),
+                flags,
+                synchronized: true,
+              });
+            }
+          }
+          const result = {
+            schema: "radar-dashboard-ev-sync-audit-v1",
+            audit_only: true,
+            provider_calls: 0,
+            writes: 0,
+            now_utc: new Date(now).toISOString(),
+            thresholds: {
+              max_quote_age_seconds: STALE_MS / 1000,
+              max_quote_skew_seconds: MAX_QUOTE_SKEW_MS / 1000,
+              minimum_ev: EV_THRESHOLD,
+            },
+            future_lines_checked: groups.size,
+            display_eligible_ev_count: candidates.length,
+            safe_ev_count: candidates.filter(row => row.flags.length === 0).length,
+            all_display_eligible_ev_synchronized: candidates.every(row => row.synchronized),
+            max_observed_quote_skew_seconds: candidates.length
+              ? Math.max(...candidates.map(row => row.quote_skew_seconds)) : null,
+            max_observed_hkjc_age_seconds: candidates.length
+              ? Math.max(...candidates.map(row => row.hkjc_age_seconds)) : null,
+            max_observed_pinnacle_age_seconds: candidates.length
+              ? Math.max(...candidates.map(row => row.pinnacle_age_seconds)) : null,
+            rejected,
+            candidates,
+          };
+          console.log(JSON.stringify(result));
+          db.close();
+          NODE
