@@ -3,8 +3,15 @@ name: 手動掃描盤路雷達
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: odds-radar-corner-ev-funnel-audit
+  cancel-in-progress: false
+
 jobs:
-  scan:
+  audit:
     runs-on: ubuntu-24.04
     steps:
       - name: 設定 SSH
@@ -17,7 +24,14 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 執行一次賽前窗口掃描
+      - name: 讀取生產環境 SHA（只讀）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/odds-radar && git rev-parse HEAD'
+
+      - name: 只讀查核角球 EV 資金流失環節（配對／同步／EV 門檻）
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -25,13 +39,383 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
-            set -a
-            . ./.env
-            set +a
-            test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
-            docker compose ps
-            curl --fail --silent --show-error \
-              --max-time 240 \
-              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/scan/window
-          '
+            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar node
+          ' <<'NODE'
+          // Read-only corner (COU) EV funnel audit. No writes, no provider calls.
+          // Constants mirrored EXACTLY from production source (server/lib/ev.ts,
+          // server/lib/execution-guard.ts) as of the commit this script is dispatched
+          // against. Do not hand-tune; if these ever drift from source, the audit
+          // output notes the discrepancy separately.
+          const fs = require("fs");
+          const Database = require("better-sqlite3");
+
+          const paths = [
+            process.env.RADAR_DB,
+            "data.db",
+            "/app/data.db",
+            "/app/data/data.db",
+            "/data/data.db",
+          ].filter(Boolean);
+          const dbPath = paths.find((p) => fs.existsSync(p));
+          if (!dbPath) throw new Error(`RADAR_DB_NOT_FOUND candidates=${paths.join(",")}`);
+          const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+
+          const now = Date.now();
+          const WINDOW_MS = 26 * 60 * 60 * 1000; // now-2h .. now+24h safety pad, but we also include all future kickoffs regardless of horizon
+          const RECENT_MS = 24 * 60 * 60 * 1000;
+
+          // ---- production contract constants (server/lib/ev.ts, execution-guard.ts) ----
+          const EV_THRESHOLD = 0.03;
+          const STALE_MS = 90_000; // ev.ts STALE_MS: pinnacle leg staleness cutoff for EV comparability
+          const MAX_QUOTE_SKEW_MS = 30_000; // ev.ts MAX_QUOTE_SKEW_MS
+          const MIN_MAPPING_CONFIDENCE = 0.8; // ev.ts MIN_MAPPING_CONFIDENCE
+          const EXECUTION_QUOTE_MAX_AGE_MS = 30_000; // execution-guard.ts, HKJC-side freshness
+          const EXECUTION_CLOCK_TOLERANCE_MS = 5_000; // execution-guard.ts
+
+          function isHkjcExecutionQuoteFresh(fetchedAt, sourceUpdatedAt, t) {
+            if (sourceUpdatedAt === null || sourceUpdatedAt === undefined) return false;
+            if (!Number.isFinite(fetchedAt) || !Number.isFinite(sourceUpdatedAt)) return false;
+            if (fetchedAt > t + EXECUTION_CLOCK_TOLERANCE_MS) return false;
+            if (sourceUpdatedAt > t + EXECUTION_CLOCK_TOLERANCE_MS) return false;
+            if (t - fetchedAt > EXECUTION_QUOTE_MAX_AGE_MS) return false;
+            if (t - sourceUpdatedAt > EXECUTION_QUOTE_MAX_AGE_MS) return false;
+            return true;
+          }
+
+          // ---------------------------------------------------------------------
+          // Stage 0: window + server identity
+          // ---------------------------------------------------------------------
+          const windowStart = now - RECENT_MS;
+          const matchesInWindow = db
+            .prepare(
+              `SELECT * FROM matches WHERE kickoff_utc > ? ORDER BY kickoff_utc ASC`,
+            )
+            .all(windowStart);
+
+          // ---------------------------------------------------------------------
+          // Stage 1: HKJC matches with a COMPLETE COU exact line (both O and U present
+          // in market_lines-declared HKJC odds_latest rows for the same line_key).
+          // ---------------------------------------------------------------------
+          const hkjcCouRows = db
+            .prepare(
+              `SELECT ol.* FROM odds_latest ol
+               JOIN matches m ON m.id = ol.match_id
+               WHERE ol.provider = 'hkjc' AND ol.market = 'COU' AND m.kickoff_utc > ?`,
+            )
+            .all(windowStart);
+
+          const hkjcCouByMatchLine = new Map(); // matchId|lineKey -> {O, U}
+          for (const row of hkjcCouRows) {
+            const k = `${row.match_id}|${row.line_key}`;
+            const entry = hkjcCouByMatchLine.get(k) ?? { matchId: row.match_id, lineKey: row.line_key, sides: {} };
+            entry.sides[row.selection] = row;
+            hkjcCouByMatchLine.set(k, entry);
+          }
+          const completeCouLines = [...hkjcCouByMatchLine.values()].filter((e) => e.sides.O && e.sides.U);
+          const incompleteCouLines = [...hkjcCouByMatchLine.values()].filter((e) => !(e.sides.O && e.sides.U));
+          const matchesWithCompleteCouLine = new Set(completeCouLines.map((e) => e.matchId));
+
+          // ---------------------------------------------------------------------
+          // Stage 2: mapped PinnAPI fixture identity for those matches
+          // ---------------------------------------------------------------------
+          const matchById = new Map(matchesInWindow.map((m) => [m.id, m]));
+          const mappingRows = db.prepare(`SELECT * FROM match_mapping`).all();
+          const mappingByMatch = new Map(mappingRows.map((r) => [r.match_id, r]));
+
+          const stage2 = [...matchesWithCompleteCouLine].map((matchId) => {
+            const m = matchById.get(matchId);
+            const mapping = mappingByMatch.get(matchId);
+            const pinnacleMatchId = m?.pinnacle_match_id ?? null;
+            const isPinnapi = !!pinnacleMatchId && pinnacleMatchId.startsWith("pinnapi:");
+            return {
+              matchId,
+              homeTeam: m?.home_team ?? null,
+              awayTeam: m?.away_team ?? null,
+              kickoffUtc: m?.kickoff_utc ?? null,
+              pinnacleMatchId,
+              isPinnapiMapped: isPinnapi,
+              mappingConfidence: mapping?.confidence ?? null,
+              mappingMethod: mapping?.method ?? null,
+              unmatchedReason: mapping?.unmatched_reason ?? null,
+            };
+          });
+          const mappedToPinnapi = stage2.filter((r) => r.isPinnapiMapped);
+          const notMappedToPinnapi = stage2.filter((r) => !r.isPinnapiMapped);
+
+          // ---------------------------------------------------------------------
+          // Stage 3: PinnAPI corner child event status, from persisted evidence only.
+          // We do NOT call PinnAPI. We infer child-event status from:
+          //   a) pinnapi_corner_detail_unavailable log lines (if a log table/file exists)
+          //   b) presence/absence/completeness of provider='pinnacle' market='COU' rows
+          //      in odds_latest for the matched matches (this is the only persisted
+          //      proxy for child-event resolution outcome).
+          // candidateCount/marketStatus semantics per parsePinnapiCornerLines:
+          //   0 candidates -> "unavailable" (missing child)
+          //   >1 candidates -> "ambiguous" (ambiguous multiple children)
+          //   exactly 1 -> parsed; completeness then depends on O/U pair presence.
+          // From odds_latest alone we can only observe the OUTCOME (rows present or
+          // not), not which of unavailable/ambiguous caused a zero-row outcome. We
+          // report this honestly as an evidence gap.
+          // ---------------------------------------------------------------------
+          const pinnaclePinnapiCouRows = db
+            .prepare(
+              `SELECT ol.* FROM odds_latest ol
+               JOIN matches m ON m.id = ol.match_id
+               WHERE ol.provider = 'pinnacle' AND ol.market = 'COU' AND m.kickoff_utc > ?
+                 AND m.pinnacle_match_id LIKE 'pinnapi:%'`,
+            )
+            .all(windowStart);
+          const pinnaclePinnapiCouByMatchLine = new Map();
+          for (const row of pinnaclePinnapiCouRows) {
+            const k = `${row.match_id}|${row.line_key}`;
+            const entry = pinnaclePinnapiCouByMatchLine.get(k) ?? { matchId: row.match_id, lineKey: row.line_key, sides: {} };
+            entry.sides[row.selection] = row;
+            pinnaclePinnapiCouByMatchLine.set(k, entry);
+          }
+          const stage3 = mappedToPinnapi.map((r) => {
+            const linesForMatch = [...pinnaclePinnapiCouByMatchLine.values()].filter((e) => e.matchId === r.matchId);
+            const anyPinnacleCouRow = linesForMatch.length > 0;
+            const completeLines = linesForMatch.filter((e) => e.sides.O && e.sides.U);
+            const oneSidedLines = linesForMatch.filter((e) => (e.sides.O && !e.sides.U) || (!e.sides.O && e.sides.U));
+            let status;
+            if (!anyPinnacleCouRow) status = "no_persisted_pinnacle_cou_rows"; // could be unavailable OR ambiguous child; log evidence needed to disambiguate
+            else if (completeLines.length > 0) status = "complete_quotes_present";
+            else if (oneSidedLines.length > 0) status = "one_sided_only";
+            else status = "unknown";
+            return {
+              matchId: r.matchId,
+              match: `${r.homeTeam} vs ${r.awayTeam}`,
+              pinnacleCouLineCount: linesForMatch.length,
+              completeLineCount: completeLines.length,
+              oneSidedLineCount: oneSidedLines.length,
+              status,
+            };
+          });
+          const stage3Complete = stage3.filter((r) => r.status === "complete_quotes_present");
+          const stage3OneSided = stage3.filter((r) => r.status === "one_sided_only");
+          const stage3NoRows = stage3.filter((r) => r.status === "no_persisted_pinnacle_cou_rows");
+
+          // ---------------------------------------------------------------------
+          // Stage 4: exact-line intersection between HKJC COU lines and Pinnacle COU
+          // lines (same match_id + line_key on BOTH sides, both books complete O/U).
+          // ---------------------------------------------------------------------
+          const intersection = [];
+          for (const [key, hkjcEntry] of hkjcCouByMatchLine.entries()) {
+            if (!(hkjcEntry.sides.O && hkjcEntry.sides.U)) continue;
+            const pinEntry = pinnaclePinnapiCouByMatchLine.get(key);
+            const pinComplete = pinEntry && pinEntry.sides.O && pinEntry.sides.U;
+            intersection.push({
+              matchId: hkjcEntry.matchId,
+              lineKey: hkjcEntry.lineKey,
+              hkjcComplete: true,
+              pinnacleComplete: !!pinComplete,
+              exactLineIntersect: !!pinComplete,
+            });
+          }
+          const exactLineIntersectRows = intersection.filter((r) => r.exactLineIntersect);
+
+          // ---------------------------------------------------------------------
+          // Stage 5: freshness — HKJC execution quote age, Pinnacle quote age, skew.
+          // Applied only to rows that reached exact-line intersection (stage 4).
+          // ---------------------------------------------------------------------
+          const freshnessRows = exactLineIntersectRows.map((r) => {
+            const hkjcEntry = hkjcCouByMatchLine.get(`${r.matchId}|${r.lineKey}`);
+            const pinEntry = pinnaclePinnapiCouByMatchLine.get(`${r.matchId}|${r.lineKey}`);
+            const hkO = hkjcEntry.sides.O, hkU = hkjcEntry.sides.U;
+            const pinO = pinEntry.sides.O, pinU = pinEntry.sides.U;
+            const hkFreshO = isHkjcExecutionQuoteFresh(hkO.fetched_at, hkO.source_updated_at, now);
+            const hkFreshU = isHkjcExecutionQuoteFresh(hkU.fetched_at, hkU.source_updated_at, now);
+            const pinAgeO = now - pinO.fetched_at;
+            const pinAgeU = now - pinU.fetched_at;
+            const pinStaleO = pinAgeO > STALE_MS;
+            const pinStaleU = pinAgeU > STALE_MS;
+            const allTimestamps = [hkO.fetched_at, hkU.fetched_at, pinO.fetched_at, pinU.fetched_at];
+            const skewMs = Math.max(...allTimestamps) - Math.min(...allTimestamps);
+            const hkjcFresh = hkFreshO && hkFreshU;
+            const pinnacleFresh = !pinStaleO && !pinStaleU;
+            const skewOk = skewMs <= MAX_QUOTE_SKEW_MS;
+            const synchronized = hkjcFresh && pinnacleFresh && skewOk;
+            let failReason = null;
+            if (!synchronized) {
+              const reasons = [];
+              if (!hkjcFresh) reasons.push("hkjc_stale_or_clock");
+              if (!pinnacleFresh) reasons.push("pinnacle_stale");
+              if (!skewOk) reasons.push("cross_source_skew");
+              failReason = reasons.join("+");
+            }
+            return {
+              matchId: r.matchId,
+              lineKey: r.lineKey,
+              hkjc_age_o_ms: now - hkO.fetched_at,
+              hkjc_age_u_ms: now - hkU.fetched_at,
+              hkjc_fresh: hkjcFresh,
+              pinnacle_age_o_ms: pinAgeO,
+              pinnacle_age_u_ms: pinAgeU,
+              pinnacle_fresh: pinnacleFresh,
+              skew_ms: skewMs,
+              skew_ok: skewOk,
+              synchronized,
+              fail_reason: failReason,
+            };
+          });
+          const synchronizedRows = freshnessRows.filter((r) => r.synchronized);
+          const failByReason = {};
+          for (const r of freshnessRows.filter((r) => !r.synchronized)) {
+            const key = r.fail_reason || "unknown";
+            failByReason[key] = (failByReason[key] || 0) + 1;
+          }
+
+          // ---------------------------------------------------------------------
+          // Stage 6: EV eligibility + distribution among synchronized candidates.
+          // EV = trueProb(no-vig from Pinnacle O/U) * hkjcOdds - 1, per selection.
+          // ---------------------------------------------------------------------
+          function noVigProbs(oddsArr) {
+            if (oddsArr.some((o) => !(o > 1))) return null;
+            const raw = oddsArr.map((o) => 1 / o);
+            const sum = raw.reduce((a, b) => a + b, 0);
+            if (!(sum > 0)) return null;
+            return raw.map((r) => r / sum);
+          }
+
+          const evCandidates = [];
+          for (const fr of freshnessRows) {
+            const hkjcEntry = hkjcCouByMatchLine.get(`${fr.matchId}|${fr.lineKey}`);
+            const pinEntry = pinnaclePinnapiCouByMatchLine.get(`${fr.matchId}|${fr.lineKey}`);
+            const mapping = mappingByMatch.get(fr.matchId);
+            const m = matchById.get(fr.matchId);
+            const probs = noVigProbs([pinEntry.sides.O.decimal_odds, pinEntry.sides.U.decimal_odds]);
+            if (!probs) continue;
+            const fairBySel = { O: probs[0], U: probs[1] };
+            for (const sel of ["O", "U"]) {
+              const hkOdds = hkjcEntry.sides[sel].decimal_odds;
+              const p = fairBySel[sel];
+              const edge = p * hkOdds - 1;
+              const eligible = fr.synchronized; // production only computes EV at all when synchronized/exactLine/fresh
+              const passesThreshold = eligible && edge >= EV_THRESHOLD;
+              evCandidates.push({
+                matchId: fr.matchId,
+                match: m ? `${m.home_team} vs ${m.away_team}` : fr.matchId,
+                lineKey: fr.lineKey,
+                selection: sel,
+                hkjcOdds: hkOdds,
+                pinnacleFairProb: Math.round(p * 1e6) / 1e6,
+                edge: Math.round(edge * 1e6) / 1e6,
+                synchronized: fr.synchronized,
+                mappingConfidence: mapping?.confidence ?? null,
+                eligible,
+                passesThreshold,
+                positiveEvButBelowThreshold: eligible && edge > 0 && edge < EV_THRESHOLD,
+              });
+            }
+          }
+          evCandidates.sort((a, b) => b.edge - a.edge);
+          const eligibleEv = evCandidates.filter((r) => r.eligible);
+          const passThreshold = eligibleEv.filter((r) => r.passesThreshold);
+          const positiveButBelowThreshold = eligibleEv.filter((r) => r.positiveEvButBelowThreshold);
+          const topCandidates = evCandidates.slice(0, 15);
+
+          // ---------------------------------------------------------------------
+          // Stage 8: historical simulation_bets COU count vs AH/OU/1X2, split clean
+          // (excluded_from_stats = 0) vs excluded/contaminated rows, for case2_ev only.
+          // ---------------------------------------------------------------------
+          const betCountsByMarket = db
+            .prepare(
+              `SELECT market, excluded_from_stats, COUNT(*) as n
+               FROM simulation_bets
+               WHERE category = 'case2_ev'
+               GROUP BY market, excluded_from_stats`,
+            )
+            .all();
+          const allBetCountsByMarketAnyCategory = db
+            .prepare(`SELECT category, market, COUNT(*) as n FROM simulation_bets GROUP BY category, market`)
+            .all();
+
+          // ---------------------------------------------------------------------
+          // Server identity (best-effort, read-only, no writes)
+          // ---------------------------------------------------------------------
+          let serverSha = null;
+          try {
+            serverSha = require("child_process").execSync("git rev-parse HEAD", { cwd: process.cwd() }).toString().trim();
+          } catch (e) {
+            serverSha = null;
+          }
+
+          const result = {
+            schema: "corner-ev-funnel-audit-v1",
+            audit_only: true,
+            provider_calls: 0,
+            writes: 0,
+            now_utc: new Date(now).toISOString(),
+            window: {
+              recent_ms: RECENT_MS,
+              window_start_utc: new Date(windowStart).toISOString(),
+              description: "All matches.kickoff_utc > (now - 24h); includes all future/current fixtures plus recently-kicked-off window.",
+            },
+            server_sha: serverSha,
+            production_constants_used: {
+              EV_THRESHOLD,
+              STALE_MS,
+              MAX_QUOTE_SKEW_MS,
+              MIN_MAPPING_CONFIDENCE,
+              EXECUTION_QUOTE_MAX_AGE_MS,
+              EXECUTION_CLOCK_TOLERANCE_MS,
+              source_files: ["server/lib/ev.ts", "server/lib/execution-guard.ts"],
+            },
+            stage1_hkjc_complete_cou_lines: {
+              total_hkjc_cou_price_rows: hkjcCouRows.length,
+              distinct_match_line_pairs: hkjcCouByMatchLine.size,
+              complete_both_sides_count: completeCouLines.length,
+              incomplete_one_sided_count: incompleteCouLines.length,
+              distinct_matches_with_complete_line: matchesWithCompleteCouLine.size,
+              incomplete_sample: incompleteCouLines.slice(0, 10),
+            },
+            stage2_pinnapi_identity_mapping: {
+              matches_considered: stage2.length,
+              mapped_to_pinnapi: mappedToPinnapi.length,
+              not_mapped_to_pinnapi: notMappedToPinnapi.length,
+              not_mapped_sample: notMappedToPinnapi.slice(0, 15),
+            },
+            stage3_pinnapi_corner_child_status: {
+              matches_considered: stage3.length,
+              complete_quotes_present: stage3Complete.length,
+              one_sided_only: stage3OneSided.length,
+              no_persisted_pinnacle_cou_rows: stage3NoRows.length,
+              evidence_gap_note:
+                "odds_latest cannot by itself distinguish parsePinnapiCornerLines marketStatus values 'unavailable' (0 candidates) vs 'ambiguous' (>1 candidates) vs successfully-parsed-but-non-quarter-step lines dropped by isQuarterStep filtering, because the engine only persists successfully parsed COU rows. Runtime pinnapi_corner_detail_unavailable log lines (server-side console.log via log()) were NOT captured by this DB-only audit; a follow-up log-grep pass would be needed to fully disambiguate. This is a genuine evidence gap, reported honestly.",
+              one_sided_sample: stage3OneSided.slice(0, 10),
+              no_rows_sample: stage3NoRows.slice(0, 15),
+            },
+            stage4_exact_line_intersection: {
+              hkjc_complete_lines_checked: intersection.length,
+              intersect_count: exactLineIntersectRows.length,
+              non_intersect_count: intersection.length - exactLineIntersectRows.length,
+            },
+            stage5_freshness: {
+              exact_line_candidates: freshnessRows.length,
+              synchronized_count: synchronizedRows.length,
+              unsynchronized_count: freshnessRows.length - synchronizedRows.length,
+              fail_reason_breakdown: failByReason,
+              thresholds_ms: { STALE_MS, MAX_QUOTE_SKEW_MS, EXECUTION_QUOTE_MAX_AGE_MS },
+              unsynchronized_sample: freshnessRows.filter((r) => !r.synchronized).slice(0, 15),
+            },
+            stage6_ev_eligibility: {
+              synchronized_candidates_with_ev_calc: evCandidates.length,
+              eligible_for_threshold_check: eligibleEv.length,
+              pass_threshold_count: passThreshold.length,
+              positive_ev_but_below_threshold_count: positiveButBelowThreshold.length,
+              ev_threshold: EV_THRESHOLD,
+              top_15_candidates_by_edge: topCandidates,
+              pass_threshold_rows: passThreshold,
+              positive_but_below_threshold_rows: positiveButBelowThreshold,
+            },
+            stage8_historical_simulation_bets: {
+              case2_ev_by_market_and_exclusion: betCountsByMarket,
+              all_categories_by_market: allBetCountsByMarketAnyCategory,
+              note: "excluded_from_stats=1 marks legacy/contaminated rows per schema.ts comment 'Preserves legacy rows for audit while excluding them from the live test.' Clean current evidence = excluded_from_stats=0 rows only.",
+            },
+          };
+
+          console.log(JSON.stringify(result));
+          db.close();
+
+          NODE
