@@ -17,21 +17,165 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 執行一次賽前窗口掃描
+      - name: 只讀核對研究時間點
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
-            set -e
-            cd /opt/odds-radar
-            set -a
-            . ./.env
-            set +a
-            test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
-            docker compose ps
-            curl --fail --silent --show-error \
-              --max-time 240 \
-              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/scan/window
-          '
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/odds-radar && python3 -' <<'PY'
+          import json
+          import sqlite3
+          import subprocess
+          import time
+          from datetime import datetime, timezone
+
+          DB_PATH = "/opt/odds-radar/data/data.db"
+          DEPLOYED_AT_MS = 1787502952000
+          now_ms = int(time.time() * 1000)
+          db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+
+          def iso(ms):
+              if ms is None:
+                  return None
+              return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+          def emit(kind, **payload):
+              print(json.dumps({"kind": kind, **payload}, ensure_ascii=False, sort_keys=True))
+
+          emit(
+              "runtime",
+              audited_at=iso(now_ms),
+              deployed_at=iso(DEPLOYED_AT_MS),
+              git_head=subprocess.check_output(
+                  ["git", "-C", "/opt/odds-radar", "rev-parse", "HEAD"],
+                  text=True,
+              ).strip(),
+          )
+
+          tables = {
+              row["name"]
+              for row in db.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'"
+              ).fetchall()
+          }
+          emit(
+              "schema",
+              has_points="research_timeline_points" in tables,
+              has_snapshots="research_timeline_snapshots" in tables,
+          )
+          if "research_timeline_points" not in tables:
+              raise SystemExit("research_timeline_points is missing")
+
+          rows = db.execute(
+              """
+              SELECT p.match_id, p.stage, p.target_at, p.captured_at,
+                     p.status, p.note, p.created_at, p.updated_at,
+                     m.home_team, m.away_team, m.league, m.kickoff_utc
+                FROM research_timeline_points p
+                JOIN matches m ON m.id=p.match_id
+               WHERE p.stage IN ('T30','T15','T5')
+                 AND (
+                   p.created_at >= ?
+                   OR p.target_at BETWEEN ? AND ?
+                 )
+               ORDER BY p.target_at, p.match_id, p.stage
+              """,
+              (DEPLOYED_AT_MS, now_ms - 6 * 60 * 60 * 1000, now_ms + 30 * 60 * 60 * 1000),
+          ).fetchall()
+
+          stage_stats = {}
+          for stage in ("T30", "T15", "T5"):
+              stage_rows = [row for row in rows if row["stage"] == stage]
+              due = [row for row in stage_rows if row["target_at"] <= now_ms]
+              captured = [row for row in due if row["captured_at"] is not None]
+              delays = sorted(
+                  (row["captured_at"] - row["target_at"]) / 1000
+                  for row in captured
+              )
+              on_time = [delay for delay in delays if 0 <= delay <= 60]
+              stage_stats[stage] = {
+                  "tracked": len(stage_rows),
+                  "due": len(due),
+                  "captured_or_partial": len(captured),
+                  "on_time_0_60s": len(on_time),
+                  "late_over_60s": sum(delay > 60 for delay in delays),
+                  "early_negative_delay": sum(delay < 0 for delay in delays),
+                  "missing_after_target": sum(
+                      row["captured_at"] is None for row in due
+                  ),
+                  "median_delay_sec": (
+                      delays[len(delays) // 2] if delays else None
+                  ),
+                  "max_delay_sec": max(delays) if delays else None,
+              }
+          emit("summary", stages=stage_stats, point_rows=len(rows))
+
+          for row in rows:
+              delay_sec = (
+                  round((row["captured_at"] - row["target_at"]) / 1000, 3)
+                  if row["captured_at"] is not None and row["target_at"] is not None
+                  else None
+              )
+              emit(
+                  "point",
+                  match_id=row["match_id"],
+                  match=f'{row["home_team"]} vs {row["away_team"]}',
+                  league=row["league"],
+                  stage=row["stage"],
+                  kickoff_at=iso(row["kickoff_utc"]),
+                  target_at=iso(row["target_at"]),
+                  captured_at=iso(row["captured_at"]),
+                  delay_sec=delay_sec,
+                  status=row["status"],
+                  note=row["note"],
+                  due=row["target_at"] <= now_ms,
+              )
+
+          quote_rows = db.execute(
+              """
+              SELECT stage, provider, market, COUNT(*) AS quote_count,
+                     COUNT(DISTINCT match_id) AS match_count
+                FROM research_timeline_snapshots
+               WHERE stage IN ('T30','T15','T5')
+                 AND captured_at >= ?
+               GROUP BY stage, provider, market
+               ORDER BY stage, provider, market
+              """,
+              (DEPLOYED_AT_MS,),
+          ).fetchall()
+          for row in quote_rows:
+              emit("quotes", **dict(row))
+
+          future = db.execute(
+              """
+              WITH stages(stage, offset_ms) AS (
+                VALUES ('T30',1800000),('T15',900000),('T5',300000)
+              )
+              SELECT m.id AS match_id, m.home_team, m.away_team, m.league,
+                     m.kickoff_utc, stages.stage,
+                     m.kickoff_utc-stages.offset_ms AS target_at
+                FROM matches m CROSS JOIN stages
+               WHERE m.kickoff_utc-stages.offset_ms > ?
+                 AND m.kickoff_utc < ?
+               ORDER BY target_at
+               LIMIT 12
+              """,
+              (now_ms, now_ms + 30 * 60 * 60 * 1000),
+          ).fetchall()
+          for row in future:
+              emit(
+                  "next_target",
+                  match_id=row["match_id"],
+                  match=f'{row["home_team"]} vs {row["away_team"]}',
+                  league=row["league"],
+                  stage=row["stage"],
+                  kickoff_at=iso(row["kickoff_utc"]),
+                  target_at=iso(row["target_at"]),
+                  seconds_from_now=round((row["target_at"] - now_ms) / 1000),
+              )
+          PY
+
+          echo '--- recent research scheduler logs ---'
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd /opt/odds-radar && sudo docker compose --env-file .env logs --since 8h --no-color radar | grep -E 'auto_research_timeline|research_openings|auto_window_scan|error' | tail -240 || true"
