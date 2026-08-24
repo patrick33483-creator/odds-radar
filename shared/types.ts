@@ -326,6 +326,15 @@ export interface ResearchResultCollectorStatus {
 export type ResearchStage = "initial" | "T30" | "T15" | "T5";
 export type ResearchMarket = "AH" | "OU" | "COU";
 export type ResearchProvider = "hkjc" | "pinnacle";
+export type ResearchCellStatus =
+  | "captured"
+  | "partial"
+  | "pending"
+  | "source_unavailable"
+  | "match_unmatched"
+  | "market_unavailable"
+  | "historical_unavailable"
+  | "checkpoint_missed";
 
 export interface ResearchTimelineQuote {
   provider: ResearchProvider;
@@ -358,6 +367,8 @@ export interface ResearchStageSnapshot {
   /** Includes known unavailable source/market combinations. */
   note: string | null;
   quotes: ResearchTimelineQuote[];
+  /** Per provider/market explanation for every populated or empty cell. */
+  cells: Record<ResearchProvider, Record<ResearchMarket, ResearchCellStatus>>;
 }
 
 export interface ResearchMatchRow {
@@ -393,6 +404,8 @@ export interface ResearchDatasetResponse {
     resultEligibleMatches: number;
     firstSnapshotAt: number | null;
     lastSnapshotAt: number | null;
+    /** First checkpoint record created by the isolated research collector. */
+    collectionStartedAt: number | null;
     providerCounts: Array<{ name: ResearchProvider; count: number }>;
     marketCounts: Array<{ name: ResearchMarket; count: number }>;
     stageCoverage: Array<{

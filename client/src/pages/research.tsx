@@ -10,8 +10,10 @@ import {
   Database,
   Download,
   ExternalLink,
+  History,
   Search,
   TriangleAlert,
+  Unplug,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +24,7 @@ import { cn } from "@/lib/utils";
 import {
   MARKET_LABEL,
   SELECTION_LABEL,
+  type ResearchCellStatus,
   type ResearchDatasetResponse,
   type ResearchMarket,
   type ResearchMatchRow,
@@ -42,6 +45,24 @@ const STAGE_LABEL: Record<ResearchStage, string> = {
   T15: "T-15",
   T5: "T-5",
 };
+const CELL_STATUS_META: Record<ResearchCellStatus, { label: string; detail: string }> = {
+  captured: { label: "已收集", detail: "雙邊賠率已完整保存" },
+  partial: { label: "只有單邊", detail: "來源只返回其中一邊賠率" },
+  pending: { label: "待時間點", detail: "尚未到指定收集時間" },
+  source_unavailable: { label: "來源不提供", detail: "外部來源本身沒有提供此市場" },
+  match_unmatched: { label: "初盤配對不到", detail: "未能在外部初盤來源配對此賽事" },
+  market_unavailable: { label: "當時未開盤", detail: "收集已執行，但莊家未開盤或來源沒有返回" },
+  historical_unavailable: { label: "上線前資料", detail: "研究收集功能上線前，無法回補此時間點" },
+  checkpoint_missed: { label: "疑似漏收", detail: "時間點已過，但沒有建立任何收集紀錄" },
+};
+
+type DataStateFilter = "all" | "review" | "unavailable" | "pending" | "captured";
+const UNAVAILABLE_STATUSES = new Set<ResearchCellStatus>([
+  "source_unavailable",
+  "match_unmatched",
+  "market_unavailable",
+  "historical_unavailable",
+]);
 
 function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
@@ -54,13 +75,32 @@ function stageTone(status: ResearchStageSnapshot["status"]): string {
   return "border-negative/30 bg-negative/10 text-negative";
 }
 
+function cellTone(status: ResearchCellStatus): string {
+  if (status === "captured") return "border-positive/30 bg-positive/10 text-positive";
+  if (status === "pending") return "border-pinnacle/30 bg-pinnacle/10 text-pinnacle";
+  if (status === "checkpoint_missed") return "border-negative/30 bg-negative/10 text-negative";
+  if (status === "partial" || status === "market_unavailable") {
+    return "border-warning/30 bg-warning/10 text-warning";
+  }
+  return "border-border bg-muted/50 text-muted-foreground";
+}
+
 function StageBadge({ snapshot }: { snapshot: ResearchStageSnapshot }) {
   const Icon = snapshot.status === "captured" ? Check : snapshot.status === "pending" ? CircleDashed : TriangleAlert;
-  const text = snapshot.status === "captured" ? "已收集" : snapshot.status === "partial" ? "部分" : snapshot.status === "pending" ? "待收集" : "缺失";
+  const text = snapshot.status === "captured"
+    ? "已收集"
+    : snapshot.status === "partial"
+      ? "部分"
+      : snapshot.status === "pending" && snapshot.targetAt
+        ? `${fmtTime(snapshot.targetAt)} 收集`
+        : snapshot.status === "pending"
+          ? "待收集"
+          : "缺失";
   return (
     <span
       className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]", stageTone(snapshot.status))}
       title={[
+        snapshot.status === "pending" && snapshot.targetAt ? `預定收集 ${fmtKickoff(snapshot.targetAt)}` : null,
         snapshot.firstCapturedAt ? `首次收集 ${fmtTime(snapshot.firstCapturedAt)}` : null,
         snapshot.lastRetryAt ? `最後補收 ${fmtTime(snapshot.lastRetryAt)}` : null,
       ].filter(Boolean).join("；") || undefined}
@@ -94,17 +134,33 @@ function TimelineCell({
 }) {
   const quotes = snapshot.quotes.filter((quote) => quote.provider === provider && quote.market === market);
   const lines = quoteLines(quotes);
+  const cellStatus = snapshot.cells[provider][market];
+  const statusMeta = CELL_STATUS_META[cellStatus];
   if (!lines.length) {
-    const unavailableOpening = snapshot.stage === "initial" && provider === "pinnacle" && market === "COU";
+    const Icon = cellStatus === "pending"
+      ? CircleDashed
+      : cellStatus === "historical_unavailable"
+        ? History
+        : cellStatus === "checkpoint_missed"
+          ? TriangleAlert
+          : Unplug;
     return (
       <div className="flex min-h-16 flex-col items-center justify-center gap-1 px-2 py-3 text-center text-[10px] text-muted-foreground">
-        <span>{unavailableOpening ? "真初盤來源缺失" : snapshot.status === "pending" ? "待收集" : "沒有記錄"}</span>
-        {unavailableOpening ? <span className="max-w-[150px] text-warning">不會用首次觀察盤代替</span> : null}
+        <span className={cn("inline-flex items-center gap-1 rounded border px-1.5 py-0.5", cellTone(cellStatus))}>
+          <Icon className="h-3 w-3" />
+          {statusMeta.label}
+        </span>
+        <span className="max-w-[160px] leading-4">{statusMeta.detail}</span>
       </div>
     );
   }
   return (
     <div className="min-w-[170px] space-y-1.5 px-2 py-2">
+      {cellStatus === "partial" ? (
+        <span className={cn("inline-flex rounded border px-1.5 py-0.5 text-[10px]", cellTone(cellStatus))}>
+          {statusMeta.label}
+        </span>
+      ) : null}
       {lines.map((line, index) => (
         <div key={line.lineKey} className={cn(index > 0 && "border-t border-grid pt-1.5")}>
           <div className="flex items-center gap-1 text-[10px]">
@@ -144,7 +200,15 @@ function TimelineCell({
   );
 }
 
-function MatchTimeline({ row }: { row: ResearchMatchRow }) {
+function MatchTimeline({
+  row,
+  providers,
+  markets,
+}: {
+  row: ResearchMatchRow;
+  providers: ResearchProvider[];
+  markets: ResearchMarket[];
+}) {
   return (
     <details
       className="group overflow-hidden rounded-md border border-border bg-card"
@@ -213,12 +277,12 @@ function MatchTimeline({ row }: { row: ResearchMatchRow }) {
             </tr>
           </thead>
           <tbody>
-            {MARKETS.map((market) =>
-              PROVIDERS.map((provider, providerIndex) => (
+            {markets.map((market) =>
+              providers.map((provider, providerIndex) => (
                 <tr key={`${market}-${provider}`} className="align-top">
                   {providerIndex === 0 ? (
                     <th
-                      rowSpan={2}
+                      rowSpan={providers.length}
                       className="sticky left-0 z-[1] border-b border-r border-grid bg-card px-3 py-3 text-left font-medium"
                     >
                       {MARKET_LABEL[market]}
@@ -252,6 +316,7 @@ export default function Research() {
   const [days, setDays] = useState("7");
   const [provider, setProvider] = useState<ResearchProvider | "all">("all");
   const [market, setMarket] = useState<ResearchMarket | "all">("all");
+  const [dataState, setDataState] = useState<DataStateFilter>("all");
   const [search, setSearch] = useState("");
   const [downloading, setDownloading] = useState<"timeline" | "results" | null>(null);
   const query = `/api/research?days=${days}&provider=${provider}&market=${market}`;
@@ -260,12 +325,56 @@ export default function Research() {
     refetchInterval: 60_000,
   });
 
+  const activeProviders = useMemo<ResearchProvider[]>(
+    () => provider === "all" ? PROVIDERS : [provider],
+    [provider],
+  );
+  const activeMarkets = useMemo<ResearchMarket[]>(
+    () => market === "all" ? MARKETS : [market],
+    [market],
+  );
   const rows = useMemo(() => {
     const term = search.trim().toLowerCase();
-    return (data?.matches ?? []).filter((row) =>
-      term ? `${row.league}${row.homeTeam}${row.awayTeam}${row.matchId}`.toLowerCase().includes(term) : true,
-    );
-  }, [data, search]);
+    return (data?.matches ?? []).filter((row) => {
+      if (term && !`${row.league}${row.homeTeam}${row.awayTeam}${row.matchId}`.toLowerCase().includes(term)) {
+        return false;
+      }
+      const statuses = STAGES.flatMap((stage) =>
+        activeProviders.flatMap((activeProvider) =>
+          activeMarkets.map((activeMarket) => row.timeline[stage].cells[activeProvider][activeMarket]),
+        ),
+      );
+      if (dataState === "review") return statuses.includes("checkpoint_missed");
+      if (dataState === "unavailable") return statuses.some((status) => UNAVAILABLE_STATUSES.has(status));
+      if (dataState === "pending") return statuses.includes("pending");
+      if (dataState === "captured") return statuses.includes("captured");
+      return true;
+    });
+  }, [activeMarkets, activeProviders, data, dataState, search]);
+  const cellCounts = useMemo(() => {
+    const counts = {
+      captured: 0,
+      pending: 0,
+      unavailable: 0,
+      review: 0,
+      partial: 0,
+    };
+    for (const row of rows) {
+      for (const stage of STAGES) {
+        for (const activeProvider of activeProviders) {
+          for (const activeMarket of activeMarkets) {
+            const status = row.timeline[stage].cells[activeProvider][activeMarket];
+            if (status === "captured") counts.captured += 1;
+            else if (status === "pending") counts.pending += 1;
+            else if (status === "checkpoint_missed") counts.review += 1;
+            else if (status === "partial") counts.partial += 1;
+            else counts.unavailable += 1;
+          }
+        }
+      }
+    }
+    return counts;
+  }, [activeMarkets, activeProviders, rows]);
   const coverage = (stage: ResearchStage) => {
     const item = data?.summary.stageCoverage.find((entry) => entry.stage === stage);
     return item?.totalMatches ? item.capturedMatches / item.totalMatches : 0;
@@ -329,6 +438,16 @@ export default function Research() {
             <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-market"><SelectValue /></SelectTrigger>
             <SelectContent><SelectItem value="all">三個玩法</SelectItem><SelectItem value="AH">亞洲讓球</SelectItem><SelectItem value="OU">入球大細</SelectItem><SelectItem value="COU">角球大細</SelectItem></SelectContent>
           </Select>
+          <Select value={dataState} onValueChange={(value) => setDataState(value as DataStateFilter)}>
+            <SelectTrigger className="h-8 w-[132px] text-xs" data-testid="select-research-data-state"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部資料狀態</SelectItem>
+              <SelectItem value="review">只看疑似漏收</SelectItem>
+              <SelectItem value="unavailable">只看來源缺口</SelectItem>
+              <SelectItem value="pending">只看待收集</SelectItem>
+              <SelectItem value="captured">只看已收集</SelectItem>
+            </SelectContent>
+          </Select>
           <div className="relative min-w-[180px] flex-1 sm:max-w-[280px]">
             <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
             <Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜尋球隊、聯賽" className="h-8 pl-8 text-xs" data-testid="input-research-search" />
@@ -345,6 +464,14 @@ export default function Research() {
           <span>最近快照 {fmtTime(data?.summary.lastSnapshotAt)}</span>
           {data?.collector.lastError ? <span className="text-negative">{data.collector.lastError}</span> : null}
         </div>
+        <div className="flex flex-wrap items-center gap-1.5 border-t border-border px-3 py-1.5 text-[10px]">
+          <span className="mr-1 text-muted-foreground">目前列表格數</span>
+          <span className="rounded border border-positive/30 bg-positive/10 px-1.5 py-0.5 text-positive" data-testid="count-cells-captured">已收集 {cellCounts.captured}</span>
+          <span className="rounded border border-warning/30 bg-warning/10 px-1.5 py-0.5 text-warning" data-testid="count-cells-partial">單邊 {cellCounts.partial}</span>
+          <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-muted-foreground" data-testid="count-cells-unavailable">來源／歷史限制 {cellCounts.unavailable}</span>
+          <span className="rounded border border-pinnacle/30 bg-pinnacle/10 px-1.5 py-0.5 text-pinnacle" data-testid="count-cells-pending">待收集 {cellCounts.pending}</span>
+          <span className="rounded border border-negative/30 bg-negative/10 px-1.5 py-0.5 text-negative" data-testid="count-cells-review">疑似漏收 {cellCounts.review}</span>
+        </div>
       </header>
 
       <main className="flex-1 space-y-2 overflow-y-auto p-2 sm:p-3" data-testid="scroll-research">
@@ -352,7 +479,14 @@ export default function Research() {
           <EmptyState title="讀取不到研究數據" hint="請確認後端服務正在運行。" testId="error-research" />
         ) : rows.length === 0 ? (
           <EmptyState title="呢個篩選暫時未有數據" hint="系統會匯入可核實的莊家真初盤，並在背景收集 T-30、T-15、T-5 及完場賽果。" testId="empty-research" />
-        ) : rows.map((row) => <MatchTimeline key={row.matchId} row={row} />)}
+        ) : rows.map((row) => (
+          <MatchTimeline
+            key={row.matchId}
+            row={row}
+            providers={activeProviders}
+            markets={activeMarkets}
+          />
+        ))}
       </main>
     </div>
   );

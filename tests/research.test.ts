@@ -188,6 +188,10 @@ describe("research data collection", () => {
       firstCapturedAt: now,
       lastRetryAt: now + 1_000,
       capturedAt: now,
+      cells: {
+        hkjc: { AH: "captured", OU: "captured", COU: "captured" },
+        pinnacle: { AH: "captured", OU: "captured", COU: "captured" },
+      },
     });
   });
 
@@ -255,6 +259,13 @@ describe("research data collection", () => {
       researchDataset({ days: 7, provider: "all", market: "all" })
         .matches.find((match) => match.matchId === "external-initial-lock")?.timeline.initial.note,
     ).toBe("Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source.");
+    expect(
+      researchDataset({ days: 7, provider: "all", market: "all" })
+        .matches.find((match) => match.matchId === "external-initial-lock")?.timeline.initial.cells,
+    ).toMatchObject({
+      hkjc: { AH: "partial", OU: "market_unavailable", COU: "market_unavailable" },
+      pinnacle: { AH: "market_unavailable", OU: "market_unavailable", COU: "source_unavailable" },
+    });
     const timelineCsv = researchCsv("timeline", { days: 7, provider: "all", market: "all" });
     expect(timelineCsv).toContain("first_captured_at,last_retry_at");
     expect(timelineCsv).toContain("source_match_id");
@@ -296,5 +307,38 @@ describe("research data collection", () => {
     expect(outcome.candidates).toBeGreaterThanOrEqual(1);
     expect(rawDb.prepare("SELECT COUNT(*) count FROM simulation_bets").get()).toEqual(beforeBets);
     expect(rawDb.prepare("SELECT COUNT(*) count FROM odds_snapshots").get()).toEqual(beforeLive);
+  });
+
+  it("distinguishes historical gaps from a genuinely missed live checkpoint", () => {
+    const collectionStartedAt = Number((rawDb.prepare(
+      "SELECT MIN(COALESCE(first_captured_at,created_at)) value FROM research_timeline_points",
+    ).get() as { value: number }).value);
+    const historicalKickoff = collectionStartedAt - 60 * 60_000;
+    addMatch("historical-gap", historicalKickoff);
+    rawDb.prepare(
+      `INSERT INTO research_results(
+        match_id,hkjc_id,home_score,away_score,corners_total,source,fetched_at
+      ) VALUES(?,?,?,?,?,?,?)`,
+    ).run("historical-gap", "historical-gap", 1, 0, 8, "test", collectionStartedAt);
+
+    const missedKickoff = collectionStartedAt + 31 * 60_000;
+    addMatch("missed-checkpoint", missedKickoff);
+    rawDb.prepare(
+      `INSERT INTO research_results(
+        match_id,hkjc_id,home_score,away_score,corners_total,source,fetched_at
+      ) VALUES(?,?,?,?,?,?,?)`,
+    ).run("missed-checkpoint", "missed-checkpoint", 1, 1, 10, "test", missedKickoff + 60_000);
+
+    const dataset = researchDataset(
+      { days: 7, provider: "all", market: "all" },
+      missedKickoff + 60_000,
+    );
+    const historical = dataset.matches.find((match) => match.matchId === "historical-gap");
+    const missed = dataset.matches.find((match) => match.matchId === "missed-checkpoint");
+
+    expect(historical?.timeline.T30.cells.hkjc.AH).toBe("historical_unavailable");
+    expect(missed?.timeline.T30.cells.hkjc.AH).toBe("checkpoint_missed");
+    expect(missed?.timeline.initial.cells.pinnacle.COU).toBe("source_unavailable");
+    expect(dataset.summary.collectionStartedAt).toBe(collectionStartedAt);
   });
 });

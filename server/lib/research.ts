@@ -11,9 +11,12 @@ import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from 
 import { getState, rawDb, setState } from "./store";
 import type {
   ResearchDatasetResponse,
+  ResearchMarket,
   ResearchMatchRow,
+  ResearchProvider,
   ResearchResultCollectorStatus,
   ResearchStage,
+  ResearchStageSnapshot,
   ResearchTimelineQuote,
 } from "@shared/types";
 
@@ -499,6 +502,28 @@ function timelineStatus(
   return targetAt !== null && now < targetAt ? "pending" : "missing";
 }
 
+function researchCellStatus(
+  stage: ResearchStage,
+  provider: ResearchProvider,
+  market: ResearchMarket,
+  snapshotStatus: ResearchStageSnapshot["status"],
+  stageQuotes: ResearchTimelineQuote[],
+  targetAt: number | null,
+  firstCapturedAt: number | null,
+  collectionStartedAt: number | null,
+): ResearchStageSnapshot["cells"][ResearchProvider][ResearchMarket] {
+  const pairQuotes = stageQuotes.filter((quote) => quote.provider === provider && quote.market === market);
+  if (pairQuotes.length >= 2) return "captured";
+  if (pairQuotes.length > 0) return "partial";
+  if (stage === "initial" && provider === "pinnacle" && market === "COU") return "source_unavailable";
+  if (snapshotStatus === "pending") return "pending";
+  if (stage === "initial") return firstCapturedAt ? "market_unavailable" : "match_unmatched";
+  if (targetAt !== null && collectionStartedAt !== null && targetAt < collectionStartedAt) {
+    return "historical_unavailable";
+  }
+  return firstCapturedAt ? "market_unavailable" : "checkpoint_missed";
+}
+
 export function researchDataset(filters: ResearchFilters, now = Date.now()): ResearchDatasetResponse {
   const { clause, params } = filterSql(filters, now);
   const { clause: matchClause, params: matchParams } = matchFilterSql(filters, now);
@@ -516,6 +541,15 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
     first_snapshot_at: number | null;
     last_snapshot_at: number | null;
   };
+  const collection = rawDb
+    .prepare(
+      `SELECT MIN(COALESCE(first_captured_at,created_at)) collection_started_at
+         FROM research_timeline_points`,
+    )
+    .get() as { collection_started_at: number | null };
+  const collectionStartedAt = collection.collection_started_at === null
+    ? null
+    : Number(collection.collection_started_at);
   const providerCounts = rawDb
     .prepare(
       `SELECT q.provider name,COUNT(*) count
@@ -654,6 +688,7 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
       resultEligibleMatches: coverage.eligible ?? 0,
       firstSnapshotAt: summary.first_snapshot_at,
       lastSnapshotAt: summary.last_snapshot_at,
+      collectionStartedAt,
       providerCounts,
       marketCounts,
       stageCoverage,
@@ -686,19 +721,42 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
             const lastRetryAt = point?.last_retry_at === null || point?.last_retry_at === undefined
               ? null
               : Number(point.last_retry_at);
+            const targetAt = point?.target_at === null || point?.target_at === undefined
+              ? stageTargetAt(stage, kickoffUtc)
+              : Number(point.target_at);
+            const status = timelineStatus(stage, kickoffUtc, now, stageQuotes, String(point?.status ?? ""));
+            const cells = Object.fromEntries(
+              RESEARCH_PROVIDERS.map((provider) => [
+                provider,
+                Object.fromEntries(
+                  RESEARCH_MARKETS.map((market) => [
+                    market,
+                    researchCellStatus(
+                      stage,
+                      provider,
+                      market,
+                      status,
+                      stageQuotes,
+                      targetAt,
+                      firstCapturedAt,
+                      collectionStartedAt,
+                    ),
+                  ]),
+                ),
+              ]),
+            ) as ResearchStageSnapshot["cells"];
             return [
               stage,
               {
                 stage,
-                status: timelineStatus(stage, kickoffUtc, now, stageQuotes, String(point?.status ?? "")),
-                targetAt: point?.target_at === null || point?.target_at === undefined
-                  ? stageTargetAt(stage, kickoffUtc)
-                  : Number(point.target_at),
+                status,
+                targetAt,
                 firstCapturedAt,
                 lastRetryAt,
                 capturedAt: firstCapturedAt,
                 note: point?.note === null || point?.note === undefined ? null : String(point.note),
                 quotes: stageQuotes,
+                cells,
               },
             ];
           }),
