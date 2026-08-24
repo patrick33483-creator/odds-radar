@@ -17,21 +17,148 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 執行一次賽前窗口掃描
+      - name: 稽核研究賠率收集覆蓋率（唯讀）
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
-            set -e
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+            set -euo pipefail
             cd /opt/odds-radar
-            set -a
-            . ./.env
-            set +a
-            test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
             docker compose ps
-            curl --fail --silent --show-error \
-              --max-time 240 \
-              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/scan/window
-          '
+            docker compose exec -T radar node <<'JS'
+          const Database = require("better-sqlite3");
+
+          const db = new Database("/app/data/data.db", {
+            readonly: true,
+            fileMustExist: true,
+          });
+          const now = Date.now();
+          const day = 24 * 60 * 60 * 1000;
+          const offsets = { T30: 30 * 60 * 1000, T15: 15 * 60 * 1000, T5: 5 * 60 * 1000 };
+          const first = db.prepare(`
+            SELECT MIN(created_at) point_start_at,
+                   MIN(first_captured_at) first_captured_at,
+                   COUNT(*) point_rows
+              FROM research_timeline_points
+          `).get();
+          const pointStart = Number(first.point_start_at || first.first_captured_at || now);
+
+          const pointStatus = db.prepare(`
+            SELECT stage,status,COUNT(*) count
+              FROM research_timeline_points
+             GROUP BY stage,status
+             ORDER BY stage,status
+          `).all();
+          const notes = db.prepare(`
+            SELECT stage,status,COALESCE(note,'') note,COUNT(*) count
+              FROM research_timeline_points
+             GROUP BY stage,status,COALESCE(note,'')
+             ORDER BY count DESC
+          `).all();
+          const pairCoverage = db.prepare(`
+            SELECT stage,provider,market,COUNT(*) complete_matches
+              FROM (
+                SELECT match_id,stage,provider,market
+                  FROM research_timeline_snapshots
+                 GROUP BY match_id,stage,provider,market
+                HAVING COUNT(DISTINCT selection)>=2
+              )
+             GROUP BY stage,provider,market
+             ORDER BY stage,provider,market
+          `).all();
+          const quoteRows = db.prepare(`
+            SELECT stage,provider,market,COUNT(*) quote_rows,
+                   COUNT(DISTINCT match_id) matches
+              FROM research_timeline_snapshots
+             GROUP BY stage,provider,market
+             ORDER BY stage,provider,market
+          `).all();
+
+          const cohort = {};
+          const liveCohort = db.prepare(`
+            SELECT COUNT(*) eligible,
+                   SUM(CASE WHEN p.status='captured' THEN 1 ELSE 0 END) captured,
+                   SUM(CASE WHEN p.status='partial' THEN 1 ELSE 0 END) partial,
+                   SUM(CASE WHEN p.status='pending' THEN 1 ELSE 0 END) pending,
+                   SUM(CASE WHEN p.match_id IS NULL THEN 1 ELSE 0 END) no_point
+              FROM matches m
+              LEFT JOIN research_timeline_points p
+                ON p.match_id=m.id AND p.stage=?
+             WHERE m.kickoff_utc>=?
+               AND m.kickoff_utc-?<=?
+          `);
+          for (const [stage, offset] of Object.entries(offsets)) {
+            cohort[stage] = liveCohort.get(
+              stage,
+              pointStart + offset,
+              offset,
+              now,
+            );
+          }
+          cohort.initial = db.prepare(`
+            SELECT COUNT(*) candidate_matches,
+                   SUM(CASE WHEN p.status='captured' THEN 1 ELSE 0 END) captured,
+                   SUM(CASE WHEN p.status='partial' THEN 1 ELSE 0 END) partial,
+                   SUM(CASE WHEN p.status='pending' THEN 1 ELSE 0 END) pending,
+                   SUM(CASE WHEN p.match_id IS NULL THEN 1 ELSE 0 END) no_point
+              FROM matches m
+              LEFT JOIN research_timeline_points p
+                ON p.match_id=m.id AND p.stage='initial'
+             WHERE m.kickoff_utc BETWEEN ? AND ?
+          `).get(pointStart - 2 * day, now + 7 * day);
+
+          const dashboardRange = db.prepare(`
+            SELECT COUNT(DISTINCT m.id) matches
+              FROM matches m
+             WHERE m.kickoff_utc BETWEEN ? AND ?
+          `).get(now - 7 * day, now + 7 * day);
+          const timing = db.prepare(`
+            SELECT stage,COUNT(*) captured_points,
+                   ROUND(AVG((first_captured_at-target_at)/1000.0),1) avg_delay_sec,
+                   ROUND(MIN((first_captured_at-target_at)/1000.0),1) min_delay_sec,
+                   ROUND(MAX((first_captured_at-target_at)/1000.0),1) max_delay_sec,
+                   SUM(CASE WHEN first_captured_at-target_at<=120000 THEN 1 ELSE 0 END) within_2m,
+                   SUM(CASE WHEN first_captured_at-target_at>120000
+                             AND first_captured_at-target_at<=300000 THEN 1 ELSE 0 END) within_2_to_5m,
+                   SUM(CASE WHEN first_captured_at-target_at>300000 THEN 1 ELSE 0 END) over_5m
+              FROM research_timeline_points
+             WHERE target_at IS NOT NULL AND first_captured_at IS NOT NULL
+             GROUP BY stage
+             ORDER BY stage
+          `).all();
+
+          console.log(JSON.stringify({
+            schema_version: "research-coverage-audit-v1",
+            read_only: true,
+            generated_at: now,
+            collection_started_at: pointStart,
+            first_capture_at: first.first_captured_at,
+            point_rows: first.point_rows,
+            dashboard_range_matches: dashboardRange.matches,
+            post_install_eligible_cohort: cohort,
+            point_status: pointStatus,
+            provider_market_complete_matches: pairCoverage,
+            quote_rows: quoteRows,
+            timing,
+            notes,
+          }, null, 2));
+          db.close();
+          JS
+
+            echo "=== collector log counts, last 24h ==="
+            logs="$(docker compose logs --since 24h radar 2>&1 || true)"
+            for event in \
+              auto_research_timeline \
+              auto_window_scan \
+              auto_window_scan_error \
+              research_openings \
+              research_openings_error; do
+              printf '%s=%s\n' "$event" \
+                "$(printf '%s\n' "$logs" | grep -c "\"event\":\"$event\"" || true)"
+            done
+            echo "=== latest collector events ==="
+            printf '%s\n' "$logs" \
+              | grep -E '"event":"(auto_research_timeline|auto_window_scan|auto_window_scan_error|research_openings|research_openings_error)"' \
+              | tail -n 40 || true
+          REMOTE
