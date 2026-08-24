@@ -25,8 +25,8 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
             set -euo pipefail
             cd /opt/odds-radar
-            docker compose ps
-            docker compose exec -T radar node <<'JS'
+            sudo docker compose ps
+            sudo docker compose exec -T radar node <<'JS'
           const Database = require("better-sqlite3");
 
           const db = new Database("/app/data/data.db", {
@@ -147,7 +147,7 @@ jobs:
           JS
 
             echo "=== collector log counts, last 24h ==="
-            logs="$(docker compose logs --since 24h radar 2>&1 || true)"
+            logs="$(sudo docker compose logs --since 24h radar 2>&1 || true)"
             for event in \
               auto_research_timeline \
               auto_window_scan \
