@@ -85,7 +85,7 @@ def summarize(rows: list[dict]) -> dict:
         else "L"
         for value in profits
     )
-    return {
+    result = {
         "n": n,
         "roi_pct": round(mean * 100, 2),
         "roi_95ci_pct": [round(low * 100, 2), round(high * 100, 2)],
@@ -93,7 +93,24 @@ def summarize(rows: list[dict]) -> dict:
         "avg_odds": round(statistics.fmean(float(row["odds"]) for row in rows), 3),
         "outcomes": dict(outcomes),
         "matches": len({row["match_id"] for row in rows}),
+        "selections": dict(Counter(str(row["selection"]) for row in rows)),
+        "days": len({
+            int(row["kickoff_utc"]) // (24 * 60 * 60 * 1000)
+            for row in rows
+        }),
     }
+    for field in ("edge", "raw_gap"):
+        values = [float(row[field]) for row in rows if field in row]
+        if values:
+            result[f"avg_{field}_pct"] = round(statistics.fmean(values) * 100, 2)
+    values = [
+        float(row["line_advantage"])
+        for row in rows
+        if "line_advantage" in row
+    ]
+    if values:
+        result["avg_line_advantage"] = round(statistics.fmean(values), 3)
+    return result
 
 
 db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
@@ -196,12 +213,15 @@ def add_result(row: dict, group: dict, selection: str, odds: float) -> dict | No
         "line": group["line"],
         "odds": odds,
         "profit": profit,
+        "kickoff_utc": int(result["kickoff_utc"]),
+        "league": str(result["league"]),
     }
 
 
 edge_candidates: list[dict] = []
 line_candidates: list[dict] = []
 movement_candidates: list[dict] = []
+consensus_candidates: list[dict] = []
 
 for match_id in results:
     for market, selections in PAIR_SELECTIONS.items():
@@ -313,6 +333,24 @@ for match_id in results:
             if row:
                 movement_candidates.append(row)
 
+# A T30 candidate is marked as cross-stage consensus when the same side keeps
+# a non-negative raw HKJC/Pinnacle gap at one or both later checkpoints.
+positive_gap_keys = {
+    (row["match_id"], row["market"], row["stage"], row["selection"])
+    for row in edge_candidates
+    if row["raw_gap"] >= 0
+}
+for row in edge_candidates:
+    if row["stage"] != "T30" or row["raw_gap"] < 0:
+        continue
+    later = sum(
+        (row["match_id"], row["market"], stage, row["selection"])
+        in positive_gap_keys
+        for stage in ("T15", "T5")
+    )
+    if later:
+        consensus_candidates.append({**row, "later_confirmations": later})
+
 
 def segment(
     name: str,
@@ -328,6 +366,25 @@ def segment(
 segments: list[dict] = []
 for market in PAIR_SELECTIONS:
     for stage in ("initial", "T30", "T15", "T5"):
+        segments.append(
+            segment(
+                f"candidate_all_{market}_{stage}",
+                edge_candidates,
+                lambda row, m=market, s=stage:
+                    row["market"] == m and row["stage"] == s,
+                {"factor": "candidate_all", "market": market, "stage": stage},
+            )
+        )
+        segments.append(
+            segment(
+                f"raw_gap_negative_{market}_{stage}",
+                edge_candidates,
+                lambda row, m=market, s=stage:
+                    row["market"] == m and row["stage"] == s
+                    and row["raw_gap"] < 0,
+                {"factor": "raw_gap_negative", "market": market, "stage": stage},
+            )
+        )
         for threshold in (0.00, 0.02, 0.04, 0.06, 0.08):
             segments.append(
                 segment(
@@ -391,6 +448,19 @@ for market in PAIR_SELECTIONS:
                 )
             )
 
+for market in PAIR_SELECTIONS:
+    for minimum_confirmations in (1, 2):
+        segments.append(
+            segment(
+                f"raw_gap_consensus_{market}_T30_{minimum_confirmations}",
+                consensus_candidates,
+                lambda row, m=market, c=minimum_confirmations:
+                    row["market"] == m and row["later_confirmations"] >= c,
+                {"factor": "raw_gap_consensus", "market": market,
+                 "stage": "T30", "later_confirmations": minimum_confirmations},
+            )
+        )
+
 # Confirmatory-looking candidates require at least 12 independent matches.
 eligible = [row for row in segments if row.get("matches", 0) >= 12]
 ranked = sorted(
@@ -419,6 +489,10 @@ report = {
         "edge_candidates": len(edge_candidates),
         "line_candidates": len(line_candidates),
         "movement_candidates": len(movement_candidates),
+        "consensus_candidates": len(consensus_candidates),
+        "settled_matches_with_corners": sum(
+            row["corners_total"] is not None for row in results.values()
+        ),
     },
     "top_segments_min_12_matches": ranked[:30],
     "all_segments": segments,
