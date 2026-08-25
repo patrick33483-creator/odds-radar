@@ -17,38 +17,93 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 建立一致的唯讀研究快照
+      - name: 輸出研究資料覆蓋摘要
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh -o BatchMode=yes -o ConnectTimeout=20 \
             "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
+          import json
           import sqlite3
-          from pathlib import Path
+          from collections import defaultdict
 
-          source = sqlite3.connect(
+          db = sqlite3.connect(
               "file:/opt/odds-radar/data/data.db?mode=ro",
               uri=True,
           )
-          target_path = Path("/tmp/odds-radar-research-snapshot.db")
-          target_path.unlink(missing_ok=True)
-          target = sqlite3.connect(target_path)
-          with target:
-              source.backup(target)
-          target.close()
-          source.close()
-          target_path.chmod(0o644)
-          PY
-          scp "$DEPLOY_USER@$DEPLOY_HOST:/tmp/odds-radar-research-snapshot.db" \
-            odds-radar-research-snapshot.db
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo rm -f /tmp/odds-radar-research-snapshot.db"
+          db.row_factory = sqlite3.Row
 
-      - name: 上載研究快照
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds-radar-research-snapshot
-          path: odds-radar-research-snapshot.db
-          retention-days: 1
-          if-no-files-found: error
+          def rows(sql, params=()):
+              return [dict(row) for row in db.execute(sql, params)]
+
+          report = {
+              "table_counts": rows("""
+                  SELECT 'matches' table_name, COUNT(*) count FROM matches
+                  UNION ALL SELECT 'research_timeline_points', COUNT(*) FROM research_timeline_points
+                  UNION ALL SELECT 'research_timeline_snapshots', COUNT(*) FROM research_timeline_snapshots
+                  UNION ALL SELECT 'research_results', COUNT(*) FROM research_results
+                  UNION ALL SELECT 'results', COUNT(*) FROM results
+              """),
+              "coverage": rows("""
+                  SELECT q.provider,q.market,q.stage,
+                         COUNT(*) quotes,
+                         COUNT(DISTINCT q.match_id) matches,
+                         COUNT(DISTINCT CASE WHEN COALESCE(rr.match_id,r.match_id) IS NOT NULL
+                                             THEN q.match_id END) settled_matches,
+                         MIN(q.captured_at) first_captured_at,
+                         MAX(q.captured_at) last_captured_at
+                    FROM research_timeline_snapshots q
+                    LEFT JOIN research_results rr ON rr.match_id=q.match_id
+                    LEFT JOIN results r ON r.match_id=q.match_id
+                   GROUP BY q.provider,q.market,q.stage
+                   ORDER BY q.market,q.provider,
+                            CASE q.stage WHEN 'initial' THEN 0 WHEN 'T30' THEN 1
+                                         WHEN 'T15' THEN 2 ELSE 3 END
+              """),
+              "selections": rows("""
+                  SELECT provider,market,selection,COUNT(*) count
+                    FROM research_timeline_snapshots
+                   GROUP BY provider,market,selection
+                   ORDER BY market,provider,selection
+              """),
+              "settled_overlap": rows("""
+                  SELECT q.market,q.stage,COUNT(DISTINCT q.match_id) matches
+                    FROM research_timeline_snapshots q
+                    JOIN research_timeline_snapshots p
+                      ON p.match_id=q.match_id AND p.market=q.market
+                     AND p.stage=q.stage AND p.line_key=q.line_key
+                     AND p.selection=q.selection
+                     AND p.provider='pinnacle'
+                    LEFT JOIN research_results rr ON rr.match_id=q.match_id
+                    LEFT JOIN results r ON r.match_id=q.match_id
+                   WHERE q.provider='hkjc'
+                     AND COALESCE(rr.match_id,r.match_id) IS NOT NULL
+                   GROUP BY q.market,q.stage
+                   ORDER BY q.market,
+                            CASE q.stage WHEN 'initial' THEN 0 WHEN 'T30' THEN 1
+                                         WHEN 'T15' THEN 2 ELSE 3 END
+              """),
+              "settled_stage_pairs": rows("""
+                  SELECT q.market,q.provider,
+                         q.stage from_stage,n.stage to_stage,
+                         COUNT(DISTINCT q.match_id) matches
+                    FROM research_timeline_snapshots q
+                    JOIN research_timeline_snapshots n
+                      ON n.match_id=q.match_id AND n.provider=q.provider
+                     AND n.market=q.market AND n.line_key=q.line_key
+                     AND n.selection=q.selection
+                    LEFT JOIN research_results rr ON rr.match_id=q.match_id
+                    LEFT JOIN results r ON r.match_id=q.match_id
+                   WHERE q.stage IN ('initial','T30','T15')
+                     AND n.stage IN ('T30','T15','T5')
+                     AND CASE q.stage WHEN 'initial' THEN 0 WHEN 'T30' THEN 1 ELSE 2 END
+                       < CASE n.stage WHEN 'T30' THEN 1 WHEN 'T15' THEN 2 ELSE 3 END
+                     AND COALESCE(rr.match_id,r.match_id) IS NOT NULL
+                   GROUP BY q.market,q.provider,q.stage,n.stage
+                   ORDER BY q.market,q.provider,from_stage,to_stage
+              """),
+          }
+          print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+          db.close()
+          PY
