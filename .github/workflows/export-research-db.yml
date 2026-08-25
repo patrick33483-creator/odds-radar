@@ -1,0 +1,57 @@
+name: Export research database snapshot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Create consistent read-only snapshot
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
+          import sqlite3
+          from pathlib import Path
+
+          source = sqlite3.connect(
+              "file:/opt/odds-radar/data/data.db?mode=ro",
+              uri=True,
+          )
+          target_path = Path("/tmp/odds-radar-research-snapshot.db")
+          target_path.unlink(missing_ok=True)
+          target = sqlite3.connect(target_path)
+          with target:
+              source.backup(target)
+          target.close()
+          source.close()
+          target_path.chmod(0o644)
+          PY
+          scp "$DEPLOY_USER@$DEPLOY_HOST:/tmp/odds-radar-research-snapshot.db" \
+            odds-radar-research-snapshot.db
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo rm -f /tmp/odds-radar-research-snapshot.db"
+
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds-radar-research-snapshot
+          path: odds-radar-research-snapshot.db
+          retention-days: 1
+          if-no-files-found: error
