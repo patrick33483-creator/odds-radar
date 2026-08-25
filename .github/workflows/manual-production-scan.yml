@@ -118,6 +118,24 @@ jobs:
               ).fetchone()
               upcoming_matches[str(hours)] = dict(row)
 
+          next_matches = [
+              dict(row)
+              for row in con.execute(
+                  """
+                  SELECT league, home_team, away_team, kickoff_utc,
+                         ROUND((kickoff_utc - ?) / 60000.0, 1) AS minutes_to_kickoff,
+                         CASE WHEN pinnacle_match_id IS NOT NULL THEN 1 ELSE 0 END AS mapped
+                  FROM matches
+                  WHERE kickoff_utc > ?
+                    AND inplay=0
+                    AND status NOT LIKE '%FINISH%'
+                  ORDER BY kickoff_utc
+                  LIMIT 10
+                  """,
+                  (now_ms, now_ms),
+              )
+          ]
+
           provider_rows = [
               dict(row)
               for row in con.execute(
@@ -207,6 +225,7 @@ jobs:
                   "reached": simulation_target > 0 and active_simulation_bets >= simulation_target,
               },
               "upcoming_matches_by_hours": upcoming_matches,
+              "next_matches": next_matches,
               "provider_health": provider_rows,
               "latest_simulation_bets": latest_bets,
               "telegram_state": dict(telegram_states),
