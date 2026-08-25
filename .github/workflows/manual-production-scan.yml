@@ -19,13 +19,161 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 輸出研究優勢分析
+      - name: 輸出 Telegram 通知唯讀診斷
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          scp scripts/analyze-research-edge.py \
-            "$DEPLOY_USER@$DEPLOY_HOST:/tmp/analyze-research-edge.py"
           ssh -o BatchMode=yes -o ConnectTimeout=20 \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            'sudo python3 /tmp/analyze-research-edge.py; rc=$?; sudo rm -f /tmp/analyze-research-edge.py; exit $rc'
+            "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/odds-radar && sudo python3 -' <<'PY'
+          import datetime
+          import json
+          import os
+          import sqlite3
+          import subprocess
+          import urllib.parse
+          import urllib.request
+
+          ROOT = "/opt/odds-radar"
+          DB = f"{ROOT}/data/data.db"
+
+          def read_env(path):
+              values = {}
+              with open(path, encoding="utf-8") as handle:
+                  for raw in handle:
+                      line = raw.strip()
+                      if not line or line.startswith("#") or "=" not in line:
+                          continue
+                      key, value = line.split("=", 1)
+                      values[key.strip()] = value.strip().strip("'").strip('"')
+              return values
+
+          def telegram_check(url):
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as response:
+                      payload = json.load(response)
+                  return {
+                      "ok": bool(payload.get("ok")),
+                      "description": payload.get("description"),
+                  }
+              except Exception as exc:
+                  return {"ok": False, "description": str(exc)}
+
+          env = read_env(f"{ROOT}/.env")
+          token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = env.get("TELEGRAM_CHAT_ID", "").strip()
+          now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+
+          con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+          con.row_factory = sqlite3.Row
+
+          counts = {}
+          for hours in (6, 24, 48, 72):
+              cutoff = now_ms - hours * 3600 * 1000
+              counts[str(hours)] = con.execute(
+                  "SELECT COUNT(*) FROM simulation_bets WHERE placed_at >= ?",
+                  (cutoff,),
+              ).fetchone()[0]
+
+          latest_bets = [
+              dict(row)
+              for row in con.execute(
+                  """
+                  SELECT category, match_label, league, market, line_key, selection,
+                         placed_at, kickoff_utc
+                  FROM simulation_bets
+                  ORDER BY placed_at DESC
+                  LIMIT 10
+                  """
+              )
+          ]
+
+          telegram_states = con.execute(
+              """
+              SELECT COUNT(*) AS total,
+                     MAX(CAST(value AS INTEGER)) AS latest_sent_at
+              FROM app_state
+              WHERE key LIKE 'telegram_sent:%'
+              """
+          ).fetchone()
+
+          last_scan_row = con.execute(
+              "SELECT value, updated_at FROM app_state WHERE key='lastScan'"
+          ).fetchone()
+          last_scan = None
+          if last_scan_row:
+              try:
+                  payload = json.loads(last_scan_row["value"])
+                  last_scan = {
+                      "updated_at": last_scan_row["updated_at"],
+                      "result": payload.get("result"),
+                      "message": payload.get("message"),
+                      "selected_count": len(payload.get("selected") or []),
+                      "new_opportunity_count": len(payload.get("newOpportunityKeys") or []),
+                      "passes": payload.get("passes"),
+                      "detail_calls": payload.get("detailCalls"),
+                      "finished_at": payload.get("finishedAt"),
+                  }
+              except Exception as exc:
+                  last_scan = {"parse_error": str(exc)}
+
+          logs = subprocess.run(
+              [
+                  "docker", "compose", "--env-file", f"{ROOT}/.env",
+                  "-f", f"{ROOT}/compose.yaml", "logs",
+                  "--since", "72h", "--no-color",
+              ],
+              cwd=ROOT,
+              text=True,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              timeout=30,
+              check=False,
+          ).stdout.splitlines()
+          markers = ("telegram_notifications", "telegram_notification_error", "window_scan")
+          relevant_logs = [line[-1000:] for line in logs if any(marker in line for marker in markers)]
+
+          ps = subprocess.run(
+              [
+                  "docker", "compose", "--env-file", f"{ROOT}/.env",
+                  "-f", f"{ROOT}/compose.yaml", "ps", "--format", "json",
+              ],
+              cwd=ROOT,
+              text=True,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              timeout=20,
+              check=False,
+          )
+
+          get_me = {"ok": False, "description": "token missing"}
+          get_chat = {"ok": False, "description": "token or chat ID missing"}
+          if token:
+              get_me = telegram_check(f"https://api.telegram.org/bot{token}/getMe")
+          if token and chat_id:
+              encoded_chat = urllib.parse.quote(chat_id, safe="")
+              get_chat = telegram_check(
+                  f"https://api.telegram.org/bot{token}/getChat?chat_id={encoded_chat}"
+              )
+
+          print(json.dumps({
+              "checked_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "service_ps_returncode": ps.returncode,
+              "service_ps": ps.stdout.strip(),
+              "telegram_config": {
+                  "token_present": bool(token),
+                  "chat_id_present": bool(chat_id),
+                  "get_me": get_me,
+                  "get_chat": get_chat,
+              },
+              "simulation_bet_counts_by_hours": counts,
+              "latest_simulation_bets": latest_bets,
+              "telegram_state": dict(telegram_states),
+              "last_scan": last_scan,
+              "log_counts_72h": {
+                  marker: sum(marker in line for line in relevant_logs)
+                  for marker in markers
+              },
+              "latest_relevant_logs": relevant_logs[-40:],
+          }, ensure_ascii=False, indent=2))
+          PY
