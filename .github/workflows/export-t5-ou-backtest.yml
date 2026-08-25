@@ -1,0 +1,117 @@
+name: 匯出 T-5 OU 聯合回測資料（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-t5-ou-backtest-radar
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 以 SQLite 唯讀模式匯出 Radar T5 OU 報價與賽果
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          umask 077
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo python3 -' > radar-t5-ou.jsonl <<'PY'
+          import json
+          import sqlite3
+
+          uri = "file:/opt/odds-radar/data/data.db?mode=ro"
+          db = sqlite3.connect(uri, uri=True)
+          db.row_factory = sqlite3.Row
+          db.execute("BEGIN")
+          sql = r"""
+          SELECT m.id AS match_id, m.hkjc_id, m.league, m.home_team,
+                 m.away_team, m.kickoff_utc,
+                 q.provider, q.line_key, q.selection, q.decimal_odds,
+                 q.is_main, q.source_updated_at, q.captured_at, q.target_at,
+                 q.status AS quote_status,
+                 p.first_captured_at, p.last_retry_at,
+                 p.status AS point_status, p.note,
+                 COALESCE(rr.home_score, r.home_score) AS home_score,
+                 COALESCE(rr.away_score, r.away_score) AS away_score,
+                 COALESCE(rr.source, r.source) AS result_source,
+                 COALESCE(rr.fetched_at, r.fetched_at) AS result_fetched_at
+          FROM research_timeline_snapshots q
+          JOIN matches m ON m.id = q.match_id
+          LEFT JOIN research_timeline_points p
+            ON p.match_id = q.match_id AND p.stage = q.stage
+          LEFT JOIN research_results rr ON rr.match_id = m.id
+          LEFT JOIN results r ON r.match_id = m.id
+          WHERE q.stage = 'T5'
+            AND q.market = 'OU'
+            AND q.captured_at < m.kickoff_utc
+          ORDER BY m.kickoff_utc, m.id, q.provider,
+                   q.is_main DESC, q.line_key, q.selection
+          """
+          for row in db.execute(sql):
+              print(json.dumps(dict(row), ensure_ascii=False, separators=(",", ":")))
+          db.rollback()
+          db.close()
+          PY
+          test -s radar-t5-ou.jsonl
+
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo python3 -' > radar-t5-ou-simulations.jsonl <<'PY'
+          import json
+          import sqlite3
+
+          uri = "file:/opt/odds-radar/data/data.db?mode=ro"
+          db = sqlite3.connect(uri, uri=True)
+          db.row_factory = sqlite3.Row
+          db.execute("BEGIN")
+          sql = r"""
+          SELECT b.id, b.unique_key, b.category, b.match_id, b.market,
+                 b.line_key, b.selection, b.kickoff_utc, b.placed_at,
+                 b.total_stake, b.realized_return, b.realized_pnl,
+                 b.result_status, b.settlement_source, b.notes,
+                 l.provider, l.selection AS leg_selection, l.decimal_odds,
+                 l.stake, l.synthetic, l.leg_status, l.leg_return
+          FROM simulation_bets b
+          JOIN simulation_legs l ON l.bet_id = b.id
+          WHERE b.market = 'OU'
+            AND b.placed_at >= b.kickoff_utc - 300000
+            AND b.placed_at < b.kickoff_utc
+            AND b.excluded_from_stats = 0
+          ORDER BY b.kickoff_utc, b.id, l.id
+          """
+          for row in db.execute(sql):
+              print(json.dumps(dict(row), ensure_ascii=False, separators=(",", ":")))
+          db.rollback()
+          db.close()
+          PY
+
+          sha256sum radar-t5-ou.jsonl radar-t5-ou-simulations.jsonl > radar-t5-ou.sha256
+          wc -l radar-t5-ou.jsonl radar-t5-ou-simulations.jsonl
+
+      - name: 上載短期回測資料
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-t5-ou-backtest
+          path: |
+            radar-t5-ou.jsonl
+            radar-t5-ou-simulations.jsonl
+            radar-t5-ou.sha256
+          retention-days: 1
+          if-no-files-found: error
