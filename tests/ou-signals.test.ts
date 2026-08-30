@@ -140,7 +140,7 @@ describe("OU signal monitor", () => {
     expect(syncOuSignalObservations(["threshold-fail"])).toBe(0);
   });
 
-  it("locks all five T-30 rule candidates and prevents duplicate prealerts", () => {
+  it("keeps all five T-30 candidates but suppresses disabled Telegram rules", () => {
     expect(syncOuSignalPrealerts()).toBe(5);
     expect(syncOuSignalPrealerts()).toBe(0);
     const rows = rawDb.prepare(
@@ -162,9 +162,12 @@ describe("OU signal monitor", () => {
     rawDb.prepare(
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_prealert_activated_at'",
     ).run(String(earliest - 1), earliest - 1);
-    expect(unsentOuPrealerts()).toHaveLength(5);
-    markOuPrealertNotified(rows[0].unique_key, Date.now());
-    expect(unsentOuPrealerts()).toHaveLength(4);
+    const pending = unsentOuPrealerts();
+    expect(pending).toHaveLength(3);
+    expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
+    expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
+    markOuPrealertNotified(pending[0].uniqueKey, Date.now());
+    expect(unsentOuPrealerts()).toHaveLength(2);
   });
 
   it("does not back-notify observations before activation and marks new sends idempotently", () => {
@@ -181,9 +184,11 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_monitor_activated_at'",
     ).run(String(latestDetected - 1), latestDetected - 1);
     const pending = unsentOuSignals();
-    expect(pending).toHaveLength(5);
+    expect(pending).toHaveLength(3);
+    expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
+    expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
     markOuSignalNotified(pending[0].uniqueKey, latestDetected + 2);
-    expect(unsentOuSignals()).toHaveLength(4);
+    expect(unsentOuSignals()).toHaveLength(2);
   });
 
   it("keeps prospective results separate from the frozen historical edge", () => {

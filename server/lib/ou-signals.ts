@@ -135,6 +135,12 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
   },
 ];
 
+/** Keep collecting these rules for research, but never send T-30/T-5 Telegram alerts. */
+export const OU_TG_DISABLED_RULE_IDS = new Set([
+  "pinnacle-ouu-short-010-020-reverse",
+  "hkjc-ooo-flat-wide-reverse",
+]);
+
 const RULE_BY_ID = new Map(OU_SIGNAL_RULES.map((rule) => [rule.id, rule]));
 const T30_RULE_BY_PREFIX = new Map(
   OU_SIGNAL_RULES.map((rule) => [
@@ -463,7 +469,9 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
       WHERE o.notified_at IS NULL AND o.detected_at>=? ${filter}
       ORDER BY o.detected_at`,
   ).all(activatedAt, ...matchIds) as StoredSignalRow[];
-  return rows.map((row) => toObservation(row, now));
+  return rows
+    .map((row) => toObservation(row, now))
+    .filter((row) => !OU_TG_DISABLED_RULE_IDS.has(row.ruleId));
 }
 
 export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
@@ -479,7 +487,9 @@ export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
       WHERE p.notified_at IS NULL AND p.detected_at>=? ${filter}
       ORDER BY p.detected_at`,
   ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
-  return rows.map(toPrealert);
+  return rows
+    .map(toPrealert)
+    .filter((row) => !OU_TG_DISABLED_RULE_IDS.has(row.ruleId));
 }
 
 export function markOuSignalNotified(uniqueKey: string, notifiedAt = Date.now()): void {
