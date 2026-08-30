@@ -24,6 +24,7 @@ import {
   selectWindowEvents,
   simulationTarget,
   simulationTargetReached,
+  t30AlertEnabled,
   SCAN_HARD_LIMIT_SEC,
   type ScanCandidate,
   type ScanConfig,
@@ -170,6 +171,13 @@ describe("scan configuration", () => {
     expect(autoScanEnabled({} as NodeJS.ProcessEnv)).toBe(true);
     expect(autoScanEnabled({ RADAR_AUTO_SCAN: "1" } as NodeJS.ProcessEnv)).toBe(true);
     expect(autoScanEnabled({ RADAR_AUTO_SCAN: "0" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+
+  it("defaults the T-30 Telegram alert to off and only re-enables on an explicit '1'", () => {
+    expect(t30AlertEnabled({} as NodeJS.ProcessEnv)).toBe(false);
+    expect(t30AlertEnabled({ RADAR_T30_ALERT_ENABLED: "0" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(t30AlertEnabled({ RADAR_T30_ALERT_ENABLED: "true" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(t30AlertEnabled({ RADAR_T30_ALERT_ENABLED: "1" } as NodeJS.ProcessEnv)).toBe(true);
   });
 
   it("defaults to a 30 s dense interval and a full 30-minute window", () => {
