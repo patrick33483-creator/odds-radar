@@ -1,0 +1,75 @@
+name: Titan007 回填 - 稽核（唯讀）
+
+on:
+  workflow_dispatch:
+    inputs:
+      sql_file:
+        description: "backfill SQL 檔案路徑（相對 repo 根目錄）"
+        required: true
+        default: "scripts/titan007_backfill/runs/backfill_2026_08_30.sql"
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 上傳 SQL 到暫存位置
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          scp "${{ github.event.inputs.sql_file }}" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/titan007_backfill_audit.sql"
+
+      - name: 讀取生產狀態（sha256、目標賽事列數，唔寫入任何資料）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            DB=/opt/odds-radar/data/data.db
+            echo "== sha256 (before, read-only) =="
+            sha256sum "$DB"
+            echo "== matches table row count =="
+            sqlite3 "$DB" "select count(*) from matches;"
+            echo "== results row count (all) =="
+            sqlite3 "$DB" "select count(*) from results;"
+            echo "== research_timeline_snapshots row count (all) =="
+            sqlite3 "$DB" "select count(*) from research_timeline_snapshots;"
+            echo "== research_timeline_points row count (all) =="
+            sqlite3 "$DB" "select count(*) from research_timeline_points;"
+            echo "== docker compose status (no changes) =="
+            cd /opt/odds-radar && docker compose ps
+          '
+
+      - name: 語法檢查 SQL（只喺遠端用 sqlite3 :memory: 執行，唔碰生產 db）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cp /opt/odds-radar/data/data.db /tmp/titan007_syntax_check.db
+            sqlite3 /tmp/titan007_syntax_check.db < /tmp/titan007_backfill_audit.sql
+            echo "SQL applied cleanly against a throwaway copy - syntax OK"
+            rm -f /tmp/titan007_syntax_check.db
+          '
+
+      - name: 清理暫存檔
+        if: always()
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'rm -f /tmp/titan007_backfill_audit.sql /tmp/titan007_syntax_check.db' || true
