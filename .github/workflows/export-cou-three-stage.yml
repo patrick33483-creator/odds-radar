@@ -14,6 +14,9 @@ jobs:
   export:
     runs-on: ubuntu-24.04
     steps:
+      - name: 取回分析程式
+        uses: actions/checkout@v4
+
       - name: 設定 SSH
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -66,6 +69,12 @@ jobs:
           sha256sum cou-three-stage.jsonl > cou-three-stage.sha256
           wc -l cou-three-stage.jsonl
 
+      - name: 回測角球大細盤
+        run: |
+          python3 scripts/backtest_cou_three_stage.py cou-three-stage.jsonl \
+            --markdown-output cou-three-stage-report.md \
+            --json-output cou-three-stage-report.json
+
       - name: 上載短期角球研究資料
         uses: actions/upload-artifact@v4
         with:
@@ -73,5 +82,7 @@ jobs:
           path: |
             cou-three-stage.jsonl
             cou-three-stage.sha256
+            cou-three-stage-report.md
+            cou-three-stage-report.json
           retention-days: 1
           if-no-files-found: error
