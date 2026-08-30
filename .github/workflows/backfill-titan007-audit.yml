@@ -45,7 +45,7 @@ jobs:
             cd /opt/odds-radar
             DB=/opt/odds-radar/data/data.db
             CDB=/app/data/data.db
-            SQ="docker compose exec -T radar sqlite3"
+            SQ="sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3"
             echo "== sha256 (before) =="
             sha256sum "$DB"
             echo "== matches row count =="
@@ -57,7 +57,7 @@ jobs:
             echo "== research_timeline_points row count (all) =="
             $SQ "$CDB" "select count(*) from research_timeline_points;"
             echo "== docker compose status =="
-            cd /opt/odds-radar && docker compose ps
+            cd /opt/odds-radar && sudo docker compose --env-file /opt/odds-radar/.env ps
           '
 
       - name: "語法檢查 SQL：喺遠端用暫存複本執行，唔碰生產 db"
@@ -68,10 +68,10 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
-            cp /opt/odds-radar/data/data.db /opt/odds-radar/data/titan007_syntax_check.db
-            docker compose exec -T radar sqlite3 /app/data/titan007_syntax_check.db < /tmp/titan007_backfill.sql
+            sudo cp /opt/odds-radar/data/data.db /opt/odds-radar/data/titan007_syntax_check.db
+            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3 /app/data/titan007_syntax_check.db < /tmp/titan007_backfill.sql
             echo "SQL applied cleanly against a throwaway copy - syntax OK"
-            rm -f /opt/odds-radar/data/titan007_syntax_check.db
+            sudo rm -f /opt/odds-radar/data/titan007_syntax_check.db
           '
 
       - name: 檢查是否要真正套用
@@ -92,8 +92,8 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            cp /opt/odds-radar/data/data.db "/opt/odds-radar/data/data.db.bak.$(date +%Y%m%d%H%M%S)"
-            ls -la /opt/odds-radar/data/*.bak.* | tail -5
+            sudo cp /opt/odds-radar/data/data.db "/opt/odds-radar/data/data.db.bak.$(date +%Y%m%d%H%M%S)"
+            sudo ls -la /opt/odds-radar/data/*.bak.* | tail -5
           '
 
       - name: 套用 SQL 落生產（單一交易、busy_timeout，唔停容器）
@@ -105,7 +105,7 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
-            docker compose exec -T radar sqlite3 /app/data/data.db < /tmp/titan007_backfill.sql
+            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3 /app/data/data.db < /tmp/titan007_backfill.sql
             echo "SQL applied to production"
           '
 
@@ -120,7 +120,7 @@ jobs:
             cd /opt/odds-radar
             DB=/opt/odds-radar/data/data.db
             CDB=/app/data/data.db
-            SQ="docker compose exec -T radar sqlite3"
+            SQ="sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3"
             echo "== sha256 (after) =="
             sha256sum "$DB"
             echo "== results row count (all) =="
@@ -128,7 +128,7 @@ jobs:
             echo "== research_timeline_snapshots row count (source_name=titan007) =="
             $SQ "$CDB" "select count(*) from research_timeline_snapshots where source_name='\''titan007'\'';"
             echo "== docker compose still healthy =="
-            cd /opt/odds-radar && docker compose ps
+            cd /opt/odds-radar && sudo docker compose --env-file /opt/odds-radar/.env ps
           '
 
       - name: 清理暫存檔
