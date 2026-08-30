@@ -1,7 +1,7 @@
 import { rawDb, getState, setState } from "./store";
 import { formatSelectionLine } from "./lines";
-import { markOuSignalNotified } from "./ou-signals";
-import type { OuSignalObservation } from "@shared/types";
+import { markOuPrealertNotified, markOuSignalNotified } from "./ou-signals";
+import type { OuSignalObservation, OuSignalPrealert } from "@shared/types";
 
 interface TelegramApiResponse {
   ok?: boolean;
@@ -199,6 +199,47 @@ export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<n
       throw new Error(`Telegram OU signal delivery failed: ${payload.description ?? response.status}`);
     }
     markOuSignalNotified(signal.uniqueKey);
+    sent += 1;
+  }
+  return sent;
+}
+
+function buildOuPrealertMessage(signal: OuSignalPrealert): string {
+  const possibleBuy = signal.signalSelection === "O" ? "大球" : "小球";
+  const mode = signal.mode === "reverse" ? "反向候選" : "正向候選";
+  return [
+    "盤路雷達：T-30 OU 候選預警",
+    `${mode}｜${signal.providerLabel}`,
+    `${signal.league}｜${signal.homeTeam} vs ${signal.awayTeam}`,
+    `開賽：${hkt(signal.kickoffUtc)} HKT`,
+    `目前兩段方向：${signal.directionPath}｜同線 ${signal.lineKey}`,
+    `低水方賠率：初盤 ${signal.initialSelectedOdds.toFixed(3)} → T-30 ${signal.t30SelectedOdds.toFixed(3)}`,
+    `如果 T-5 完成條件，可能留意：${possibleBuy} ${signal.lineKey}｜目前 T-30 賠率 ${signal.signalT30Odds.toFixed(3)}`,
+    "呢個只係心理準備預警，未係正式買入訊號；T-5 會重新核對完整方向同收水幅度。",
+  ].join("\n");
+}
+
+export async function notifyOuPrealerts(signals: OuSignalPrealert[]): Promise<number> {
+  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
+  if (!token || !chatId || !signals.length) return 0;
+  let sent = 0;
+  for (const signal of signals) {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: buildOuPrealertMessage(signal),
+        disable_web_page_preview: true,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
+    if (!response.ok || !payload.ok) {
+      throw new Error(`Telegram OU T-30 prealert delivery failed: ${payload.description ?? response.status}`);
+    }
+    markOuPrealertNotified(signal.uniqueKey);
     sent += 1;
   }
   return sent;

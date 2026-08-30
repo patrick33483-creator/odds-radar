@@ -2,6 +2,7 @@ import { rawDb } from "./store";
 import type {
   OuSignalDatasetResponse,
   OuSignalObservation,
+  OuSignalPrealert,
   OuSignalRule,
   OuSignalRuleSummary,
 } from "@shared/types";
@@ -56,6 +57,24 @@ interface StoredSignalRow {
   inplay: number;
   home_score: number | null;
   away_score: number | null;
+}
+
+interface StoredPrealertRow {
+  unique_key: string;
+  match_id: string;
+  provider: Provider;
+  rule_id: string;
+  line_key: string;
+  direction_path: string;
+  initial_selected_odds: number;
+  t30_selected_odds: number;
+  signal_t30_odds: number;
+  detected_at: number;
+  notified_at: number | null;
+  league: string;
+  home_team: string;
+  away_team: string;
+  kickoff_utc: number;
 }
 
 export const OU_SIGNAL_RULES: OuSignalRule[] = [
@@ -117,6 +136,12 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
 ];
 
 const RULE_BY_ID = new Map(OU_SIGNAL_RULES.map((rule) => [rule.id, rule]));
+const T30_RULE_BY_PREFIX = new Map(
+  OU_SIGNAL_RULES.map((rule) => [
+    `${rule.provider}|${rule.directionPath.split("→").slice(0, 2).join("→")}`,
+    rule,
+  ]),
+);
 
 function selectedSide(prices: Map<Side, number>): { side: Side | "D"; odds: number } | null {
   const over = prices.get("O");
@@ -141,6 +166,78 @@ function matchingRule(provider: Provider, path: string, gap: number): OuSignalRu
     if (rule.driftBucket === "收水 0.10–0.20") return gap >= 0.1 && gap < 0.2;
     return rule.driftBucket === "持平或拉闊" && gap <= 0;
   });
+}
+
+/** Lock T-30 candidates once their first two directions match a frozen rule. */
+export function syncOuSignalPrealerts(matchIds: string[] = []): number {
+  const cutoff = Date.now() - 120 * 24 * 60 * 60_000;
+  const matchFilter = matchIds.length
+    ? `AND s.match_id IN (${matchIds.map(() => "?").join(",")})`
+    : "AND m.kickoff_utc>=?";
+  const params = matchIds.length ? matchIds : [cutoff];
+  const rows = rawDb.prepare(
+    `SELECT s.match_id,s.provider,s.stage,s.line_key,s.selection,s.decimal_odds,s.captured_at
+       FROM research_timeline_snapshots s
+       JOIN matches m ON m.id=s.match_id
+      WHERE s.market='OU'
+        AND s.provider IN ('hkjc','pinnacle')
+        AND s.stage IN ('initial','T30')
+        AND s.selection IN ('O','U')
+        ${matchFilter}
+      ORDER BY s.match_id,s.provider,s.line_key,s.stage,s.selection`,
+  ).all(...params) as SnapshotRow[];
+
+  const groups = new Map<string, Map<Stage, Map<Side, SnapshotRow>>>();
+  for (const row of rows) {
+    const key = `${row.match_id}|${row.provider}|${row.line_key}`;
+    const stages = groups.get(key) ?? new Map<Stage, Map<Side, SnapshotRow>>();
+    const prices = stages.get(row.stage) ?? new Map<Side, SnapshotRow>();
+    prices.set(row.selection, row);
+    stages.set(row.stage, prices);
+    groups.set(key, stages);
+  }
+
+  const insert = rawDb.prepare(
+    `INSERT OR IGNORE INTO ou_signal_prealerts(
+       unique_key,match_id,provider,rule_id,line_key,direction_path,
+       initial_selected_odds,t30_selected_odds,signal_t30_odds,detected_at,notified_at
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,NULL)`,
+  );
+  let inserted = 0;
+  const tx = rawDb.transaction(() => {
+    for (const [groupKey, stages] of groups) {
+      const initialRows = stages.get("initial");
+      const t30Rows = stages.get("T30");
+      if (!initialRows || !t30Rows) continue;
+      const decisions = [initialRows, t30Rows].map((stage) =>
+        selectedSide(new Map([...stage].map(([side, row]) => [side, row.decimal_odds]))),
+      );
+      if (decisions.some((decision) => !decision || decision.side === "D")) continue;
+      if (decisions.some((decision) => decision!.odds <= 1.7)) continue;
+      const path = decisions.map((decision) => decision!.side).join("→");
+      const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
+      const rule = T30_RULE_BY_PREFIX.get(`${provider}|${path}`);
+      if (!rule) continue;
+      const signalT30Odds = t30Rows.get(rule.signalSelection)?.decimal_odds;
+      if (signalT30Odds === undefined) continue;
+      const detectedAt = Math.max(...[...t30Rows.values()].map((row) => row.captured_at));
+      const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}|T30`;
+      inserted += insert.run(
+        uniqueKey,
+        matchId,
+        provider,
+        rule.id,
+        lineKey,
+        path,
+        decisions[0]!.odds,
+        decisions[1]!.odds,
+        signalT30Odds,
+        detectedAt,
+      ).changes;
+    }
+  });
+  tx();
+  return inserted;
 }
 
 /**
@@ -281,6 +378,31 @@ function toObservation(row: StoredSignalRow, now: number): OuSignalObservation {
   };
 }
 
+function toPrealert(row: StoredPrealertRow): OuSignalPrealert {
+  const rule = RULE_BY_ID.get(row.rule_id);
+  if (!rule) throw new Error(`Unknown OU prealert rule: ${row.rule_id}`);
+  return {
+    uniqueKey: row.unique_key,
+    matchId: row.match_id,
+    league: row.league,
+    homeTeam: row.home_team,
+    awayTeam: row.away_team,
+    kickoffUtc: row.kickoff_utc,
+    provider: row.provider,
+    providerLabel: rule.providerLabel,
+    ruleId: row.rule_id,
+    lineKey: row.line_key,
+    directionPath: row.direction_path,
+    signalSelection: rule.signalSelection,
+    mode: rule.mode,
+    initialSelectedOdds: row.initial_selected_odds,
+    t30SelectedOdds: row.t30_selected_odds,
+    signalT30Odds: row.signal_t30_odds,
+    detectedAt: row.detected_at,
+    notifiedAt: row.notified_at,
+  };
+}
+
 function summaries(observations: OuSignalObservation[]): OuSignalRuleSummary[] {
   return OU_SIGNAL_RULES.map((rule) => {
     const rows = observations.filter((row) => row.ruleId === rule.id);
@@ -344,8 +466,30 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
   return rows.map((row) => toObservation(row, now));
 }
 
+export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
+  syncOuSignalPrealerts(matchIds);
+  const activatedAt = Number(
+    (rawDb.prepare("SELECT value FROM app_state WHERE key='ou_signal_prealert_activated_at'").get() as { value: string }).value,
+  );
+  const filter = matchIds.length ? `AND p.match_id IN (${matchIds.map(() => "?").join(",")})` : "";
+  const rows = rawDb.prepare(
+    `SELECT p.*,m.league,m.home_team,m.away_team,m.kickoff_utc
+       FROM ou_signal_prealerts p
+       JOIN matches m ON m.id=p.match_id
+      WHERE p.notified_at IS NULL AND p.detected_at>=? ${filter}
+      ORDER BY p.detected_at`,
+  ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
+  return rows.map(toPrealert);
+}
+
 export function markOuSignalNotified(uniqueKey: string, notifiedAt = Date.now()): void {
   rawDb.prepare(
     "UPDATE ou_signal_observations SET notified_at=? WHERE unique_key=? AND notified_at IS NULL",
+  ).run(notifiedAt, uniqueKey);
+}
+
+export function markOuPrealertNotified(uniqueKey: string, notifiedAt = Date.now()): void {
+  rawDb.prepare(
+    "UPDATE ou_signal_prealerts SET notified_at=? WHERE unique_key=? AND notified_at IS NULL",
   ).run(notifiedAt, uniqueKey);
 }

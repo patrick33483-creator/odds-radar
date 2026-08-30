@@ -41,9 +41,9 @@ import {
 import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCoversCrown, type SynSide } from "./synthetic";
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
-import { notifyOuSignals, notifySimulationBets } from "./telegram";
+import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
 import { captureResearchTimelinePrices } from "./research";
-import { unsentOuSignals } from "./ou-signals";
+import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
@@ -839,6 +839,13 @@ export class RadarEngine {
     });
     await Promise.all(workers);
     this.pinnacleRowsSeen = rows;
+    try {
+      const prealerts = unsentOuPrealerts(targets.map((target) => target.id));
+      const sent = await notifyOuPrealerts(prealerts);
+      if (sent) log("telegram_ou_t30_prealerts", { detected: prealerts.length, sent });
+    } catch (err) {
+      log("telegram_ou_t30_prealert_error", { error: (err as Error).message });
+    }
     try {
       const signals = unsentOuSignals(targets.map((target) => target.id));
       const sent = await notifyOuSignals(signals);

@@ -5,18 +5,24 @@ const dbPath = `/tmp/odds-radar-ou-signals-${process.pid}.db`;
 process.env.RADAR_DB = dbPath;
 
 let rawDb: typeof import("../server/lib/store").rawDb;
+let markOuPrealertNotified: typeof import("../server/lib/ou-signals").markOuPrealertNotified;
 let markOuSignalNotified: typeof import("../server/lib/ou-signals").markOuSignalNotified;
 let ouSignalDataset: typeof import("../server/lib/ou-signals").ouSignalDataset;
 let syncOuSignalObservations: typeof import("../server/lib/ou-signals").syncOuSignalObservations;
+let syncOuSignalPrealerts: typeof import("../server/lib/ou-signals").syncOuSignalPrealerts;
+let unsentOuPrealerts: typeof import("../server/lib/ou-signals").unsentOuPrealerts;
 let unsentOuSignals: typeof import("../server/lib/ou-signals").unsentOuSignals;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
   const signals = await import("../server/lib/ou-signals");
   rawDb = store.rawDb;
+  markOuPrealertNotified = signals.markOuPrealertNotified;
   markOuSignalNotified = signals.markOuSignalNotified;
   ouSignalDataset = signals.ouSignalDataset;
   syncOuSignalObservations = signals.syncOuSignalObservations;
+  syncOuSignalPrealerts = signals.syncOuSignalPrealerts;
+  unsentOuPrealerts = signals.unsentOuPrealerts;
   unsentOuSignals = signals.unsentOuSignals;
   store.migrate();
 });
@@ -132,6 +138,33 @@ describe("OU signal monitor", () => {
       T5: [1.84, 2.00],
     }, now);
     expect(syncOuSignalObservations(["threshold-fail"])).toBe(0);
+  });
+
+  it("locks all five T-30 rule candidates and prevents duplicate prealerts", () => {
+    expect(syncOuSignalPrealerts()).toBe(5);
+    expect(syncOuSignalPrealerts()).toBe(0);
+    const rows = rawDb.prepare(
+      "SELECT unique_key,match_id,rule_id,signal_t30_odds,detected_at FROM ou_signal_prealerts ORDER BY match_id",
+    ).all() as Array<{
+      unique_key: string;
+      match_id: string;
+      rule_id: string;
+      signal_t30_odds: number;
+      detected_at: number;
+    }>;
+    expect(rows).toHaveLength(5);
+    expect(rows.find((row) => row.match_id === "ouu-reverse")).toMatchObject({
+      rule_id: "pinnacle-ouu-short-010-020-reverse",
+      signal_t30_odds: 1.96,
+    });
+
+    const earliest = Math.min(...rows.map((row) => row.detected_at));
+    rawDb.prepare(
+      "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_prealert_activated_at'",
+    ).run(String(earliest - 1), earliest - 1);
+    expect(unsentOuPrealerts()).toHaveLength(5);
+    markOuPrealertNotified(rows[0].unique_key, Date.now());
+    expect(unsentOuPrealerts()).toHaveLength(4);
   });
 
   it("does not back-notify observations before activation and marks new sends idempotently", () => {

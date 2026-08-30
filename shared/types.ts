@@ -464,6 +464,27 @@ export interface OuSignalObservation {
   } | null;
 }
 
+export interface OuSignalPrealert {
+  uniqueKey: string;
+  matchId: string;
+  league: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoffUtc: number;
+  provider: ResearchProvider;
+  providerLabel: string;
+  ruleId: string;
+  lineKey: string;
+  directionPath: string;
+  signalSelection: "O" | "U";
+  mode: OuSignalMode;
+  initialSelectedOdds: number;
+  t30SelectedOdds: number;
+  signalT30Odds: number;
+  detectedAt: number;
+  notifiedAt: number | null;
+}
+
 export interface OuSignalRuleSummary {
   rule: OuSignalRule;
   observations: number;

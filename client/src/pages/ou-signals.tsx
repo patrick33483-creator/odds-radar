@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
-import { ArrowLeft, BellRing, Clock3, Database, Radio, ShieldAlert } from "lucide-react";
+import { ArrowLeft, BellRing, ChevronDown, Clock3, Database, History, Radio, ShieldAlert } from "lucide-react";
 import { EmptyState, RadarLogo, TableSkeleton, ThemeToggle, fmtKickoff, fmtTime } from "@/components/radar-ui";
 import { cn } from "@/lib/utils";
 import type {
@@ -112,6 +112,7 @@ function SignalRow({ row, activatedAt }: { row: OuSignalObservation; activatedAt
 export default function OuSignals() {
   const [view, setView] = useState<View>("active");
   const [ruleId, setRuleId] = useState("all");
+  const [expandedRules, setExpandedRules] = useState<Set<string>>(() => new Set());
   const { data, isLoading, isError } = useQuery<OuSignalDatasetResponse>({
     queryKey: ["/api/ou-signals"],
     refetchInterval: 20_000,
@@ -135,7 +136,7 @@ export default function OuSignals() {
           <RadarLogo className="h-7 w-7 text-pinnacle" />
           <div className="min-w-0">
             <h1 className="truncate text-sm font-semibold" data-testid="text-page-title">OU 買入訊號</h1>
-            <p className="truncate text-[10px] text-muted-foreground">五組鎖定規則 · 未開賽／進行中即時顯示 · 新訊號 TG 防重通知</p>
+            <p className="truncate text-[10px] text-muted-foreground">五組鎖定規則 · T-30 候選預警 · T-5 正式訊號 TG 防重通知</p>
           </div>
           <div className="ml-auto flex items-center gap-1">
             <Link href="/" className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover-elevate" data-testid="link-tab-dashboard">
@@ -202,33 +203,82 @@ export default function OuSignals() {
             <span className="text-[10px] text-muted-foreground">所有方向都用初盤、T-30、T-5 同一條線；三段低水方賠率均須 &gt; 1.70</span>
           </div>
           <div className="flex snap-x gap-2 overflow-x-auto pb-2 md:grid md:grid-cols-2 md:overflow-visible md:pb-0">
-            {(data?.summaries ?? []).map((summary, index) => (
-              <button
-                key={summary.rule.id}
-                type="button"
-                onClick={() => setRuleId(ruleId === summary.rule.id ? "all" : summary.rule.id)}
-                className={cn(
-                  "w-[82vw] max-w-[320px] shrink-0 snap-start rounded-md border bg-card p-3 text-left shadow-sm transition-colors md:w-auto md:max-w-none md:shrink",
-                  ruleId === summary.rule.id ? "border-pinnacle" : "border-border hover:border-pinnacle/40",
-                  index === 0 && "md:col-span-2",
-                )}
-                data-testid={`ou-rule-${summary.rule.id}`}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-xs font-semibold">
-                    {summary.rule.providerLabel} · {summary.rule.directionPath.replaceAll("O", "大").replaceAll("U", "小")} · {summary.rule.driftBucket}
-                  </span>
-                  <span className={cn("rounded px-1.5 py-0.5 text-[10px]", summary.rule.mode === "direct" ? "bg-positive/10 text-positive" : "bg-warning/10 text-warning")}>
-                    {summary.rule.mode === "direct" ? `揸${summary.rule.signalSelection === "O" ? "大" : "小"}` : `反向揸${summary.rule.signalSelection === "O" ? "大" : "小"}`}
-                  </span>
-                </div>
-                <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{summary.rule.historicalNote}</p>
-                <p className="tnum mt-2 text-[10px]">
-                  新累積 {summary.observations} · 已判定 {summary.hits + summary.misses}
-                  {summary.prospectiveHitRate !== null ? ` · 前瞻命中 ${(summary.prospectiveHitRate * 100).toFixed(1)}%` : " · 前瞻命中率待累積"}
-                </p>
-              </button>
-            ))}
+            {(data?.summaries ?? []).map((summary, index) => {
+              const isExpanded = expandedRules.has(summary.rule.id);
+              const history = (data?.observations ?? []).filter((row) => row.ruleId === summary.rule.id);
+              return (
+                <article
+                  key={summary.rule.id}
+                  className={cn(
+                    "w-[82vw] max-w-[320px] shrink-0 snap-start rounded-md border bg-card p-3 text-left shadow-sm transition-colors md:w-auto md:max-w-none md:shrink",
+                    ruleId === summary.rule.id ? "border-pinnacle" : "border-border",
+                    index === 0 && "md:col-span-2",
+                  )}
+                  data-testid={`ou-rule-${summary.rule.id}`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold">
+                      {summary.rule.providerLabel} · {summary.rule.directionPath.replaceAll("O", "大").replaceAll("U", "小")} · {summary.rule.driftBucket}
+                    </span>
+                    <span className={cn("rounded px-1.5 py-0.5 text-[10px]", summary.rule.mode === "direct" ? "bg-positive/10 text-positive" : "bg-warning/10 text-warning")}>
+                      {summary.rule.mode === "direct" ? `揸${summary.rule.signalSelection === "O" ? "大" : "小"}` : `反向揸${summary.rule.signalSelection === "O" ? "大" : "小"}`}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{summary.rule.historicalNote}</p>
+                  <p className="tnum mt-2 text-[10px]">
+                    累積 {summary.observations} · 已判定 {summary.hits + summary.misses}
+                    {summary.prospectiveHitRate !== null ? ` · 前瞻命中 ${(summary.prospectiveHitRate * 100).toFixed(1)}%` : " · 前瞻命中率待累積"}
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-1.5 border-t border-grid pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setRuleId(ruleId === summary.rule.id ? "all" : summary.rule.id)}
+                      className="min-h-8 rounded border border-border px-2 text-[10px] text-muted-foreground hover-elevate"
+                    >
+                      {ruleId === summary.rule.id ? "取消場次篩選" : "只顯示此條件"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedRules((current) => {
+                        const next = new Set(current);
+                        if (next.has(summary.rule.id)) next.delete(summary.rule.id);
+                        else next.add(summary.rule.id);
+                        return next;
+                      })}
+                      className="flex min-h-8 items-center gap-1 rounded border border-border px-2 text-[10px] text-muted-foreground hover-elevate"
+                      aria-expanded={isExpanded}
+                      data-testid={`expand-ou-rule-${summary.rule.id}`}
+                    >
+                      <History className="h-3 w-3" />
+                      {isExpanded ? "收起歷史場次" : `展開歷史場次 (${history.length})`}
+                      <ChevronDown className={cn("h-3 w-3 transition-transform", isExpanded && "rotate-180")} />
+                    </button>
+                  </div>
+                  {isExpanded ? (
+                    <div className="mt-2 max-h-72 space-y-1.5 overflow-y-auto border-t border-grid pt-2" data-testid={`history-ou-rule-${summary.rule.id}`}>
+                      {history.length ? history.map((row) => (
+                        <div key={row.uniqueKey} className="rounded border border-grid bg-background/60 p-2 text-[10px]">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="truncate font-medium">{row.homeTeam} vs {row.awayTeam}</p>
+                              <p className="truncate text-muted-foreground">{row.league} · {fmtKickoff(row.kickoffUtc)}</p>
+                            </div>
+                            <div className="shrink-0 text-right">
+                              <p className="tnum font-semibold text-hkjc">
+                                {row.signalSelection === "O" ? "大" : "小"} {row.lineKey} @ {row.signalT5Odds.toFixed(3)}
+                              </p>
+                              <p className={cn("tnum", resultTone(row))}>{resultLabel(row)}</p>
+                            </div>
+                          </div>
+                        </div>
+                      )) : (
+                        <p className="py-2 text-center text-muted-foreground">暫時未有累積場次</p>
+                      )}
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
           </div>
         </section>
 
@@ -243,7 +293,7 @@ export default function OuSignals() {
             ) : observations.length === 0 ? (
               <EmptyState
                 title={view === "active" ? "暫時未有未開賽或進行中訊號" : "呢個篩選暫時未有訊號"}
-                hint="系統會繼續收集初盤、T-30、T-5；新場次首次符合五組規則之一就會寫入呢頁並發 Telegram。"
+                hint="系統會繼續收集初盤、T-30、T-5；T-30 先發候選預警，T-5 完整符合先寫入正式訊號並再發 Telegram。"
                 testId="empty-ou-signals"
               />
             ) : observations.map((row) => (

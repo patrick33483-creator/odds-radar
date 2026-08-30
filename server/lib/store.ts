@@ -152,6 +152,16 @@ CREATE INDEX IF NOT EXISTS ou_signal_match_idx
 CREATE INDEX IF NOT EXISTS ou_signal_rule_idx
   ON ou_signal_observations(rule_id,detected_at);
 
+CREATE TABLE IF NOT EXISTS ou_signal_prealerts (
+  unique_key TEXT PRIMARY KEY, match_id TEXT NOT NULL, provider TEXT NOT NULL,
+  rule_id TEXT NOT NULL, line_key TEXT NOT NULL, direction_path TEXT NOT NULL,
+  initial_selected_odds REAL NOT NULL, t30_selected_odds REAL NOT NULL,
+  signal_t30_odds REAL NOT NULL, detected_at INTEGER NOT NULL, notified_at INTEGER);
+CREATE INDEX IF NOT EXISTS ou_signal_prealert_match_idx
+  ON ou_signal_prealerts(match_id,detected_at);
+CREATE INDEX IF NOT EXISTS ou_signal_prealert_rule_idx
+  ON ou_signal_prealerts(rule_id,detected_at);
+
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,
@@ -175,6 +185,9 @@ CREATE TABLE IF NOT EXISTS app_state (
   const activatedAt = Date.now();
   sqlite
     .prepare("INSERT OR IGNORE INTO app_state(key,value,updated_at) VALUES('ou_signal_monitor_activated_at',?,?)")
+    .run(String(activatedAt), activatedAt);
+  sqlite
+    .prepare("INSERT OR IGNORE INTO app_state(key,value,updated_at) VALUES('ou_signal_prealert_activated_at',?,?)")
     .run(String(activatedAt), activatedAt);
   const ouSignalColumns = sqlite
     .prepare("PRAGMA table_info(ou_signal_observations)")
