@@ -17,7 +17,12 @@ STAGES = {
 }
 
 
-def parse_dt(value: str) -> datetime:
+def parse_dt(value: str | int | float) -> datetime:
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp)
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
