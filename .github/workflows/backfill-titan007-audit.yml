@@ -35,6 +35,21 @@ jobs:
         run: |
           scp "${{ github.event.inputs.sql_file }}" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/titan007_backfill.sql"
 
+      - name: 確保 host 有 sqlite3（冪等，唔改動容器/服務）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            if ! command -v sqlite3 >/dev/null 2>&1; then
+              echo "sqlite3 未安裝，安裝中..."
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq sqlite3
+            fi
+            sqlite3 --version
+          '
+
       - name: 讀取生產狀態（sha256、目標賽事列數，唔寫入任何資料）
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -42,20 +57,18 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            cd /opt/odds-radar
             DB=/opt/odds-radar/data/data.db
-            CDB=/app/data/data.db
-            SQ="sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3"
+            SQ="sudo sqlite3"
             echo "== sha256 (before) =="
-            sha256sum "$DB"
+            sudo sha256sum "$DB"
             echo "== matches row count =="
-            $SQ "$CDB" "select count(*) from matches;"
+            $SQ "$DB" "select count(*) from matches;"
             echo "== results row count (all) =="
-            $SQ "$CDB" "select count(*) from results;"
+            $SQ "$DB" "select count(*) from results;"
             echo "== research_timeline_snapshots row count (all) =="
-            $SQ "$CDB" "select count(*) from research_timeline_snapshots;"
+            $SQ "$DB" "select count(*) from research_timeline_snapshots;"
             echo "== research_timeline_points row count (all) =="
-            $SQ "$CDB" "select count(*) from research_timeline_points;"
+            $SQ "$DB" "select count(*) from research_timeline_points;"
             echo "== docker compose status =="
             cd /opt/odds-radar && sudo docker compose --env-file /opt/odds-radar/.env ps
           '
@@ -67,11 +80,10 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            cd /opt/odds-radar
-            sudo cp /opt/odds-radar/data/data.db /opt/odds-radar/data/titan007_syntax_check.db
-            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3 /app/data/titan007_syntax_check.db < /tmp/titan007_backfill.sql
+            sudo cp /opt/odds-radar/data/data.db /tmp/titan007_syntax_check.db
+            sudo sqlite3 /tmp/titan007_syntax_check.db < /tmp/titan007_backfill.sql
             echo "SQL applied cleanly against a throwaway copy - syntax OK"
-            sudo rm -f /opt/odds-radar/data/titan007_syntax_check.db
+            sudo rm -f /tmp/titan007_syntax_check.db
           '
 
       - name: 檢查是否要真正套用
@@ -104,8 +116,7 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            cd /opt/odds-radar
-            sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3 /app/data/data.db < /tmp/titan007_backfill.sql
+            sudo sqlite3 /opt/odds-radar/data/data.db < /tmp/titan007_backfill.sql
             echo "SQL applied to production"
           '
 
@@ -117,16 +128,14 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            cd /opt/odds-radar
             DB=/opt/odds-radar/data/data.db
-            CDB=/app/data/data.db
-            SQ="sudo docker compose --env-file /opt/odds-radar/.env exec -T radar sqlite3"
+            SQ="sudo sqlite3"
             echo "== sha256 (after) =="
-            sha256sum "$DB"
+            sudo sha256sum "$DB"
             echo "== results row count (all) =="
-            $SQ "$CDB" "select count(*) from results;"
+            $SQ "$DB" "select count(*) from results;"
             echo "== research_timeline_snapshots row count (source_name=titan007) =="
-            $SQ "$CDB" "select count(*) from research_timeline_snapshots where source_name='\''titan007'\'';"
+            $SQ "$DB" "select count(*) from research_timeline_snapshots where source_name='"'"'titan007'"'"';"
             echo "== docker compose still healthy =="
             cd /opt/odds-radar && sudo docker compose --env-file /opt/odds-radar/.env ps
           '
@@ -137,4 +146,4 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'rm -f /tmp/titan007_backfill.sql /tmp/titan007_syntax_check.db' || true
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo rm -f /tmp/titan007_backfill.sql /tmp/titan007_syntax_check.db' || true
