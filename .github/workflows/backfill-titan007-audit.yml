@@ -42,17 +42,20 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
+            cd /opt/odds-radar
             DB=/opt/odds-radar/data/data.db
+            CDB=/app/data/data.db
+            SQ="docker compose exec -T radar sqlite3"
             echo "== sha256 (before) =="
             sha256sum "$DB"
             echo "== matches row count =="
-            sqlite3 "$DB" "select count(*) from matches;"
+            $SQ "$CDB" "select count(*) from matches;"
             echo "== results row count (all) =="
-            sqlite3 "$DB" "select count(*) from results;"
+            $SQ "$CDB" "select count(*) from results;"
             echo "== research_timeline_snapshots row count (all) =="
-            sqlite3 "$DB" "select count(*) from research_timeline_snapshots;"
+            $SQ "$CDB" "select count(*) from research_timeline_snapshots;"
             echo "== research_timeline_points row count (all) =="
-            sqlite3 "$DB" "select count(*) from research_timeline_points;"
+            $SQ "$CDB" "select count(*) from research_timeline_points;"
             echo "== docker compose status =="
             cd /opt/odds-radar && docker compose ps
           '
@@ -64,10 +67,11 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            cp /opt/odds-radar/data/data.db /tmp/titan007_syntax_check.db
-            sqlite3 /tmp/titan007_syntax_check.db < /tmp/titan007_backfill.sql
+            cd /opt/odds-radar
+            cp /opt/odds-radar/data/data.db /opt/odds-radar/data/titan007_syntax_check.db
+            docker compose exec -T radar sqlite3 /app/data/titan007_syntax_check.db < /tmp/titan007_backfill.sql
             echo "SQL applied cleanly against a throwaway copy - syntax OK"
-            rm -f /tmp/titan007_syntax_check.db
+            rm -f /opt/odds-radar/data/titan007_syntax_check.db
           '
 
       - name: 檢查是否要真正套用
@@ -100,8 +104,8 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
-            DB=/opt/odds-radar/data/data.db
-            sqlite3 "$DB" < /tmp/titan007_backfill.sql
+            cd /opt/odds-radar
+            docker compose exec -T radar sqlite3 /app/data/data.db < /tmp/titan007_backfill.sql
             echo "SQL applied to production"
           '
 
@@ -113,13 +117,16 @@ jobs:
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
+            cd /opt/odds-radar
             DB=/opt/odds-radar/data/data.db
+            CDB=/app/data/data.db
+            SQ="docker compose exec -T radar sqlite3"
             echo "== sha256 (after) =="
             sha256sum "$DB"
             echo "== results row count (all) =="
-            sqlite3 "$DB" "select count(*) from results;"
+            $SQ "$CDB" "select count(*) from results;"
             echo "== research_timeline_snapshots row count (source_name=titan007) =="
-            sqlite3 "$DB" "select count(*) from research_timeline_snapshots where source_name=\"titan007\";"
+            $SQ "$CDB" "select count(*) from research_timeline_snapshots where source_name='\''titan007'\'';"
             echo "== docker compose still healthy =="
             cd /opt/odds-radar && docker compose ps
           '
