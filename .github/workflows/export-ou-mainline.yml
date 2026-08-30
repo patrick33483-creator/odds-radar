@@ -1,0 +1,83 @@
+name: 匯出入球大細主線研究資料（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-ou-mainline-radar
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 取回分析程式
+        uses: actions/checkout@v4
+
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 匯出入球大細主線快照與賽果
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          umask 077
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo python3 -' > ou-mainline.jsonl <<'PY'
+          import json
+          import sqlite3
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+          db.execute("BEGIN")
+          sql = r"""
+          SELECT m.id AS match_id, m.league, m.home_team, m.away_team,
+                 m.kickoff_utc,
+                 q.provider, q.stage, q.line_key, q.selection,
+                 q.decimal_odds, q.is_main, q.captured_at,
+                 r.home_score, r.away_score
+            FROM research_timeline_snapshots q
+            JOIN matches m ON m.id=q.match_id
+            LEFT JOIN research_results r ON r.match_id=m.id
+           WHERE q.market='OU'
+             AND q.provider IN ('hkjc','pinnacle')
+             AND q.stage IN ('initial','T30','T5')
+             AND q.captured_at < m.kickoff_utc
+           ORDER BY m.kickoff_utc,m.id,q.provider,q.stage,q.line_key,q.selection
+          """
+          for row in db.execute(sql):
+              print(json.dumps(dict(row), ensure_ascii=False, separators=(",", ":")))
+          db.rollback()
+          db.close()
+          PY
+          test -s ou-mainline.jsonl
+          sha256sum ou-mainline.jsonl > ou-mainline.sha256
+          wc -l ou-mainline.jsonl
+
+      - name: 分析主線走勢與雙方差異
+        run: |
+          python3 scripts/analyze_ou_mainline.py ou-mainline.jsonl \
+            --markdown-output ou-mainline-report.md
+
+      - name: 上載短期研究資料
+        uses: actions/upload-artifact@v4
+        with:
+          name: ou-mainline-data
+          path: |
+            ou-mainline.jsonl
+            ou-mainline.sha256
+            ou-mainline-report.md
+          retention-days: 1
+          if-no-files-found: error
