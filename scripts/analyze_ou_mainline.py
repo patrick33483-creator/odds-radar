@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -156,6 +157,19 @@ def bucket_line_diff(diff: float) -> str:
     return "馬會主線低≥0.25"
 
 
+def wilson_ci(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval for a binomial proportion."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = hits / n
+    denom = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    adj = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    lo = (centre - adj) / denom
+    hi = (centre + adj) / denom
+    return (lo * 100, hi * 100)
+
+
 def result_side(row: dict, line: float) -> str | None:
     if row.get("home_score") is None or row.get("away_score") is None:
         return None
@@ -174,10 +188,11 @@ def insight_section(records: list[dict], match_info: dict) -> list[str]:
     lines = [
         "## 主線差異與賽果關係（T5，以皇冠主線同賽果結算）",
         "",
-        "| 主線差異區間 | 場數 | 大 | 小 | 走盤 | 大命中率 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| 主線差異區間 | 場數 | 大 | 小 | 走盤 | 大命中率 | 95% Wilson CI |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     buckets = defaultdict(list)
+    all_outcomes = []
     for r in t5:
         info = match_info.get(r["match_id"])
         if not info:
@@ -186,6 +201,7 @@ def insight_section(records: list[dict], match_info: dict) -> list[str]:
         if outcome is None:
             continue
         buckets[bucket_line_diff(r["line_diff"])].append(outcome)
+        all_outcomes.append(outcome)
     order = [
         "馬會主線高≥0.25",
         "馬會主線略高(0,0.25)",
@@ -202,11 +218,26 @@ def insight_section(records: list[dict], match_info: dict) -> list[str]:
         u_n = outcomes.count("U")
         p_n = outcomes.count("push")
         decided = o_n + u_n
-        rate = f"{o_n/decided*100:.1f}%" if decided else "n.a."
-        lines.append(f"| {key} | {n} | {o_n} | {u_n} | {p_n} | {rate} |")
+        if decided:
+            rate = f"{o_n/decided*100:.1f}%"
+            ci_lo, ci_hi = wilson_ci(o_n, decided)
+            ci = f"{ci_lo:.1f}%\u2013{ci_hi:.1f}%"
+        else:
+            rate, ci = "n.a.", "n.a."
+        lines.append(f"| {key} | {n} | {o_n} | {u_n} | {p_n} | {rate} | {ci} |")
+
+    baseline_decided = all_outcomes.count("O") + all_outcomes.count("U")
+    baseline_o = all_outcomes.count("O")
+    baseline_rate = baseline_o / baseline_decided * 100 if baseline_decided else 0.0
+    b_lo, b_hi = wilson_ci(baseline_o, baseline_decided)
+    lines.append(
+        f"| **整體基準（全部配對場合計）** | {len(all_outcomes)} | {baseline_o} | "
+        f"{all_outcomes.count('U')} | {all_outcomes.count('push')} | {baseline_rate:.1f}% | "
+        f"{b_lo:.1f}%\u2013{b_hi:.1f}% |"
+    )
     lines.append("")
     lines.append(
-        "- 樣本量普遍偏細，屬探索性觀察，不代表已驗證的可執行訊號。"
+        "- 判斷方法：用 95% Wilson 信賴區間睇每個桶嘅命中率係否顯著偏離「整體基準」——如果兩個桶嘅信賴區間有重疊，即差異可能只係樣本噪音，唔可以當做已驗證訊號。"
     )
     lines.append("")
     return lines
@@ -220,8 +251,8 @@ def odds_gap_insight(records: list[dict], match_info: dict) -> list[str]:
         "- 正數：皇冠大球賠率比馬會高（皇冠對大球開價更保守／馬會更看好大球）。",
         "- 負數：皇冠大球賠率比馬會低。",
         "",
-        "| 賠率差區間 | 場數 | 大 | 小 | 走盤 | 大命中率 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| 賠率差區間 | 場數 | 大 | 小 | 走盤 | 大命中率 | 95% Wilson CI |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
 
     def bucket_odds(diff: float) -> str:
@@ -261,8 +292,13 @@ def odds_gap_insight(records: list[dict], match_info: dict) -> list[str]:
         u_n = outcomes.count("U")
         p_n = outcomes.count("push")
         decided = o_n + u_n
-        rate = f"{o_n/decided*100:.1f}%" if decided else "n.a."
-        lines.append(f"| {key} | {n} | {o_n} | {u_n} | {p_n} | {rate} |")
+        if decided:
+            rate = f"{o_n/decided*100:.1f}%"
+            ci_lo, ci_hi = wilson_ci(o_n, decided)
+            ci = f"{ci_lo:.1f}%\u2013{ci_hi:.1f}%"
+        else:
+            rate, ci = "n.a.", "n.a."
+        lines.append(f"| {key} | {n} | {o_n} | {u_n} | {p_n} | {rate} | {ci} |")
     lines.append("")
     return lines
 
