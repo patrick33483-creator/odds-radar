@@ -12,6 +12,13 @@ Looks at:
      U/U), paired match-by-match at the same stage.
   5. Whether the line/odds gap between the two books says anything about
      the eventual over/under result.
+
+Data quirk: `is_main` is only populated by the ingestion pipeline from T30
+onward -- `initial` snapshots are stored with `is_main=0` for every line.
+To still get an "initial main line" data point, we anchor on the line_key
+that carries `is_main=1` at T30 (falling back to T5) for that match+provider,
+then pull the `initial` stage row for that same line_key, regardless of its
+own is_main flag.
 """
 
 from __future__ import annotations
@@ -31,17 +38,33 @@ def median(values: list[float]) -> float | None:
 
 def load(path: Path):
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    # key: (match_id, provider, stage) -> {"O": row, "U": row}, only is_main rows
-    by_stage: dict[tuple, dict[str, dict]] = defaultdict(dict)
     match_info = {}
+    # all rows, keyed by (match_id, provider, stage, line_key) -> {"O":row,"U":row}
+    all_by_line: dict[tuple, dict[str, dict]] = defaultdict(dict)
     for row in rows:
         match_info[row["match_id"]] = row
-        if int(row.get("is_main") or 0) != 1:
-            continue
         if row["stage"] not in STAGES:
             continue
-        key = (row["match_id"], row["provider"], row["stage"])
-        by_stage[key][row["selection"]] = row
+        key = (row["match_id"], row["provider"], row["stage"], row["line_key"])
+        all_by_line[key][row["selection"]] = row
+
+    # main line_key per (match_id, provider): prefer T30 is_main=1, else T5 is_main=1
+    main_line_key: dict[tuple, str] = {}
+    for row in rows:
+        if int(row.get("is_main") or 0) != 1:
+            continue
+        if row["stage"] not in ("T30", "T5"):
+            continue
+        mkey = (row["match_id"], row["provider"])
+        if mkey not in main_line_key or row["stage"] == "T30":
+            main_line_key[mkey] = row["line_key"]
+
+    by_stage: dict[tuple, dict[str, dict]] = defaultdict(dict)
+    for (match_id, provider), line_key in main_line_key.items():
+        for stage in STAGES:
+            pair = all_by_line.get((match_id, provider, stage, line_key))
+            if pair:
+                by_stage[(match_id, provider, stage)] = pair
     return rows, by_stage, match_info
 
 
