@@ -136,10 +136,11 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
 ];
 
 /** Keep collecting these rules for research, but never send T-30/T-5 Telegram alerts. */
-export const OU_TG_DISABLED_RULE_IDS = new Set([
+export const OU_HIDDEN_RULE_IDS = new Set([
   "pinnacle-ouu-short-010-020-reverse",
   "hkjc-ooo-flat-wide-reverse",
 ]);
+export const OU_TG_DISABLED_RULE_IDS = OU_HIDDEN_RULE_IDS;
 
 const RULE_BY_ID = new Map(OU_SIGNAL_RULES.map((rule) => [rule.id, rule]));
 const T30_RULE_BY_PREFIX = new Map(
@@ -442,14 +443,18 @@ export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
         ELSE 2 END,
         o.detected_at DESC`,
   ).all(now, now - 3 * 60 * 60_000, now) as StoredSignalRow[];
-  const observations = rows.map((row) => toObservation(row, now));
+  const observations = rows
+    .map((row) => toObservation(row, now))
+    .filter((row) => !OU_HIDDEN_RULE_IDS.has(row.ruleId));
   return {
     generatedAt: now,
     activatedAt: Number(
       (rawDb.prepare("SELECT value FROM app_state WHERE key='ou_signal_monitor_activated_at'").get() as { value: string }).value,
     ),
-    rules: OU_SIGNAL_RULES,
-    summaries: summaries(observations),
+    rules: OU_SIGNAL_RULES.filter((rule) => !OU_HIDDEN_RULE_IDS.has(rule.id)),
+    summaries: summaries(observations).filter(
+      (summary) => !OU_HIDDEN_RULE_IDS.has(summary.rule.id),
+    ),
     observations,
   };
 }

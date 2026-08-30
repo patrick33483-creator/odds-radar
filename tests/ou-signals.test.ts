@@ -112,22 +112,18 @@ describe("OU signal monitor", () => {
 
     expect(syncOuSignalObservations()).toBe(5);
     expect(syncOuSignalObservations()).toBe(0);
+    expect(
+      (rawDb.prepare("SELECT COUNT(*) AS total FROM ou_signal_observations").get() as { total: number }).total,
+    ).toBe(5);
     const dataset = ouSignalDataset(now);
-    expect(dataset.observations).toHaveLength(5);
+    expect(dataset.observations).toHaveLength(3);
     expect(dataset.observations.map((row) => [row.ruleId, row.signalSelection])).toEqual(expect.arrayContaining([
       ["pinnacle-uoo-short-005-010", "O"],
       ["pinnacle-ooo-short-010-020", "O"],
-      ["pinnacle-ouu-short-010-020-reverse", "O"],
-      ["hkjc-ooo-flat-wide-reverse", "U"],
       ["pinnacle-uuu-flat-wide-reverse", "O"],
     ]));
-    expect(dataset.observations.find((row) => row.matchId === "ouu-reverse")).toMatchObject({
-      originalSelection: "U",
-      signalSelection: "O",
-      referenceInitialOdds: 1.95,
-      referenceT5Odds: 1.83,
-      signalT5Odds: 1.98,
-    });
+    expect(dataset.observations.find((row) => row.matchId === "ouu-reverse")).toBeUndefined();
+    expect(dataset.observations.find((row) => row.matchId === "ooo-reverse")).toBeUndefined();
   });
 
   it("excludes a row when any selected checkpoint price is not strictly above 1.70", () => {
@@ -203,5 +199,13 @@ describe("OU signal monitor", () => {
       hits: 1,
       prospectiveHitRate: 1,
     });
+    expect(dataset.rules.map((rule) => rule.id)).not.toContain("pinnacle-ouu-short-010-020-reverse");
+    expect(dataset.rules.map((rule) => rule.id)).not.toContain("hkjc-ooo-flat-wide-reverse");
+    expect(dataset.observations.map((row) => row.ruleId)).not.toContain(
+      "pinnacle-ouu-short-010-020-reverse",
+    );
+    expect(dataset.observations.map((row) => row.ruleId)).not.toContain(
+      "hkjc-ooo-flat-wide-reverse",
+    );
   });
 });
