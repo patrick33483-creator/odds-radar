@@ -53,7 +53,7 @@ jobs:
             cd /opt/odds-radar && docker compose ps
           '
 
-      - name: 語法檢查 SQL（只喺遠端用 sqlite3 :memory: 執行，唔碰生產 db）
+      - name: "語法檢查 SQL：喺遠端用暫存複本執行，唔碰生產 db"
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
