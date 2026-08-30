@@ -414,6 +414,9 @@ export default function Research() {
             <Link href="/simulations" className="hidden rounded px-2 py-1 text-xs text-muted-foreground hover-elevate sm:block" data-testid="link-tab-simulations">
               模擬投注
             </Link>
+            <Link href="/ou-signals" className="rounded px-2 py-1 text-xs text-hkjc hover-elevate" data-testid="link-tab-ou-signals">
+              OU 訊號
+            </Link>
             <ThemeToggle />
           </div>
         </div>

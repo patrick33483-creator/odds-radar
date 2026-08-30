@@ -99,6 +99,13 @@ export default function Simulations() {
               <Database className="h-3 w-3" />
               研究數據
             </Link>
+            <Link
+              href="/ou-signals"
+              className="flex items-center gap-1 rounded px-2 py-1 text-xs text-hkjc hover-elevate"
+              data-testid="link-tab-ou-signals"
+            >
+              OU 訊號
+            </Link>
             <ThemeToggle />
             <Button size="sm" variant="outline" onClick={() => settle.mutate()} disabled={settle.isPending} data-testid="button-settle">
               {settle.isPending ? "結算中" : "即刻結算"}

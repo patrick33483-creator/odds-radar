@@ -418,6 +418,71 @@ export interface ResearchDatasetResponse {
   matches: ResearchMatchRow[];
 }
 
+export type OuSignalMode = "direct" | "reverse";
+export type OuSignalMatchStatus = "upcoming" | "live" | "completed" | "awaiting_result";
+
+export interface OuSignalRule {
+  id: string;
+  provider: ResearchProvider;
+  providerLabel: string;
+  directionPath: string;
+  driftBucket: string;
+  signalSelection: "O" | "U";
+  mode: OuSignalMode;
+  historicalEdgePp: number;
+  historicalNote: string;
+}
+
+export interface OuSignalObservation {
+  uniqueKey: string;
+  matchId: string;
+  league: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoffUtc: number;
+  matchStatus: OuSignalMatchStatus;
+  provider: ResearchProvider;
+  providerLabel: string;
+  ruleId: string;
+  lineKey: string;
+  directionPath: string;
+  driftBucket: string;
+  originalSelection: "O" | "U";
+  signalSelection: "O" | "U";
+  mode: OuSignalMode;
+  referenceInitialOdds: number;
+  referenceT5Odds: number;
+  signalT5Odds: number;
+  oddsGap: number;
+  detectedAt: number;
+  notifiedAt: number | null;
+  result: {
+    homeScore: number;
+    awayScore: number;
+    totalGoals: number;
+    outcome: "hit" | "miss" | "push";
+  } | null;
+}
+
+export interface OuSignalRuleSummary {
+  rule: OuSignalRule;
+  observations: number;
+  pending: number;
+  settled: number;
+  hits: number;
+  misses: number;
+  pushes: number;
+  prospectiveHitRate: number | null;
+}
+
+export interface OuSignalDatasetResponse {
+  generatedAt: number;
+  activatedAt: number;
+  rules: OuSignalRule[];
+  summaries: OuSignalRuleSummary[];
+  observations: OuSignalObservation[];
+}
+
 export const CATEGORY_LABEL: Record<string, string> = {
   case1_arb: "情況一 · 兩邊鎖利",
   case2_ev: "情況二 · 正期望值",

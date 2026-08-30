@@ -16,6 +16,7 @@ import {
   researchCsv,
   researchDataset,
 } from "./lib/research";
+import { ouSignalDataset } from "./lib/ou-signals";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -422,6 +423,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/research", (req, res) => {
     return res.json(researchDataset(parseResearchFilters(req.query as Record<string, unknown>)));
+  });
+
+  app.get("/api/ou-signals", (_req, res) => {
+    return res.json(ouSignalDataset());
   });
 
   app.get("/api/research/export", (req, res) => {

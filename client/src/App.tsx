@@ -8,6 +8,7 @@ import { ThemeProvider } from "@/components/radar-ui";
 import Dashboard from "@/pages/dashboard";
 import Simulations from "@/pages/simulations";
 import Research from "@/pages/research";
+import OuSignals from "@/pages/ou-signals";
 import NotFound from "@/pages/not-found";
 
 function AppRouter() {
@@ -16,6 +17,7 @@ function AppRouter() {
       <Route path="/" component={Dashboard} />
       <Route path="/simulations" component={Simulations} />
       <Route path="/research" component={Research} />
+      <Route path="/ou-signals" component={OuSignals} />
       <Route component={NotFound} />
     </Switch>
   );

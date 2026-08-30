@@ -169,6 +169,13 @@ export default function Dashboard() {
               >
                 研究數據
               </Link>
+              <Link
+                href="/ou-signals"
+                className="whitespace-nowrap rounded px-2 py-1 text-hkjc hover-elevate"
+                data-testid="link-tab-ou-signals"
+              >
+                OU 訊號
+              </Link>
             </nav>
             <ThemeToggle />
             <ScanButton onClick={() => scan.mutate()} busy={scan.isPending} last={status?.scan.lastScan ?? null} />

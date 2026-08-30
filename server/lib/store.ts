@@ -140,6 +140,18 @@ CREATE INDEX IF NOT EXISTS research_timeline_match_idx
 CREATE INDEX IF NOT EXISTS research_timeline_captured_idx
   ON research_timeline_snapshots(captured_at);
 
+CREATE TABLE IF NOT EXISTS ou_signal_observations (
+  unique_key TEXT PRIMARY KEY, match_id TEXT NOT NULL, provider TEXT NOT NULL,
+  rule_id TEXT NOT NULL, line_key TEXT NOT NULL, direction_path TEXT NOT NULL,
+  drift_bucket TEXT NOT NULL, original_selection TEXT NOT NULL,
+  signal_selection TEXT NOT NULL, initial_signal_odds REAL NOT NULL,
+  t5_signal_odds REAL NOT NULL, signal_t5_odds REAL NOT NULL, odds_gap REAL NOT NULL,
+  detected_at INTEGER NOT NULL, notified_at INTEGER);
+CREATE INDEX IF NOT EXISTS ou_signal_match_idx
+  ON ou_signal_observations(match_id,detected_at);
+CREATE INDEX IF NOT EXISTS ou_signal_rule_idx
+  ON ou_signal_observations(rule_id,detected_at);
+
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,
@@ -158,6 +170,19 @@ CREATE TABLE IF NOT EXISTS provider_health (
 CREATE TABLE IF NOT EXISTS app_state (
   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
 `);
+  // The activation watermark prevents a new deployment from sending Telegram
+  // alerts for historical rows that are backfilled into the signal page.
+  const activatedAt = Date.now();
+  sqlite
+    .prepare("INSERT OR IGNORE INTO app_state(key,value,updated_at) VALUES('ou_signal_monitor_activated_at',?,?)")
+    .run(String(activatedAt), activatedAt);
+  const ouSignalColumns = sqlite
+    .prepare("PRAGMA table_info(ou_signal_observations)")
+    .all() as Array<{ name: string }>;
+  if (!ouSignalColumns.some((column) => column.name === "signal_t5_odds")) {
+    sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN signal_t5_odds REAL");
+    sqlite.exec("UPDATE ou_signal_observations SET signal_t5_odds=t5_signal_odds WHERE signal_t5_odds IS NULL");
+  }
   // Existing installations predate PinnAPI. SQLite's CREATE TABLE IF NOT EXISTS
   // does not evolve the table, so add only the two additive mapping columns.
   const sourceColumns = sqlite

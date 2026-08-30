@@ -1,5 +1,7 @@
 import { rawDb, getState, setState } from "./store";
 import { formatSelectionLine } from "./lines";
+import { markOuSignalNotified } from "./ou-signals";
+import type { OuSignalObservation } from "@shared/types";
 
 interface TelegramApiResponse {
   ok?: boolean;
@@ -153,6 +155,50 @@ export async function notifySimulationBets(newBetKeys: string[]): Promise<number
       throw new Error(`Telegram delivery failed: ${payload.description ?? response.status}`);
     }
     setState(stateKey, String(Date.now()));
+    sent += 1;
+  }
+  return sent;
+}
+
+function buildOuSignalMessage(signal: OuSignalObservation): string {
+  const buy = signal.signalSelection === "O" ? "大球" : "小球";
+  const mode = signal.mode === "reverse" ? "反向買入訊號" : "歷史正向訊號";
+  return [
+    "盤路雷達：OU 買入提示",
+    `${mode}｜${signal.providerLabel}`,
+    `${signal.league}｜${signal.homeTeam} vs ${signal.awayTeam}`,
+    `開賽：${hkt(signal.kickoffUtc)} HKT`,
+    `建議留意：${buy} ${signal.lineKey}｜T-5 賠率 ${signal.signalT5Odds.toFixed(3)}`,
+    `盤路：${signal.directionPath}｜${signal.driftBucket}`,
+    `收水判定（原方向 ${signal.originalSelection === "O" ? "大" : "小"}）：初盤 ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${signal.referenceT5Odds.toFixed(3)}（差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}）`,
+    signal.mode === "reverse"
+      ? "注意：呢個係歷史原方向負 edge 推導嘅反向觀察訊號，唔代表反向 edge 已獨立證實。"
+      : "條件已按歷史正 edge 規則觸發。",
+    "請自行核對即時盤口、賠率同陣容後先落實投注。",
+  ].join("\n");
+}
+
+export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<number> {
+  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
+  if (!token || !chatId || !signals.length) return 0;
+  let sent = 0;
+  for (const signal of signals) {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: buildOuSignalMessage(signal),
+        disable_web_page_preview: true,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
+    if (!response.ok || !payload.ok) {
+      throw new Error(`Telegram OU signal delivery failed: ${payload.description ?? response.status}`);
+    }
+    markOuSignalNotified(signal.uniqueKey);
     sent += 1;
   }
   return sent;
