@@ -11,6 +11,10 @@ on:
         description: "淨係喺打 APPLY 先會真正寫入生產資料庫；留空 = 只做唯讀稽核"
         required: false
         default: ""
+      disk_cleanup:
+        description: "打 CLEANUP 會刪除舊備份(只保留最新一個)+ leftover temp檔；留空 = 唔做"
+        required: false
+        default: ""
 
 jobs:
   audit_or_apply:
@@ -48,6 +52,43 @@ jobs:
               sudo apt-get install -y -qq sqlite3
             fi
             sqlite3 --version
+          '
+
+      - name: 磁碟空間報告(唔改動任何東西)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            echo "== disk usage =="
+            df -h /opt/odds-radar/data
+            echo "== backup files =="
+            sudo ls -la /opt/odds-radar/data/*.bak.* 2>/dev/null || echo "(none)"
+            echo "== leftover /tmp temp files =="
+            sudo ls -la /tmp/titan007_* 2>/dev/null || echo "(none)"
+          '
+
+      - name: 磁碟清理（只保留最新一個備份，只喺打 CLEANUP 先做）
+        if: github.event.inputs.disk_cleanup == 'CLEANUP'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /opt/odds-radar/data
+            KEEP=$(sudo ls -t *.bak.* 2>/dev/null | head -1 || true)
+            echo "keeping: $KEEP"
+            for f in *.bak.*; do
+              if [ -e "$f" ] && [ "$f" != "$KEEP" ]; then
+                sudo rm -f "$f"
+                echo "deleted: $f"
+              fi
+            done
+            sudo rm -f /tmp/titan007_syntax_check.db
+            echo "== disk usage after cleanup =="
+            df -h /opt/odds-radar/data
+            sudo ls -la *.bak.* 2>/dev/null || echo "(none left)"
           '
 
       - name: 讀取生產狀態（sha256、目標賽事列數，唔寫入任何資料）
