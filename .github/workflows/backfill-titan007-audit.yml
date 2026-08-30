@@ -1,4 +1,4 @@
-name: Titan007 回填 - 稽核（唯讀）
+name: Titan007 回填 - 稽核 / 套用
 
 on:
   workflow_dispatch:
@@ -7,9 +7,13 @@ on:
         description: "backfill SQL 檔案路徑（相對 repo 根目錄）"
         required: true
         default: "scripts/titan007_backfill/runs/backfill_2026_08_30.sql"
+      confirm_apply:
+        description: "淨係喺打 APPLY 先會真正寫入生產資料庫；留空 = 只做唯讀稽核"
+        required: false
+        default: ""
 
 jobs:
-  audit:
+  audit_or_apply:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +33,7 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          scp "${{ github.event.inputs.sql_file }}" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/titan007_backfill_audit.sql"
+          scp "${{ github.event.inputs.sql_file }}" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/titan007_backfill.sql"
 
       - name: 讀取生產狀態（sha256、目標賽事列數，唔寫入任何資料）
         env:
@@ -39,9 +43,9 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             DB=/opt/odds-radar/data/data.db
-            echo "== sha256 (before, read-only) =="
+            echo "== sha256 (before) =="
             sha256sum "$DB"
-            echo "== matches table row count =="
+            echo "== matches row count =="
             sqlite3 "$DB" "select count(*) from matches;"
             echo "== results row count (all) =="
             sqlite3 "$DB" "select count(*) from results;"
@@ -49,7 +53,7 @@ jobs:
             sqlite3 "$DB" "select count(*) from research_timeline_snapshots;"
             echo "== research_timeline_points row count (all) =="
             sqlite3 "$DB" "select count(*) from research_timeline_points;"
-            echo "== docker compose status (no changes) =="
+            echo "== docker compose status =="
             cd /opt/odds-radar && docker compose ps
           '
 
@@ -61,9 +65,63 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cp /opt/odds-radar/data/data.db /tmp/titan007_syntax_check.db
-            sqlite3 /tmp/titan007_syntax_check.db < /tmp/titan007_backfill_audit.sql
+            sqlite3 /tmp/titan007_syntax_check.db < /tmp/titan007_backfill.sql
             echo "SQL applied cleanly against a throwaway copy - syntax OK"
             rm -f /tmp/titan007_syntax_check.db
+          '
+
+      - name: 檢查是否要真正套用
+        id: gate
+        run: |
+          if [ "${{ github.event.inputs.confirm_apply }}" = "APPLY" ]; then
+            echo "do_apply=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "do_apply=false" >> "$GITHUB_OUTPUT"
+            echo "confirm_apply 冇打 APPLY，呢次淨係做咗以上唯讀稽核，冇寫入生產資料庫。"
+          fi
+
+      - name: 套用前備份（只喺 confirm_apply=APPLY 先行）
+        if: steps.gate.outputs.do_apply == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cp /opt/odds-radar/data/data.db "/opt/odds-radar/data/data.db.bak.$(date +%Y%m%d%H%M%S)"
+            ls -la /opt/odds-radar/data/*.bak.* | tail -5
+          '
+
+      - name: 套用 SQL 落生產（單一交易、busy_timeout，唔停容器）
+        if: steps.gate.outputs.do_apply == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            DB=/opt/odds-radar/data/data.db
+            sqlite3 "$DB" < /tmp/titan007_backfill.sql
+            echo "SQL applied to production"
+          '
+
+      - name: 套用後 sha256 + 列數
+        if: steps.gate.outputs.do_apply == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            DB=/opt/odds-radar/data/data.db
+            echo "== sha256 (after) =="
+            sha256sum "$DB"
+            echo "== results row count (all) =="
+            sqlite3 "$DB" "select count(*) from results;"
+            echo "== research_timeline_snapshots row count (source_name=titan007) =="
+            sqlite3 "$DB" "select count(*) from research_timeline_snapshots where source_name=\"titan007\";"
+            echo "== docker compose still healthy =="
+            cd /opt/odds-radar && docker compose ps
           '
 
       - name: 清理暫存檔
@@ -72,4 +130,4 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'rm -f /tmp/titan007_backfill_audit.sql /tmp/titan007_syntax_check.db' || true
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'rm -f /tmp/titan007_backfill.sql /tmp/titan007_syntax_check.db' || true
