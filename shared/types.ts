@@ -437,6 +437,11 @@ export interface OuSignalRule {
   mode: OuSignalMode;
   historicalEdgePp: number;
   historicalNote: string;
+  historicalSample?: number;
+  historicalDecided?: number;
+  historicalHits?: number;
+  historicalHitRate?: number;
+  historicalRoi?: number;
 }
 
 export interface OuSignalObservation {

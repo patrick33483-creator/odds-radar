@@ -199,11 +199,11 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_monitor_activated_at'",
     ).run(String(latestDetected - 1), latestDetected - 1);
     const pending = unsentOuSignals();
-    expect(pending).toHaveLength(2);
+    expect(pending).toHaveLength(5);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
-    expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
+    expect(pending.map((row) => row.ruleId)).toContain("hkjc-ooo-flat-wide-reverse");
     markOuSignalNotified(pending[0].uniqueKey, latestDetected + 2);
-    expect(unsentOuSignals()).toHaveLength(1);
+    expect(unsentOuSignals()).toHaveLength(4);
   });
 
   it("tracks all four reverse Watch rules with inclusive line and T-5 odds boundaries", () => {

@@ -87,7 +87,12 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     signalSelection: "O",
     mode: "direct",
     historicalEdgePp: 22.8,
-    historicalNote: "歷史大球命中率高過 T-5 原始隱含機率 22.8 點",
+    historicalNote: "歷史 20 場，16/20 命中；大球命中率高過 T-5 原始隱含機率 22.8 點",
+    historicalSample: 20,
+    historicalDecided: 20,
+    historicalHits: 16,
+    historicalHitRate: 0.8,
+    historicalRoi: 0.44625,
   },
   {
     id: "pinnacle-ooo-short-010-020",
@@ -98,7 +103,12 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     signalSelection: "O",
     mode: "direct",
     historicalEdgePp: 16.9,
-    historicalNote: "歷史大球命中率高過 T-5 原始隱含機率 16.9 點",
+    historicalNote: "歷史 22 場，17/22 命中；大球命中率高過 T-5 原始隱含機率 16.9 點",
+    historicalSample: 22,
+    historicalDecided: 22,
+    historicalHits: 17,
+    historicalHitRate: 0.772727,
+    historicalRoi: 0.264182,
   },
   {
     id: "pinnacle-ooo-line-gt-275-over-watch",
@@ -138,6 +148,11 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     mode: "reverse",
     historicalEdgePp: 0,
     historicalNote: "Watch：歷史 23 場，反向小球 17/23（73.9%），ROI +41.4%；主盤 2.25 至 2.50",
+    historicalSample: 23,
+    historicalDecided: 23,
+    historicalHits: 17,
+    historicalHitRate: 0.73913,
+    historicalRoi: 0.414348,
   },
   {
     id: "pinnacle-ouu-t5-selected-180-190-over-watch",
@@ -152,6 +167,11 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     mode: "reverse",
     historicalEdgePp: 0,
     historicalNote: "Watch：歷史 30 場（26 場判定），反向大球 17/26（65.4%），ROI +27.2%；T-5 原選定價 1.80 至 1.90",
+    historicalSample: 30,
+    historicalDecided: 26,
+    historicalHits: 17,
+    historicalHitRate: 0.653846,
+    historicalRoi: 0.271687,
   },
   {
     id: "hkjc-ooo-t5-selected-le-180-under-watch",
@@ -165,6 +185,11 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     mode: "reverse",
     historicalEdgePp: 0,
     historicalNote: "Watch：歷史 35 場，反向小球 22/35（62.9%），ROI +21.7%；T-5 原選定價不高於 1.80",
+    historicalSample: 35,
+    historicalDecided: 35,
+    historicalHits: 22,
+    historicalHitRate: 0.628571,
+    historicalRoi: 0.216857,
   },
   {
     id: "pinnacle-ouu-short-010-020-reverse",
@@ -187,6 +212,11 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     mode: "reverse",
     historicalEdgePp: 0,
     historicalNote: "Watch：歷史 24 場，反向小球 17/24（70.8%），ROI +35.5%；包含主盤 2.25 至 2.50 子條件",
+    historicalSample: 24,
+    historicalDecided: 24,
+    historicalHits: 17,
+    historicalHitRate: 0.708333,
+    historicalRoi: 0.355417,
   },
 ];
 
@@ -210,7 +240,8 @@ export const OU_HIDDEN_RULE_IDS = new Set([
   "pinnacle-uoo-line-250-275-over-watch",
   "pinnacle-uuu-flat-wide-reverse",
 ]);
-export const OU_TG_DISABLED_RULE_IDS = new Set([
+/** T-30 is only a candidate stage, so Watch rules stay silent until fully qualified at T-5. */
+export const OU_T30_TG_DISABLED_RULE_IDS = new Set([
   ...OU_HIDDEN_RULE_IDS,
   "hkjc-ooo-flat-wide-line-225-250-under-watch",
   "hkjc-ooo-flat-wide-reverse",
@@ -221,6 +252,10 @@ export const OU_TG_DISABLED_RULE_IDS = new Set([
 const RULE_BY_ID = new Map(
   [...OU_SIGNAL_RULES, ...RETIRED_OU_SIGNAL_RULES].map((rule) => [rule.id, rule]),
 );
+
+export function ouRuleById(ruleId: string): OuSignalRule | undefined {
+  return RULE_BY_ID.get(ruleId);
+}
 const T30_RULES_BY_PREFIX = new Map<string, OuSignalRule[]>();
 for (const rule of OU_SIGNAL_RULES) {
   const prefix = `${rule.provider}|${rule.directionPath.split("→").slice(0, 2).join("→")}`;
@@ -596,7 +631,7 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
   ).all(activatedAt, ...matchIds) as StoredSignalRow[];
   return rows
     .map((row) => toObservation(row, now))
-    .filter((row) => !OU_TG_DISABLED_RULE_IDS.has(row.ruleId));
+    .filter((row) => !OU_HIDDEN_RULE_IDS.has(row.ruleId));
 }
 
 export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
@@ -614,7 +649,7 @@ export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
   ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
   return rows
     .map(toPrealert)
-    .filter((row) => !OU_TG_DISABLED_RULE_IDS.has(row.ruleId));
+    .filter((row) => !OU_T30_TG_DISABLED_RULE_IDS.has(row.ruleId));
 }
 
 export function markOuSignalNotified(uniqueKey: string, notifiedAt = Date.now()): void {

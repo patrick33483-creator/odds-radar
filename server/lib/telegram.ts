@@ -1,7 +1,7 @@
 import { rawDb, getState, setState } from "./store";
 import { formatSelectionLine } from "./lines";
-import { markOuPrealertNotified, markOuSignalNotified } from "./ou-signals";
-import type { OuSignalObservation, OuSignalPrealert } from "@shared/types";
+import { markOuPrealertNotified, markOuSignalNotified, ouRuleById } from "./ou-signals";
+import type { OuSignalObservation, OuSignalPrealert, OuSignalRule } from "@shared/types";
 
 interface TelegramApiResponse {
   ok?: boolean;
@@ -160,21 +160,54 @@ export async function notifySimulationBets(newBetKeys: string[]): Promise<number
   return sent;
 }
 
-function buildOuSignalMessage(signal: OuSignalObservation): string {
+function historicalLine(rule: OuSignalRule): string {
+  if (
+    rule.historicalSample !== undefined
+    && rule.historicalDecided !== undefined
+    && rule.historicalHits !== undefined
+    && rule.historicalHitRate !== undefined
+  ) {
+    const sample = rule.historicalDecided === rule.historicalSample
+      ? `${rule.historicalSample} 場`
+      : `${rule.historicalSample} 場（${rule.historicalDecided} 場判定）`;
+    const roi = rule.historicalRoi === undefined
+      ? ""
+      : `｜ROI ${rule.historicalRoi >= 0 ? "+" : ""}${(rule.historicalRoi * 100).toFixed(1)}%`;
+    return `歷史：${sample}｜${rule.historicalHits}/${rule.historicalDecided}｜命中率 ${(rule.historicalHitRate * 100).toFixed(1)}%${roi}`;
+  }
+  return `歷史：${rule.historicalNote}`;
+}
+
+function signalLines(signal: OuSignalObservation): string[] {
   const buy = signal.signalSelection === "O" ? "大球" : "小球";
   const mode = signal.mode === "reverse" ? "反向買入訊號" : "歷史正向訊號";
+  const rule = ouRuleById(signal.ruleId);
   return [
-    "盤路雷達：OU 買入提示",
-    `${mode}｜${signal.providerLabel}`,
-    `${signal.league}｜${signal.homeTeam} vs ${signal.awayTeam}`,
-    `開賽：${hkt(signal.kickoffUtc)} HKT`,
-    `建議留意：${buy} ${signal.lineKey}｜T-5 賠率 ${signal.signalT5Odds.toFixed(3)}`,
+    `${mode}｜${signal.providerLabel}｜${buy} ${signal.lineKey} @ ${signal.signalT5Odds.toFixed(3)}`,
+    `規則：${signal.ruleId}`,
     `盤路：${signal.directionPath}｜${signal.driftBucket}`,
-    `收水判定（原方向 ${signal.originalSelection === "O" ? "大" : "小"}）：初盤 ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${signal.referenceT5Odds.toFixed(3)}（差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}）`,
-    signal.mode === "reverse"
-      ? "注意：呢個係歷史原方向負 edge 推導嘅反向觀察訊號，唔代表反向 edge 已獨立證實。"
-      : "條件已按歷史正 edge 規則觸發。",
-    "請自行核對即時盤口、賠率同陣容後先落實投注。",
+    `原方向 ${signal.originalSelection === "O" ? "大" : "小"}：初盤 ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${signal.referenceT5Odds.toFixed(3)}（差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}）`,
+    rule ? historicalLine(rule) : "歷史：暫無可核實統計",
+  ];
+}
+
+export function buildOuSignalMessage(signals: OuSignalObservation[]): string {
+  const first = signals[0];
+  if (!first) return "";
+  const details = signals.flatMap((signal, index) => [
+    ...(index ? [""] : []),
+    `條件 ${index + 1}`,
+    ...signalLines(signal),
+  ]);
+  return [
+    "盤路雷達：T-5 OU 合資格賽事",
+    `${first.league}｜${first.homeTeam} vs ${first.awayTeam}`,
+    `開賽：${hkt(first.kickoffUtc)} HKT`,
+    `命中條件：${signals.length} 條`,
+    "",
+    ...details,
+    "",
+    "純統計追蹤；請自行核對即時盤口、賠率同陣容。",
   ].join("\n");
 }
 
@@ -183,13 +216,17 @@ export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<n
   const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
   if (!token || !chatId || !signals.length) return 0;
   let sent = 0;
+  const byMatch = new Map<string, OuSignalObservation[]>();
   for (const signal of signals) {
+    byMatch.set(signal.matchId, [...(byMatch.get(signal.matchId) ?? []), signal]);
+  }
+  for (const groupedSignals of byMatch.values()) {
     const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
-        text: buildOuSignalMessage(signal),
+        text: buildOuSignalMessage(groupedSignals),
         disable_web_page_preview: true,
       }),
       signal: AbortSignal.timeout(10_000),
@@ -198,7 +235,7 @@ export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<n
     if (!response.ok || !payload.ok) {
       throw new Error(`Telegram OU signal delivery failed: ${payload.description ?? response.status}`);
     }
-    markOuSignalNotified(signal.uniqueKey);
+    for (const signal of groupedSignals) markOuSignalNotified(signal.uniqueKey);
     sent += 1;
   }
   return sent;
