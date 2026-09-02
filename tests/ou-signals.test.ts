@@ -74,15 +74,16 @@ function addPath(
   provider: "hkjc" | "pinnacle",
   prices: Record<Stage, [number, number]>,
   now: number,
+  lineKey = "2.5",
 ): void {
   addMatch(id, now + 30 * 60_000);
-  addStage(id, provider, "initial", "2.5", ...prices.initial, now - 25 * 60_000);
-  addStage(id, provider, "T30", "2.5", ...prices.T30, now - 20 * 60_000);
-  addStage(id, provider, "T5", "2.5", ...prices.T5, now - 60_000);
+  addStage(id, provider, "initial", lineKey, ...prices.initial, now - 25 * 60_000);
+  addStage(id, provider, "T30", lineKey, ...prices.T30, now - 20 * 60_000);
+  addStage(id, provider, "T5", lineKey, ...prices.T5, now - 60_000);
 }
 
 describe("OU signal monitor", () => {
-  it("locks the two direct and three reverse rules with exact drift boundaries", () => {
+  it("locks active rules with exact drift boundaries and retires UUU reverse", () => {
     const now = Date.now();
     addPath("uoo", "pinnacle", {
       initial: [1.90, 1.80],
@@ -110,18 +111,20 @@ describe("OU signal monitor", () => {
       T5: [1.98, 1.85],
     }, now);
 
-    expect(syncOuSignalObservations()).toBe(5);
+    expect(syncOuSignalObservations()).toBe(4);
     expect(syncOuSignalObservations()).toBe(0);
     expect(
       (rawDb.prepare("SELECT COUNT(*) AS total FROM ou_signal_observations").get() as { total: number }).total,
-    ).toBe(5);
+    ).toBe(4);
     const dataset = ouSignalDataset(now);
-    expect(dataset.observations).toHaveLength(3);
+    expect(dataset.observations).toHaveLength(2);
     expect(dataset.observations.map((row) => [row.ruleId, row.signalSelection])).toEqual(expect.arrayContaining([
       ["pinnacle-uoo-short-005-010", "O"],
       ["pinnacle-ooo-short-010-020", "O"],
-      ["pinnacle-uuu-flat-wide-reverse", "O"],
     ]));
+    expect(dataset.observations.map((row) => row.ruleId)).not.toContain(
+      "pinnacle-uuu-flat-wide-reverse",
+    );
     expect(dataset.observations.find((row) => row.matchId === "ouu-reverse")).toBeUndefined();
     expect(dataset.observations.find((row) => row.matchId === "ooo-reverse")).toBeUndefined();
   });
@@ -136,8 +139,8 @@ describe("OU signal monitor", () => {
     expect(syncOuSignalObservations(["threshold-fail"])).toBe(0);
   });
 
-  it("keeps all five T-30 candidates but suppresses disabled Telegram rules", () => {
-    expect(syncOuSignalPrealerts()).toBe(5);
+  it("keeps active T-30 candidates but suppresses disabled Telegram rules", () => {
+    expect(syncOuSignalPrealerts()).toBe(4);
     expect(syncOuSignalPrealerts()).toBe(0);
     const rows = rawDb.prepare(
       "SELECT unique_key,match_id,rule_id,signal_t30_odds,detected_at FROM ou_signal_prealerts ORDER BY match_id",
@@ -148,7 +151,7 @@ describe("OU signal monitor", () => {
       signal_t30_odds: number;
       detected_at: number;
     }>;
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(4);
     expect(rows.find((row) => row.match_id === "ouu-reverse")).toMatchObject({
       rule_id: "pinnacle-ouu-short-010-020-reverse",
       signal_t30_odds: 1.96,
@@ -159,11 +162,11 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_prealert_activated_at'",
     ).run(String(earliest - 1), earliest - 1);
     const pending = unsentOuPrealerts();
-    expect(pending).toHaveLength(3);
+    expect(pending).toHaveLength(2);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
     expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
     markOuPrealertNotified(pending[0].uniqueKey, Date.now());
-    expect(unsentOuPrealerts()).toHaveLength(2);
+    expect(unsentOuPrealerts()).toHaveLength(1);
   });
 
   it("does not back-notify observations before activation and marks new sends idempotently", () => {
@@ -180,11 +183,43 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_monitor_activated_at'",
     ).run(String(latestDetected - 1), latestDetected - 1);
     const pending = unsentOuSignals();
-    expect(pending).toHaveLength(3);
+    expect(pending).toHaveLength(2);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
     expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
     markOuSignalNotified(pending[0].uniqueKey, latestDetected + 2);
-    expect(unsentOuSignals()).toHaveLength(2);
+    expect(unsentOuSignals()).toHaveLength(1);
+  });
+
+  it("collects the two line watches without duplicating user-visible signals", () => {
+    const now = Date.now();
+    addPath("ooo-high-watch", "pinnacle", {
+      initial: [1.95, 2.02],
+      T30: [1.88, 2.00],
+      T5: [1.83, 2.01],
+    }, now, "3.0");
+    addPath("uoo-mid-watch", "pinnacle", {
+      initial: [1.90, 1.80],
+      T30: [1.78, 1.96],
+      T5: [1.84, 2.00],
+    }, now, "2.75");
+
+    expect(syncOuSignalObservations(["ooo-high-watch", "uoo-mid-watch"])).toBe(4);
+    const stored = rawDb.prepare(
+      "SELECT match_id,rule_id FROM ou_signal_observations WHERE match_id IN (?,?) ORDER BY match_id,rule_id",
+    ).all("ooo-high-watch", "uoo-mid-watch") as Array<{ match_id: string; rule_id: string }>;
+    expect(stored).toEqual(expect.arrayContaining([
+      { match_id: "ooo-high-watch", rule_id: "pinnacle-ooo-short-010-020" },
+      { match_id: "ooo-high-watch", rule_id: "pinnacle-ooo-line-gt-275-over-watch" },
+      { match_id: "uoo-mid-watch", rule_id: "pinnacle-uoo-short-005-010" },
+      { match_id: "uoo-mid-watch", rule_id: "pinnacle-uoo-line-250-275-over-watch" },
+    ]));
+    const visible = ouSignalDataset(now).observations
+      .filter((row) => ["ooo-high-watch", "uoo-mid-watch"].includes(row.matchId));
+    expect(visible).toHaveLength(2);
+    expect(visible.map((row) => row.ruleId)).toEqual(expect.arrayContaining([
+      "pinnacle-ooo-short-010-020",
+      "pinnacle-uoo-short-005-010",
+    ]));
   });
 
   it("keeps prospective results separate from the frozen historical edge", () => {

@@ -101,6 +101,31 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     historicalNote: "歷史大球命中率高過 T-5 原始隱含機率 16.9 點",
   },
   {
+    id: "pinnacle-ooo-line-gt-275-over-watch",
+    provider: "pinnacle",
+    providerLabel: "皇冠",
+    directionPath: "O→O→O",
+    driftBucket: "任何水位走勢",
+    lineMinExclusive: 2.75,
+    signalSelection: "O",
+    mode: "direct",
+    historicalEdgePp: 0,
+    historicalNote: "隱藏觀察：O→O→O 主盤大於 2.75，研究標籤；不獨立發送通知",
+  },
+  {
+    id: "pinnacle-uoo-line-250-275-over-watch",
+    provider: "pinnacle",
+    providerLabel: "皇冠",
+    directionPath: "U→O→O",
+    driftBucket: "任何水位走勢",
+    lineMinExclusive: 2.5,
+    lineMaxInclusive: 2.75,
+    signalSelection: "O",
+    mode: "direct",
+    historicalEdgePp: 0,
+    historicalNote: "隱藏觀察：U→O→O 主盤大於 2.50 至 2.75，研究標籤；不獨立發送通知",
+  },
+  {
     id: "pinnacle-ouu-short-010-020-reverse",
     provider: "pinnacle",
     providerLabel: "皇冠",
@@ -122,33 +147,39 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     historicalEdgePp: -15.1,
     historicalNote: "歷史原方向大球低過隱含機率 15.1 點，反向觀察小球",
   },
-  {
-    id: "pinnacle-uuu-flat-wide-reverse",
-    provider: "pinnacle",
-    providerLabel: "皇冠",
-    directionPath: "U→U→U",
-    driftBucket: "持平或拉闊",
-    signalSelection: "O",
-    mode: "reverse",
-    historicalEdgePp: -24.3,
-    historicalNote: "歷史原方向小球低過隱含機率 24.3 點，反向觀察大球",
-  },
 ];
+
+/** Retired rules remain decodable for historical rows, but never match new observations. */
+const RETIRED_OU_SIGNAL_RULES: OuSignalRule[] = [{
+  id: "pinnacle-uuu-flat-wide-reverse",
+  provider: "pinnacle",
+  providerLabel: "皇冠",
+  directionPath: "U→U→U",
+  driftBucket: "持平或拉闊",
+  signalSelection: "O",
+  mode: "reverse",
+  historicalEdgePp: -24.3,
+  historicalNote: "已停用；只保留舊紀錄解碼，不再配對新賽事",
+}];
 
 /** Keep collecting these rules for research, but never send T-30/T-5 Telegram alerts. */
 export const OU_HIDDEN_RULE_IDS = new Set([
   "pinnacle-ouu-short-010-020-reverse",
   "hkjc-ooo-flat-wide-reverse",
+  "pinnacle-ooo-line-gt-275-over-watch",
+  "pinnacle-uoo-line-250-275-over-watch",
+  "pinnacle-uuu-flat-wide-reverse",
 ]);
 export const OU_TG_DISABLED_RULE_IDS = OU_HIDDEN_RULE_IDS;
 
-const RULE_BY_ID = new Map(OU_SIGNAL_RULES.map((rule) => [rule.id, rule]));
-const T30_RULE_BY_PREFIX = new Map(
-  OU_SIGNAL_RULES.map((rule) => [
-    `${rule.provider}|${rule.directionPath.split("→").slice(0, 2).join("→")}`,
-    rule,
-  ]),
+const RULE_BY_ID = new Map(
+  [...OU_SIGNAL_RULES, ...RETIRED_OU_SIGNAL_RULES].map((rule) => [rule.id, rule]),
 );
+const T30_RULES_BY_PREFIX = new Map<string, OuSignalRule[]>();
+for (const rule of OU_SIGNAL_RULES) {
+  const prefix = `${rule.provider}|${rule.directionPath.split("→").slice(0, 2).join("→")}`;
+  T30_RULES_BY_PREFIX.set(prefix, [...(T30_RULES_BY_PREFIX.get(prefix) ?? []), rule]);
+}
 
 function selectedSide(prices: Map<Side, number>): { side: Side | "D"; odds: number } | null {
   const over = prices.get("O");
@@ -166,9 +197,25 @@ function driftBucket(gap: number): string {
   return "持平或拉闊";
 }
 
-function matchingRule(provider: Provider, path: string, gap: number): OuSignalRule | undefined {
-  return OU_SIGNAL_RULES.find((rule) => {
+function lineNumber(lineKey: string): number | null {
+  const parts = lineKey.replace(/[OU]/g, "").split("/").map(Number);
+  if (!parts.length || parts.some((part) => !Number.isFinite(part))) return null;
+  return parts.reduce((sum, part) => sum + part, 0) / parts.length;
+}
+
+function matchesLine(rule: OuSignalRule, lineKey: string): boolean {
+  const line = lineNumber(lineKey);
+  if (line === null) return false;
+  if (rule.lineMinExclusive !== undefined && line <= rule.lineMinExclusive) return false;
+  if (rule.lineMaxInclusive !== undefined && line > rule.lineMaxInclusive) return false;
+  return true;
+}
+
+function matchingRules(provider: Provider, path: string, gap: number, lineKey: string): OuSignalRule[] {
+  return OU_SIGNAL_RULES.filter((rule) => {
     if (rule.provider !== provider || rule.directionPath !== path) return false;
+    if (!matchesLine(rule, lineKey)) return false;
+    if (rule.driftBucket === "任何水位走勢") return true;
     if (rule.driftBucket === "收水 0.05–0.10") return gap >= 0.05 && gap < 0.1;
     if (rule.driftBucket === "收水 0.10–0.20") return gap >= 0.1 && gap < 0.2;
     return rule.driftBucket === "持平或拉闊" && gap <= 0;
@@ -223,24 +270,26 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
       if (decisions.some((decision) => decision!.odds <= 1.7)) continue;
       const path = decisions.map((decision) => decision!.side).join("→");
       const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
-      const rule = T30_RULE_BY_PREFIX.get(`${provider}|${path}`);
-      if (!rule) continue;
-      const signalT30Odds = t30Rows.get(rule.signalSelection)?.decimal_odds;
-      if (signalT30Odds === undefined) continue;
       const detectedAt = Math.max(...[...t30Rows.values()].map((row) => row.captured_at));
-      const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}|T30`;
-      inserted += insert.run(
-        uniqueKey,
-        matchId,
-        provider,
-        rule.id,
-        lineKey,
-        path,
-        decisions[0]!.odds,
-        decisions[1]!.odds,
-        signalT30Odds,
-        detectedAt,
-      ).changes;
+      const rules = (T30_RULES_BY_PREFIX.get(`${provider}|${path}`) ?? [])
+        .filter((rule) => matchesLine(rule, lineKey));
+      for (const rule of rules) {
+        const signalT30Odds = t30Rows.get(rule.signalSelection)?.decimal_odds;
+        if (signalT30Odds === undefined) continue;
+        const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}|T30`;
+        inserted += insert.run(
+          uniqueKey,
+          matchId,
+          provider,
+          rule.id,
+          lineKey,
+          path,
+          decisions[0]!.odds,
+          decisions[1]!.odds,
+          signalT30Odds,
+          detectedAt,
+        ).changes;
+      }
     }
   });
   tx();
@@ -307,28 +356,29 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
       if (initialSignalOdds === undefined || t5SignalOdds === undefined) continue;
       const gap = Math.round((initialSignalOdds - t5SignalOdds) * 10_000) / 10_000;
       const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
-      const rule = matchingRule(provider, path, gap);
-      if (!rule) continue;
-      const signalT5Odds = t5Rows.get(rule.signalSelection)?.decimal_odds;
-      if (signalT5Odds === undefined) continue;
       const detectedAt = Math.max(...[...t5Rows.values()].map((row) => row.captured_at));
-      const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}`;
-      inserted += insert.run(
-        uniqueKey,
-        matchId,
-        provider,
-        rule.id,
-        lineKey,
-        path,
-        driftBucket(gap),
-        t5Side,
-        rule.signalSelection,
-        initialSignalOdds,
-        t5SignalOdds,
-        signalT5Odds,
-        gap,
-        detectedAt,
-      ).changes;
+      const rules = matchingRules(provider, path, gap, lineKey);
+      for (const rule of rules) {
+        const signalT5Odds = t5Rows.get(rule.signalSelection)?.decimal_odds;
+        if (signalT5Odds === undefined) continue;
+        const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}`;
+        inserted += insert.run(
+          uniqueKey,
+          matchId,
+          provider,
+          rule.id,
+          lineKey,
+          path,
+          driftBucket(gap),
+          t5Side,
+          rule.signalSelection,
+          initialSignalOdds,
+          t5SignalOdds,
+          signalT5Odds,
+          gap,
+          detectedAt,
+        ).changes;
+      }
     }
   });
   tx();

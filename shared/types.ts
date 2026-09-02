@@ -427,6 +427,8 @@ export interface OuSignalRule {
   providerLabel: string;
   directionPath: string;
   driftBucket: string;
+  lineMinExclusive?: number;
+  lineMaxInclusive?: number;
   signalSelection: "O" | "U";
   mode: OuSignalMode;
   historicalEdgePp: number;
