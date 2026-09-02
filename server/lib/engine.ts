@@ -56,6 +56,7 @@ import {
   remainingSimulationCapacity,
   simulationTarget,
   simulationTargetReached,
+  t30AlertEnabled,
   type ScanCandidate,
   type ScanConfig,
 } from "./scan";
@@ -1134,7 +1135,7 @@ export class RadarEngine {
       });
       this.lastScan = outcome;
       setState("lastScan", JSON.stringify(outcome));
-      if (outcome.newOpportunityKeys.length) {
+      if (outcome.newOpportunityKeys.length && t30AlertEnabled()) {
         try {
           const sent = await notifySimulationBets(outcome.newOpportunityKeys);
           if (sent) log("telegram_notifications", { sent });

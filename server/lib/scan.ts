@@ -32,6 +32,16 @@ export function autoScanEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.RADAR_AUTO_SCAN !== "0";
 }
 
+/**
+ * T-30 窗口掃描完成後嘅 Telegram 「新模擬注單」提示。獨立於掃描本身：
+ * 掃描、注單建立同記錄（回測資料）永遠繼續運作，此開關只控制係否再
+ * 送 Telegram 訊息。預設關閉（cancelled）；設 RADAR_T30_ALERT_ENABLED=1
+ * 先會再發送。
+ */
+export function t30AlertEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.RADAR_T30_ALERT_ENABLED === "1";
+}
+
 export interface ScanConfig {
   windowMinutes: number;
   intervalSec: number;
