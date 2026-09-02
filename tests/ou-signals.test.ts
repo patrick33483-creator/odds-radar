@@ -40,6 +40,8 @@ afterAll(() => {
 
 type Side = "O" | "U";
 type Stage = "initial" | "T30" | "T5";
+const watchActivatedAt = 1_788_350_822_000;
+const afterWatchActivation = watchActivatedAt + 30 * 60_000;
 
 function addMatch(id: string, kickoff: number): void {
   rawDb.prepare(
@@ -84,7 +86,7 @@ function addPath(
 
 describe("OU signal monitor", () => {
   it("locks active rules with exact drift boundaries and retires UUU reverse", () => {
-    const now = Date.now();
+    const now = afterWatchActivation;
     addPath("uoo", "pinnacle", {
       initial: [1.90, 1.80],
       T30: [1.78, 1.96],
@@ -111,22 +113,27 @@ describe("OU signal monitor", () => {
       T5: [1.98, 1.85],
     }, now);
 
-    expect(syncOuSignalObservations()).toBe(4);
+    expect(syncOuSignalObservations()).toBe(6);
     expect(syncOuSignalObservations()).toBe(0);
     expect(
       (rawDb.prepare("SELECT COUNT(*) AS total FROM ou_signal_observations").get() as { total: number }).total,
-    ).toBe(4);
+    ).toBe(6);
     const dataset = ouSignalDataset(now);
-    expect(dataset.observations).toHaveLength(2);
+    expect(dataset.observations).toHaveLength(5);
     expect(dataset.observations.map((row) => [row.ruleId, row.signalSelection])).toEqual(expect.arrayContaining([
       ["pinnacle-uoo-short-005-010", "O"],
       ["pinnacle-ooo-short-010-020", "O"],
+      ["hkjc-ooo-flat-wide-line-225-250-under-watch", "U"],
+      ["hkjc-ooo-flat-wide-reverse", "U"],
     ]));
     expect(dataset.observations.map((row) => row.ruleId)).not.toContain(
       "pinnacle-uuu-flat-wide-reverse",
     );
-    expect(dataset.observations.find((row) => row.matchId === "ouu-reverse")).toBeUndefined();
-    expect(dataset.observations.find((row) => row.matchId === "ooo-reverse")).toBeUndefined();
+    expect(dataset.observations.filter((row) => row.matchId === "ouu-reverse")).toHaveLength(1);
+    expect(dataset.observations.find((row) => row.matchId === "ouu-reverse")?.ruleId).toBe(
+      "pinnacle-ouu-t5-selected-180-190-over-watch",
+    );
+    expect(dataset.observations.filter((row) => row.matchId === "ooo-reverse")).toHaveLength(2);
   });
 
   it("excludes a row when any selected checkpoint price is not strictly above 1.70", () => {
@@ -140,7 +147,7 @@ describe("OU signal monitor", () => {
   });
 
   it("keeps active T-30 candidates but suppresses disabled Telegram rules", () => {
-    expect(syncOuSignalPrealerts()).toBe(4);
+    expect(syncOuSignalPrealerts()).toBe(7);
     expect(syncOuSignalPrealerts()).toBe(0);
     const rows = rawDb.prepare(
       "SELECT unique_key,match_id,rule_id,signal_t30_odds,detected_at FROM ou_signal_prealerts ORDER BY match_id",
@@ -151,8 +158,11 @@ describe("OU signal monitor", () => {
       signal_t30_odds: number;
       detected_at: number;
     }>;
-    expect(rows).toHaveLength(4);
-    expect(rows.find((row) => row.match_id === "ouu-reverse")).toMatchObject({
+    expect(rows).toHaveLength(7);
+    expect(rows.find((row) =>
+      row.match_id === "ouu-reverse"
+      && row.rule_id === "pinnacle-ouu-short-010-020-reverse",
+    )).toMatchObject({
       rule_id: "pinnacle-ouu-short-010-020-reverse",
       signal_t30_odds: 1.96,
     });
@@ -165,6 +175,12 @@ describe("OU signal monitor", () => {
     expect(pending).toHaveLength(2);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
     expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
+    expect(pending.map((row) => row.ruleId)).not.toContain(
+      "hkjc-ooo-flat-wide-line-225-250-under-watch",
+    );
+    expect(pending.map((row) => row.ruleId)).not.toContain(
+      "hkjc-ooo-t5-selected-le-180-under-watch",
+    );
     markOuPrealertNotified(pending[0].uniqueKey, Date.now());
     expect(unsentOuPrealerts()).toHaveLength(1);
   });
@@ -188,6 +204,110 @@ describe("OU signal monitor", () => {
     expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
     markOuSignalNotified(pending[0].uniqueKey, latestDetected + 2);
     expect(unsentOuSignals()).toHaveLength(1);
+  });
+
+  it("tracks all four reverse Watch rules with inclusive line and T-5 odds boundaries", () => {
+    const now = afterWatchActivation + 60_000;
+    addPath("hkjc-watch-low-boundary", "hkjc", {
+      initial: [1.80, 1.92],
+      T30: [1.82, 1.94],
+      T5: [1.80, 1.96],
+    }, now, "2.25");
+    addPath("hkjc-watch-high-boundary", "hkjc", {
+      initial: [1.80, 1.92],
+      T30: [1.82, 1.94],
+      T5: [1.80, 1.96],
+    }, now, "2.5");
+    addPath("hkjc-watch-outside-line", "hkjc", {
+      initial: [1.80, 1.92],
+      T30: [1.82, 1.94],
+      T5: [1.80, 1.96],
+    }, now, "2.75");
+    addPath("pinnacle-watch-low-boundary", "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.80],
+    }, now);
+    addPath("pinnacle-watch-below-odds", "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.79],
+    }, now);
+    addPath("pinnacle-watch-high-boundary", "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.90],
+    }, now);
+    addPath("pinnacle-watch-outside-odds", "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.91],
+    }, now);
+
+    syncOuSignalObservations([
+      "hkjc-watch-low-boundary",
+      "hkjc-watch-high-boundary",
+      "hkjc-watch-outside-line",
+      "pinnacle-watch-low-boundary",
+      "pinnacle-watch-high-boundary",
+      "pinnacle-watch-below-odds",
+      "pinnacle-watch-outside-odds",
+    ]);
+    const rows = ouSignalDataset(now).observations.filter((row) => row.matchId.includes("watch-"));
+
+    for (const id of ["hkjc-watch-low-boundary", "hkjc-watch-high-boundary"]) {
+      expect(rows.filter((row) => row.matchId === id).map((row) => row.ruleId)).toEqual(
+        expect.arrayContaining([
+          "hkjc-ooo-flat-wide-line-225-250-under-watch",
+          "hkjc-ooo-flat-wide-reverse",
+          "hkjc-ooo-t5-selected-le-180-under-watch",
+        ]),
+      );
+    }
+    expect(rows.filter((row) => row.matchId === "hkjc-watch-outside-line").map((row) => row.ruleId))
+      .not.toContain("hkjc-ooo-flat-wide-line-225-250-under-watch");
+    for (const id of ["pinnacle-watch-low-boundary", "pinnacle-watch-high-boundary"]) {
+      expect(rows.filter((row) => row.matchId === id).map((row) => row.ruleId)).toContain(
+        "pinnacle-ouu-t5-selected-180-190-over-watch",
+      );
+    }
+    expect(rows.filter((row) => row.matchId === "pinnacle-watch-outside-odds").map((row) => row.ruleId))
+      .not.toContain("pinnacle-ouu-t5-selected-180-190-over-watch");
+    expect(rows.filter((row) => row.matchId === "pinnacle-watch-below-odds").map((row) => row.ruleId))
+      .not.toContain("pinnacle-ouu-t5-selected-180-190-over-watch");
+
+    const storedBefore = (rawDb.prepare(
+      "SELECT COUNT(*) AS total FROM ou_signal_observations WHERE match_id LIKE '%watch-%'",
+    ).get() as { total: number }).total;
+    syncOuSignalObservations([
+      "hkjc-watch-low-boundary",
+      "hkjc-watch-high-boundary",
+      "hkjc-watch-outside-line",
+      "pinnacle-watch-low-boundary",
+      "pinnacle-watch-high-boundary",
+      "pinnacle-watch-below-odds",
+      "pinnacle-watch-outside-odds",
+    ]);
+    const storedAfter = (rawDb.prepare(
+      "SELECT COUNT(*) AS total FROM ou_signal_observations WHERE match_id LIKE '%watch-%'",
+    ).get() as { total: number }).total;
+    expect(storedAfter).toBe(storedBefore);
+  });
+
+  it("does not backfill newly activated Watch rules from older snapshots", () => {
+    const beforeActivation = watchActivatedAt - 1_000;
+    addPath("watch-before-activation", "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.85],
+    }, beforeActivation);
+
+    syncOuSignalObservations(["watch-before-activation"]);
+    const ruleIds = (rawDb.prepare(
+      "SELECT rule_id FROM ou_signal_observations WHERE match_id=? ORDER BY rule_id",
+    ).all("watch-before-activation") as Array<{ rule_id: string }>).map((row) => row.rule_id);
+    expect(ruleIds).toContain("pinnacle-ouu-short-010-020-reverse");
+    expect(ruleIds).not.toContain("pinnacle-ouu-t5-selected-180-190-over-watch");
   });
 
   it("collects the two line watches without duplicating user-visible signals", () => {
@@ -235,11 +355,11 @@ describe("OU signal monitor", () => {
       prospectiveHitRate: 1,
     });
     expect(dataset.rules.map((rule) => rule.id)).not.toContain("pinnacle-ouu-short-010-020-reverse");
-    expect(dataset.rules.map((rule) => rule.id)).not.toContain("hkjc-ooo-flat-wide-reverse");
+    expect(dataset.rules.map((rule) => rule.id)).toContain("hkjc-ooo-flat-wide-reverse");
     expect(dataset.observations.map((row) => row.ruleId)).not.toContain(
       "pinnacle-ouu-short-010-020-reverse",
     );
-    expect(dataset.observations.map((row) => row.ruleId)).not.toContain(
+    expect(dataset.observations.map((row) => row.ruleId)).toContain(
       "hkjc-ooo-flat-wide-reverse",
     );
   });

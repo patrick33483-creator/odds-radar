@@ -126,6 +126,47 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     historicalNote: "隱藏觀察：U→O→O 主盤大於 2.50 至 2.75，研究標籤；不獨立發送通知",
   },
   {
+    id: "hkjc-ooo-flat-wide-line-225-250-under-watch",
+    activatedAt: 1_788_350_822_000,
+    provider: "hkjc",
+    providerLabel: "馬會",
+    directionPath: "O→O→O",
+    driftBucket: "持平或拉闊",
+    lineMinInclusive: 2.25,
+    lineMaxInclusive: 2.5,
+    signalSelection: "U",
+    mode: "reverse",
+    historicalEdgePp: 0,
+    historicalNote: "Watch：歷史 23 場，反向小球 17/23（73.9%），ROI +41.4%；主盤 2.25 至 2.50",
+  },
+  {
+    id: "pinnacle-ouu-t5-selected-180-190-over-watch",
+    activatedAt: 1_788_350_822_000,
+    provider: "pinnacle",
+    providerLabel: "皇冠",
+    directionPath: "O→U→U",
+    driftBucket: "任何水位走勢",
+    selectedT5OddsMinInclusive: 1.8,
+    selectedT5OddsMaxInclusive: 1.9,
+    signalSelection: "O",
+    mode: "reverse",
+    historicalEdgePp: 0,
+    historicalNote: "Watch：歷史 30 場（26 場判定），反向大球 17/26（65.4%），ROI +27.2%；T-5 原選定價 1.80 至 1.90",
+  },
+  {
+    id: "hkjc-ooo-t5-selected-le-180-under-watch",
+    activatedAt: 1_788_350_822_000,
+    provider: "hkjc",
+    providerLabel: "馬會",
+    directionPath: "O→O→O",
+    driftBucket: "任何水位走勢",
+    selectedT5OddsMaxInclusive: 1.8,
+    signalSelection: "U",
+    mode: "reverse",
+    historicalEdgePp: 0,
+    historicalNote: "Watch：歷史 35 場，反向小球 22/35（62.9%），ROI +21.7%；T-5 原選定價不高於 1.80",
+  },
+  {
     id: "pinnacle-ouu-short-010-020-reverse",
     provider: "pinnacle",
     providerLabel: "皇冠",
@@ -144,8 +185,8 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     driftBucket: "持平或拉闊",
     signalSelection: "U",
     mode: "reverse",
-    historicalEdgePp: -15.1,
-    historicalNote: "歷史原方向大球低過隱含機率 15.1 點，反向觀察小球",
+    historicalEdgePp: 0,
+    historicalNote: "Watch：歷史 24 場，反向小球 17/24（70.8%），ROI +35.5%；包含主盤 2.25 至 2.50 子條件",
   },
 ];
 
@@ -165,12 +206,17 @@ const RETIRED_OU_SIGNAL_RULES: OuSignalRule[] = [{
 /** Keep collecting these rules for research, but never send T-30/T-5 Telegram alerts. */
 export const OU_HIDDEN_RULE_IDS = new Set([
   "pinnacle-ouu-short-010-020-reverse",
-  "hkjc-ooo-flat-wide-reverse",
   "pinnacle-ooo-line-gt-275-over-watch",
   "pinnacle-uoo-line-250-275-over-watch",
   "pinnacle-uuu-flat-wide-reverse",
 ]);
-export const OU_TG_DISABLED_RULE_IDS = OU_HIDDEN_RULE_IDS;
+export const OU_TG_DISABLED_RULE_IDS = new Set([
+  ...OU_HIDDEN_RULE_IDS,
+  "hkjc-ooo-flat-wide-line-225-250-under-watch",
+  "hkjc-ooo-flat-wide-reverse",
+  "pinnacle-ouu-t5-selected-180-190-over-watch",
+  "hkjc-ooo-t5-selected-le-180-under-watch",
+]);
 
 const RULE_BY_ID = new Map(
   [...OU_SIGNAL_RULES, ...RETIRED_OU_SIGNAL_RULES].map((rule) => [rule.id, rule]),
@@ -206,15 +252,35 @@ function lineNumber(lineKey: string): number | null {
 function matchesLine(rule: OuSignalRule, lineKey: string): boolean {
   const line = lineNumber(lineKey);
   if (line === null) return false;
+  if (rule.lineMinInclusive !== undefined && line < rule.lineMinInclusive) return false;
   if (rule.lineMinExclusive !== undefined && line <= rule.lineMinExclusive) return false;
   if (rule.lineMaxInclusive !== undefined && line > rule.lineMaxInclusive) return false;
   return true;
 }
 
-function matchingRules(provider: Provider, path: string, gap: number, lineKey: string): OuSignalRule[] {
+function matchesSelectedT5Odds(rule: OuSignalRule, selectedT5Odds: number): boolean {
+  if (
+    rule.selectedT5OddsMinInclusive !== undefined
+    && selectedT5Odds < rule.selectedT5OddsMinInclusive
+  ) return false;
+  if (
+    rule.selectedT5OddsMaxInclusive !== undefined
+    && selectedT5Odds > rule.selectedT5OddsMaxInclusive
+  ) return false;
+  return true;
+}
+
+function matchingRules(
+  provider: Provider,
+  path: string,
+  gap: number,
+  lineKey: string,
+  selectedT5Odds: number,
+): OuSignalRule[] {
   return OU_SIGNAL_RULES.filter((rule) => {
     if (rule.provider !== provider || rule.directionPath !== path) return false;
     if (!matchesLine(rule, lineKey)) return false;
+    if (!matchesSelectedT5Odds(rule, selectedT5Odds)) return false;
     if (rule.driftBucket === "任何水位走勢") return true;
     if (rule.driftBucket === "收水 0.05–0.10") return gap >= 0.05 && gap < 0.1;
     if (rule.driftBucket === "收水 0.10–0.20") return gap >= 0.1 && gap < 0.2;
@@ -272,7 +338,10 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
       const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
       const detectedAt = Math.max(...[...t30Rows.values()].map((row) => row.captured_at));
       const rules = (T30_RULES_BY_PREFIX.get(`${provider}|${path}`) ?? [])
-        .filter((rule) => matchesLine(rule, lineKey));
+        .filter((rule) =>
+          matchesLine(rule, lineKey)
+          && (rule.activatedAt === undefined || detectedAt >= rule.activatedAt)
+        );
       for (const rule of rules) {
         const signalT30Odds = t30Rows.get(rule.signalSelection)?.decimal_odds;
         if (signalT30Odds === undefined) continue;
@@ -357,7 +426,8 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
       const gap = Math.round((initialSignalOdds - t5SignalOdds) * 10_000) / 10_000;
       const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
       const detectedAt = Math.max(...[...t5Rows.values()].map((row) => row.captured_at));
-      const rules = matchingRules(provider, path, gap, lineKey);
+      const rules = matchingRules(provider, path, gap, lineKey, decisions[2]!.odds)
+        .filter((rule) => rule.activatedAt === undefined || detectedAt >= rule.activatedAt);
       for (const rule of rules) {
         const signalT5Odds = t5Rows.get(rule.signalSelection)?.decimal_odds;
         if (signalT5Odds === undefined) continue;

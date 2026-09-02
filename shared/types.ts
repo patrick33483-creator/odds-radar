@@ -423,12 +423,16 @@ export type OuSignalMatchStatus = "upcoming" | "live" | "completed" | "awaiting_
 
 export interface OuSignalRule {
   id: string;
+  activatedAt?: number;
   provider: ResearchProvider;
   providerLabel: string;
   directionPath: string;
   driftBucket: string;
+  lineMinInclusive?: number;
   lineMinExclusive?: number;
   lineMaxInclusive?: number;
+  selectedT5OddsMinInclusive?: number;
+  selectedT5OddsMaxInclusive?: number;
   signalSelection: "O" | "U";
   mode: OuSignalMode;
   historicalEdgePp: number;
