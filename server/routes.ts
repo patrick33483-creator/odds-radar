@@ -12,6 +12,7 @@ import { HkjcProvider } from "./providers/hkjc";
 import {
   collectResearchInitialSnapshots,
   collectResearchResults,
+  collectTodayCrownBackfill,
   parseResearchFilters,
   researchCsv,
   researchDataset,
@@ -32,6 +33,9 @@ let researchResultsInFlight: Promise<{ candidates: number; collected: number }> 
 let researchOpeningsTimer: NodeJS.Timeout | null = null;
 let researchOpeningsStartupTimer: NodeJS.Timeout | null = null;
 let researchOpeningsInFlight: Promise<Awaited<ReturnType<typeof collectResearchInitialSnapshots>>> | null = null;
+let crownBackfillTimer: NodeJS.Timeout | null = null;
+let crownBackfillStartupTimer: NodeJS.Timeout | null = null;
+let crownBackfillInFlight: Promise<Awaited<ReturnType<typeof collectTodayCrownBackfill>>> | null = null;
 const researchHkjc = new HkjcProvider();
 
 function installResearchResultCollection(): void {
@@ -62,6 +66,41 @@ function installResearchResultCollection(): void {
   researchResultsStartupTimer.unref();
   researchResultsTimer = setInterval(() => void run(), 60 * 60_000);
   researchResultsTimer.unref();
+}
+
+/**
+ * Crown fixtures that already kicked off today can sit without an official
+ * result or an opening snapshot.  This research-only job backfills both so the
+ * research page fills in naturally; it never touches execution tables.
+ */
+function installTodayCrownBackfill(): void {
+  if (process.env.RADAR_TODAY_CROWN_BACKFILL === "0" || crownBackfillTimer) return;
+  const run = async () => {
+    if (crownBackfillInFlight) return;
+    crownBackfillInFlight = collectTodayCrownBackfill();
+    try {
+      const outcome = await crownBackfillInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "today_crown_backfill_run",
+        ...outcome,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "today_crown_backfill_run_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      crownBackfillInFlight = null;
+    }
+  };
+  crownBackfillStartupTimer = setTimeout(() => void run(), 5 * 60_000);
+  crownBackfillStartupTimer.unref();
+  crownBackfillTimer = setInterval(() => void run(), 15 * 60_000);
+  crownBackfillTimer.unref();
 }
 
 /**
@@ -287,6 +326,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   installHourlyPrewarm();
   installResearchOpeningCollection();
   installResearchResultCollection();
+  installTodayCrownBackfill();
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.dashboardData();
