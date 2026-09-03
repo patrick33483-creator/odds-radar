@@ -50,6 +50,13 @@ jobs:
           hkjc_latest_max = scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='hkjc'")
           simulation_bets = scalar("SELECT COUNT(*) FROM simulation_bets WHERE excluded_from_stats=0")
           fixture_sources = db.execute("SELECT fixture_source,COUNT(*) FROM matches GROUP BY fixture_source ORDER BY fixture_source").fetchall()
+          pinnacle_only_matches = scalar("SELECT COUNT(*) FROM matches WHERE fixture_source='pinnacle'")
+          pinnacle_only_kickoff_window = scalar("SELECT COUNT(*) FROM matches WHERE fixture_source='pinnacle' AND kickoff_utc > strftime('%s','now')*1000")
+          pinnapi_source_map_total = scalar("SELECT COUNT(*) FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL")
+          pinnacle_only_snapshots = db.execute(
+              "SELECT stage, COUNT(*) FROM research_timeline_snapshots s JOIN matches m ON m.id=s.match_id "
+              "WHERE m.fixture_source='pinnacle' AND s.provider='pinnacle' GROUP BY stage ORDER BY stage"
+          ).fetchall()
           timeline_by_stage = db.execute(
               "SELECT provider,stage,COUNT(*),MAX(captured_at) FROM research_timeline_snapshots "
               "WHERE provider IN ('hkjc','pinnacle') GROUP BY provider,stage ORDER BY provider,stage"
@@ -63,7 +70,9 @@ jobs:
           ).stdout
           clean_logs = [re.sub(r'\x1b\[[0-9;]*m', '', line) for line in logs.splitlines()]
           crown_events = [line for line in clean_logs if 'today_crown_backfill' in line or 'crown_research_detail' in line]
+          pinnacle_only_logs = [line for line in clean_logs if 'pinnacle_only' in line]
           auto_research = [line for line in clean_logs if 'auto_research_timeline' in line]
+          auto_window = [line for line in clean_logs if 'auto_window_scan' in line]
           ou_errors = [line for line in clean_logs if 'ou_signal' in line.lower() and 'error' in line.lower()]
           print("::notice title=Phase1 read-only production audit::" + json.dumps({
               'read_only_connection': True,
@@ -79,10 +88,17 @@ jobs:
               'crown_events_current_container_count': len(crown_events),
               'auto_research_timeline_current_container_count': len(auto_research),
               'auto_research_timeline_latest': auto_research[-1] if auto_research else None,
+              'auto_window_scan_current_container_count': len(auto_window),
+              'auto_window_scan_latest': auto_window[-1] if auto_window else None,
               'ou_errors_current_container_count': len(ou_errors),
               'ou_errors_current_container': ou_errors[-3:],
               'app_state': states,
               'fixture_sources': [dict(zip(('fixture_source','rows'), row)) for row in fixture_sources],
+              'pinnacle_only_matches': pinnacle_only_matches,
+              'pinnacle_only_kickoff_window': pinnacle_only_kickoff_window,
+              'pinnapi_source_map_total': pinnapi_source_map_total,
+              'pinnacle_only_snapshots_by_stage': [dict(zip(('stage','rows'), row)) for row in pinnacle_only_snapshots],
+              'pinnacle_only_log_tail': pinnacle_only_logs[-5:],
               'simulation_bets_included': simulation_bets,
               'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
           }, ensure_ascii=False, sort_keys=False))
