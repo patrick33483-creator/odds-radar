@@ -54,6 +54,35 @@ UPDATE matches
 SET titan_id=(SELECT p.titan_id FROM pinnacle_source_map p WHERE p.match_id=matches.id)
 WHERE titan_id IS NULL;
 
--- This intentionally fails rather than silently choosing a duplicate owner.
+-- Runtime migration additionally removes duplicate research rows only when the
+-- two HKJC rows represent the same teams. This portable migration keeps one
+-- deterministic owner and detaches every other legacy mapping.
+WITH ranked AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY titan_id
+           ORDER BY updated_at DESC,id DESC
+         ) AS owner_rank
+  FROM matches
+  WHERE titan_id IS NOT NULL
+)
+UPDATE pinnacle_source_map
+SET titan_id=NULL,titan_reversed=0,
+    active_source=CASE WHEN active_source='titan' THEN NULL ELSE active_source END
+WHERE match_id IN (SELECT id FROM ranked WHERE owner_rank>1);
+
+WITH ranked AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY titan_id
+           ORDER BY updated_at DESC,id DESC
+         ) AS owner_rank
+  FROM matches
+  WHERE titan_id IS NOT NULL
+)
+UPDATE matches
+SET titan_id=NULL
+WHERE id IN (SELECT id FROM ranked WHERE owner_rank>1);
+
 CREATE UNIQUE INDEX matches_titan_uniq ON matches(titan_id) WHERE titan_id IS NOT NULL;
 COMMIT;

@@ -66,4 +66,17 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" \
-            'sleep 50 && sudo /opt/odds-radar/deploy/health-check.sh'
+            'set -e
+             cd /opt/odds-radar
+             for attempt in $(seq 1 120); do
+               container_id="$(sudo docker compose ps -aq radar)"
+               health="$(sudo docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" "$container_id")"
+               [ "$health" = healthy ] && break
+               sleep 5
+             done
+             if [ "$health" != healthy ]; then
+               sudo docker compose ps >&2
+               sudo docker compose logs --tail 250 radar >&2
+               exit 1
+             fi
+             sudo /opt/odds-radar/deploy/health-check.sh'

@@ -393,6 +393,7 @@ function migrateCrownResearchFixtures(): void {
           WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
        );
   `);
+  dedupeTitanFixtureIdentity();
   const duplicate = sqlite.prepare(
     `SELECT titan_id,COUNT(*) count FROM matches
       WHERE titan_id IS NOT NULL GROUP BY titan_id HAVING COUNT(*)>1 LIMIT 1`,
@@ -401,6 +402,80 @@ function migrateCrownResearchFixtures(): void {
     throw new Error(`Duplicate Titan fixture identity ${duplicate.titan_id} (${duplicate.count} rows)`);
   }
   sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS matches_titan_uniq ON matches(titan_id) WHERE titan_id IS NOT NULL");
+}
+
+function normalizedFixtureTeam(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/**
+ * Repair legacy Titan mappings before the unique index is installed.
+ *
+ * A duplicated sid can mean either a duplicate HKJC listing of the same match
+ * (occasionally with home/away reversed), or a genuinely unrelated HKJC match
+ * that was matched to the wrong Titan fixture. Duplicate research rows are
+ * removed only for the former; unrelated HKJC history is retained.
+ */
+export function dedupeTitanFixtureIdentity(): number {
+  return sqlite.transaction(() => {
+    const groups = sqlite.prepare(
+      `SELECT titan_id FROM matches
+        WHERE titan_id IS NOT NULL
+        GROUP BY titan_id HAVING COUNT(*)>1
+        ORDER BY titan_id`,
+    ).all() as Array<{ titan_id: string }>;
+    let detached = 0;
+    for (const group of groups) {
+      const candidates = sqlite.prepare(
+        `SELECT m.id,m.home_team,m.away_team,m.kickoff_utc,m.updated_at,
+                COALESCE((SELECT COUNT(*) FROM research_results r WHERE r.match_id=m.id),0) result_count,
+                COALESCE((SELECT COUNT(*) FROM research_timeline_snapshots s WHERE s.match_id=m.id),0) snapshot_count
+           FROM matches m WHERE m.titan_id=?`,
+      ).all(group.titan_id) as Array<{
+        id: string;
+        home_team: string;
+        away_team: string;
+        kickoff_utc: number;
+        updated_at: number;
+        result_count: number;
+        snapshot_count: number;
+      }>;
+      candidates.sort((a, b) =>
+        b.result_count - a.result_count
+        || b.updated_at - a.updated_at
+        || b.snapshot_count - a.snapshot_count
+        || b.id.localeCompare(a.id),
+      );
+      const winner = candidates[0];
+      if (!winner) continue;
+      const winnerTeams = [
+        normalizedFixtureTeam(winner.home_team),
+        normalizedFixtureTeam(winner.away_team),
+      ].sort().join("|");
+      for (const loser of candidates.slice(1)) {
+        const loserTeams = [
+          normalizedFixtureTeam(loser.home_team),
+          normalizedFixtureTeam(loser.away_team),
+        ].sort().join("|");
+        const sameFixture = winnerTeams === loserTeams
+          && Math.abs(winner.kickoff_utc - loser.kickoff_utc) <= 15 * 60_000;
+        if (sameFixture) {
+          sqlite.prepare("DELETE FROM research_timeline_snapshots WHERE match_id=?").run(loser.id);
+          sqlite.prepare("DELETE FROM research_timeline_points WHERE match_id=?").run(loser.id);
+          sqlite.prepare("DELETE FROM research_results WHERE match_id=?").run(loser.id);
+        }
+        sqlite.prepare("UPDATE matches SET titan_id=NULL WHERE id=?").run(loser.id);
+        sqlite.prepare(
+          `UPDATE pinnacle_source_map
+              SET titan_id=NULL,titan_reversed=0,
+                  active_source=CASE WHEN active_source='titan' THEN NULL ELSE active_source END
+            WHERE match_id=?`,
+        ).run(loser.id);
+        detached++;
+      }
+    }
+    return detached;
+  })();
 }
 
 migrate();

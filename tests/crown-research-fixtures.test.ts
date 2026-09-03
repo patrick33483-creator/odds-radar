@@ -12,7 +12,7 @@ import {
   researchDataset,
   saveCrownResearchInitialSnapshots,
 } from "../server/lib/research";
-import { rawDb } from "../server/lib/store";
+import { dedupeTitanFixtureIdentity, rawDb } from "../server/lib/store";
 import {
   syncOuSignalObservations,
   syncOuSignalPrealerts,
@@ -78,6 +78,67 @@ afterEach(() => {
 });
 
 describe("Crown-only research fixtures", () => {
+  it("repairs legacy duplicate Titan mappings without creating duplicate research samples", () => {
+    const sameSid = `${PREFIX}-legacy-same`;
+    const wrongSid = `${PREFIX}-legacy-wrong`;
+    const ids = [
+      `${PREFIX}-same-winner`,
+      `${PREFIX}-same-loser`,
+      `${PREFIX}-wrong-winner`,
+      `${PREFIX}-wrong-loser`,
+    ];
+    rawDb.exec("DROP INDEX matches_titan_uniq");
+    try {
+      const insertMatch = rawDb.prepare(
+        `INSERT INTO matches(
+          id,hkjc_id,fixture_source,titan_id,league,home_team,away_team,kickoff_utc,status,inplay,updated_at
+        ) VALUES(?,?,'hkjc',?,'L',?,?,?,'PREEVENT',0,?)`,
+      );
+      insertMatch.run(ids[0], "same-winner", sameSid, "Rennes", "PSG", NOW, NOW + 2);
+      insertMatch.run(ids[1], "same-loser", sameSid, "PSG", "Rennes", NOW + 60_000, NOW + 1);
+      insertMatch.run(ids[2], "wrong-winner", wrongSid, "Brisbane Roar B", "Gold Coast Knights", NOW, NOW + 2);
+      insertMatch.run(ids[3], "wrong-loser", wrongSid, "Gold Coast United", "Eastern Suburbs", NOW, NOW + 1);
+      const insertSource = rawDb.prepare(
+        `INSERT INTO pinnacle_source_map(match_id,titan_id,titan_reversed,active_source,updated_at)
+         VALUES(?,?,1,'titan',?)`,
+      );
+      for (const id of ids.slice(0, 2)) insertSource.run(id, sameSid, NOW);
+      for (const id of ids.slice(2)) insertSource.run(id, wrongSid, NOW);
+      const insertSnapshot = rawDb.prepare(
+        `INSERT INTO research_timeline_snapshots(
+          match_id,provider,market,stage,line_key,selection,decimal_odds,captured_at
+        ) VALUES(?,'crown','OU','T5','2.5','O',1.9,?)`,
+      );
+      insertSnapshot.run(ids[0], NOW);
+      insertSnapshot.run(ids[1], NOW);
+      insertSnapshot.run(ids[3], NOW);
+      rawDb.prepare(
+        `INSERT INTO research_results(
+          match_id,hkjc_id,home_score,away_score,source,result_source,source_match_id,fetched_at
+        ) VALUES(?,?,2,2,'hkjc','hkjc',?,?)`,
+      ).run(ids[0], "same-winner", "same-winner", NOW);
+
+      expect(dedupeTitanFixtureIdentity()).toBe(2);
+      expect(rawDb.prepare("SELECT id FROM matches WHERE titan_id=?").all(sameSid))
+        .toEqual([{ id: ids[0] }]);
+      expect(rawDb.prepare("SELECT id FROM matches WHERE titan_id=?").all(wrongSid))
+        .toEqual([{ id: ids[2] }]);
+      expect(rawDb.prepare(
+        "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=?",
+      ).get(ids[1])).toEqual({ count: 0 });
+      expect(rawDb.prepare(
+        "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=?",
+      ).get(ids[3])).toEqual({ count: 1 });
+      expect(rawDb.prepare(
+        "SELECT titan_id,titan_reversed,active_source FROM pinnacle_source_map WHERE match_id=?",
+      ).get(ids[1])).toEqual({ titan_id: null, titan_reversed: 0, active_source: null });
+    } finally {
+      rawDb.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS matches_titan_uniq ON matches(titan_id) WHERE titan_id IS NOT NULL",
+      );
+    }
+  });
+
   it("inserts unmatched Titan fixtures once and respects an HKJC claim", () => {
     const sid = `${PREFIX}-upsert`;
     expect(upsertCrownResearchFixtures([fixture(sid)], NOW)).toBe(1);

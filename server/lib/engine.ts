@@ -157,9 +157,13 @@ export function upsertCrownResearchFixtures(fixtures: PinnacleFixture[], now = D
 /** Merge a Crown-first alias into the later HKJC canonical fixture atomically. */
 export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): boolean {
   return rawDb.transaction(() => {
-    const crown = rawDb.prepare(
-      "SELECT id FROM matches WHERE titan_id=? AND fixture_source='crown' AND id<>?",
-    ).get(titanId, hkjcId) as { id: string } | undefined;
+    const claimed = rawDb.prepare(
+      "SELECT id,fixture_source FROM matches WHERE titan_id=? AND id<>?",
+    ).get(titanId, hkjcId) as { id: string; fixture_source: "hkjc" | "crown" } | undefined;
+    // Never let a fuzzy fixture match steal a Titan identity already owned by
+    // another HKJC row. Legacy duplicates are repaired during migration.
+    if (claimed?.fixture_source === "hkjc") return false;
+    const crown = claimed?.fixture_source === "crown" ? claimed : undefined;
     if (!crown) {
       rawDb.prepare("UPDATE matches SET titan_id=? WHERE id=? AND fixture_source='hkjc'").run(titanId, hkjcId);
       return false;
