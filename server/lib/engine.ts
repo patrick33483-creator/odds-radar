@@ -119,7 +119,7 @@ export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): 
   return rawDb.transaction(() => {
     const claimed = rawDb.prepare(
       "SELECT id,fixture_source FROM matches WHERE titan_id=? AND id<>?",
-    ).get(titanId, hkjcId) as { id: string; fixture_source: "hkjc" | "crown" } | undefined;
+    ).get(titanId, hkjcId) as { id: string; fixture_source: "hkjc" | "pinnacle" | "crown" } | undefined;
     // Never let a fuzzy fixture match steal a Titan identity already owned by
     // another HKJC row. Legacy duplicates are repaired during migration.
     if (claimed?.fixture_source === "hkjc") return false;
@@ -733,6 +733,137 @@ export class RadarEngine {
     return pinnapiFixtures.length + opticFixtures.length + titanFixtures.length;
   }
 
+  /**
+   * Isolated Pinnacle-only research ingestion.  For every PinnAPI fixture that
+   * is NOT already mapped to an HKJC-linked match, we persist a fixture row
+   * (`id='pinnacle:<eventId>'`, `fixture_source='pinnacle'`, `hkjc_id=NULL`)
+   * and capture live prices into `research_timeline_snapshots`.
+   *
+   * This method NEVER touches `odds_latest`, `market_lines`, `opportunities`,
+   * `simulation_bets`, Crown detail, HKJC execution, or the T-30 window
+   * scanner.  It only writes research-timeline rows so the Pinnacle-only OU
+   * signal path (rule provider='pinnacle', >1.70 gate) can evaluate them.
+   */
+  async refreshPinnacleOnlyResearch(now = Date.now()): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
+    if (!this.fixtureCache) {
+      // Load the shared fixture cache without disturbing HKJC mapping.
+      await this.refreshPinnacleFixtures();
+    }
+    const pinnapi = this.fixtureCache?.pinnapi ?? [];
+    if (!pinnapi.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
+
+    // Skip PinnAPI ids already mapped to an HKJC-linked match, so we do not
+    // shadow the HKJC canonical row.
+    const mapped = new Set(
+      (rawDb.prepare(
+        "SELECT pinnapi_id FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL",
+      ).all() as Array<{ pinnapi_id: string | null }>).map((row) => row.pinnapi_id).filter((v): v is string => !!v),
+    );
+    const upsertFixture = rawDb.prepare(
+      `INSERT INTO matches(
+        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
+        home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+      ) VALUES(?,NULL,'pinnacle',NULL,?,?,NULL,?,?,NULL,NULL,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET league=excluded.league,home_team=excluded.home_team,
+         away_team=excluded.away_team,kickoff_utc=excluded.kickoff_utc,
+         status=excluded.status,inplay=excluded.inplay,updated_at=excluded.updated_at
+         WHERE matches.fixture_source='pinnacle'`,
+    );
+
+    const targets: Array<{ matchId: string; eventId: string; kickoffUtc: number }> = [];
+    const upsertTx = rawDb.transaction(() => {
+      for (const fixture of pinnapi) {
+        if (fixture.parentId) continue; // prefer parent events only
+        if (mapped.has(fixture.providerMatchId)) continue;
+        // Only fixtures still in the future or just kicked off are useful for
+        // research; historical rows may still be settled later by a separate job.
+        if (fixture.kickoffUtc < now - 5 * 60_000) continue;
+        const matchId = `pinnacle:${fixture.providerMatchId}`;
+        upsertFixture.run(
+          matchId,
+          `pinnapi:${fixture.providerMatchId}`,
+          fixture.league,
+          fixture.homeTeam,
+          fixture.awayTeam,
+          fixture.kickoffUtc,
+          fixture.status,
+          fixture.inplay ? 1 : 0,
+          now,
+        );
+        targets.push({ matchId, eventId: fixture.providerMatchId, kickoffUtc: fixture.kickoffUtc });
+      }
+    });
+    upsertTx();
+
+    if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
+
+    // Only poll fixtures inside the research capture horizon: any point where
+    // a snapshot could still be assigned to initial/T30/T15/T5.  For
+    // Pinnacle-only, `initial` requires observedAt < kickoff - 30 min.
+    const eligible = targets.filter((t) => t.kickoffUtc - now > 0 && t.kickoffUtc - now <= 24 * 60 * 60_000);
+    let fetched = 0;
+    let failed = 0;
+    let rows = 0;
+    for (const target of eligible) {
+      if (Date.now() > now + MAX_LOOP_MS) break;
+      let prices: ProviderPrice[] = [];
+      try {
+        if (DEMO) {
+          prices = DEMO_FIXTURE.pinnaclePrices[`pinnapi:${target.eventId}`] ?? [];
+        } else if (this.pinnapi.status().configured) {
+          const normalPrices = await this.pinnapi.fetchMatchPrices(target.eventId);
+          let cornerPrices: ProviderPrice[] = [];
+          try {
+            cornerPrices = (await this.pinnapi.fetchEventCornerLines(target.eventId)).prices;
+          } catch (cornerError) {
+            log("pinnacle_only_corner_unavailable", {
+              eventId: target.eventId,
+              error: (cornerError as Error).message,
+            });
+          }
+          prices = [...normalPrices, ...cornerPrices];
+        }
+        fetched++;
+      } catch (err) {
+        failed++;
+        log("pinnacle_only_detail_error", { eventId: target.eventId, error: (err as Error).message });
+      }
+      if (prices.length) {
+        // captureResearchTimelinePrices persists T30/T15/T5 windows and, for
+        // Pinnacle-only fixtures observed >30 min before kickoff, freezes the
+        // earliest snapshot as `initial`.
+        const inserted = captureResearchTimelinePrices(
+          target.matchId,
+          "pinnacle",
+          prices,
+          target.kickoffUtc,
+          Date.now(),
+        );
+        if (inserted) rows++;
+      }
+    }
+
+    // Pinnacle-only fixtures can qualify for the OU signal path via the
+    // existing prealert/observation sync (rule provider='pinnacle' only).
+    try {
+      const prealerts = unsentOuPrealerts(targets.map((t) => t.matchId));
+      const sent = await notifyOuPrealerts(prealerts);
+      if (sent) log("telegram_ou_t30_prealerts_pinnacle_only", { detected: prealerts.length, sent });
+    } catch (err) {
+      log("telegram_ou_t30_prealert_pinnacle_only_error", { error: (err as Error).message });
+    }
+    try {
+      const signals = unsentOuSignals(targets.map((t) => t.matchId));
+      const sent = await notifyOuSignals(signals);
+      if (sent) log("telegram_ou_signals_pinnacle_only", { detected: signals.length, sent });
+    } catch (err) {
+      log("telegram_ou_signal_pinnacle_only_error", { error: (err as Error).message });
+    }
+
+    log("pinnacle_only_research", { fixtures: targets.length, fetched, failed, rows });
+    return { fixtures: targets.length, fetched, failed, rows };
+  }
+
   private sourceMap(matchId: string): {
     pinnapi_id: string | null;
     pinnapi_reversed: number;
@@ -1266,6 +1397,14 @@ export class RadarEngine {
   async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
+    // Pinnacle-only research runs after the shared fixture cache is warm.
+    // It writes only research-timeline rows and never touches HKJC execution
+    // or the T-30 window scanner.
+    try {
+      await this.refreshPinnacleOnlyResearch();
+    } catch (err) {
+      log("pinnacle_only_research_error", { error: (err as Error).message });
+    }
     return { selected: 0, detailCalls: 0 };
   }
 
