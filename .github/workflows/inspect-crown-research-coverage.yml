@@ -42,7 +42,7 @@ jobs:
           db.execute('PRAGMA query_only=ON')
           db.execute('PRAGMA busy_timeout=1000')
           scalar = lambda sql, params=(): db.execute(sql, params).fetchone()[0]
-          states = dict(db.execute("SELECT key,value FROM app_state WHERE key IN ('lastScan','researchResultsLastRunAt','researchOpeningsLastRunAt','crownBackfillLastRunAt','crownBackfillLastSuccessAt','crownBackfillLastError')").fetchall())
+          states = dict(db.execute("SELECT key,value FROM app_state WHERE key IN ('researchResultsLastRunAt','researchOpeningsLastRunAt','crownBackfillLastRunAt','crownBackfillLastSuccessAt','crownBackfillLastError')").fetchall())
           provider_health = db.execute("SELECT provider,ok,last_success_at,last_attempt_at,last_error_at,last_error,consecutive_failures,item_count,mode FROM provider_health WHERE provider IN ('hkjc','pinnacle') ORDER BY provider").fetchall()
           quote_latest = db.execute("SELECT provider,COUNT(*) rows,MAX(fetched_at) max_fetched_at,MIN(fetched_at) min_fetched_at FROM odds_latest WHERE provider IN ('hkjc','pinnacle','crown') GROUP BY provider ORDER BY provider").fetchall()
           pinnacle_latest_max = scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='pinnacle'")
@@ -73,17 +73,19 @@ jobs:
               'pinnacle_odds_latest_max_fetched_at': pinnacle_latest_max,
               'pinnacle_odds_latest_rows': pinnacle_latest_rows,
               'hkjc_odds_latest_max_fetched_at': hkjc_latest_max,
-              'simulation_bets_included': simulation_bets,
-              'fixture_sources': [dict(zip(('fixture_source','rows'), row)) for row in fixture_sources],
-              'research_timeline_by_provider_stage': [dict(zip(('provider','stage','rows','max_captured_at'), row)) for row in timeline_by_stage],
-              'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
               'provider_health': [dict(zip(('provider','ok','last_success_at','last_attempt_at','last_error_at','last_error','consecutive_failures','item_count','mode'), row)) for row in provider_health],
-              'app_state': states,
+              'research_timeline_by_provider_stage': [dict(zip(('provider','stage','rows','max_captured_at'), row)) for row in timeline_by_stage],
               'ou_counts': [dict(zip(('kind','total','latest_detected_at'), row)) for row in ou_counts],
-              'crown_events_current_container': crown_events[-20:],
-              'auto_research_timeline_current_container': auto_research[-20:],
-              'ou_errors_current_container': ou_errors[-20:],
-          }, ensure_ascii=False, sort_keys=True))
+              'crown_events_current_container_count': len(crown_events),
+              'auto_research_timeline_current_container_count': len(auto_research),
+              'auto_research_timeline_latest': auto_research[-1] if auto_research else None,
+              'ou_errors_current_container_count': len(ou_errors),
+              'ou_errors_current_container': ou_errors[-3:],
+              'app_state': states,
+              'fixture_sources': [dict(zip(('fixture_source','rows'), row)) for row in fixture_sources],
+              'simulation_bets_included': simulation_bets,
+              'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
+          }, ensure_ascii=False, sort_keys=False))
           db.close()
           PY
           printf '%s\n' '=== relevant radar logs (last 900) ==='
