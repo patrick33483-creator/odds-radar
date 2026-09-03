@@ -25,6 +25,12 @@ SIDE = {"AH": ("H", "A"), "OU": ("O", "U")}
 BOOTSTRAPS = 10_000
 PERMUTATIONS = 5_000
 EPS = 1e-9
+POLICY_TEMPLATES = {
+    "F1_league_water": 3,  # top 10%, 70-90%, middle control
+    "F2_double_external_hkjc_lag": 3,  # 0.03, 0.05, 0.08
+    "F3_line_odds_contradiction": 6,  # 3 odds rises × follow/fade
+    "F4_AH_OU_script": 18,  # 3 AH states × 3 OU states × AH/OU execution
+}
 
 
 def num(value: Any) -> float | None:
@@ -542,7 +548,8 @@ def markdown(report: dict[str, Any]) -> str:
         "", "## 結論",
         "",
         f"- 資料期間：{cov['data_period_utc']}；有效已結算 fixtures：{cov['settled_fixtures']}，原始報價列：{cov['raw_quote_rows']}。",
-        f"- 共掃描 {report['total_predefined_policy_tests']} 條預設政策；每家族只以 discovery 選最多三條，固定後才查看 holdout。",
+        f"- 預先定義 {report['planned_policy_templates']} 條政策模板，實際可執行掃描 {report['total_predefined_policy_tests']} 條；每家族只以 discovery 選最多三條，固定後才查看 holdout。",
+        "- 本資料切片沒有一條可執行政策：HKJC 與 Pinnacle 的真初盤完整雙邊全部未標示主線，嚴格規則下不能以其他線代替；這是資料完整性阻塞，並非 ROI 反證。",
         "- 任何 `Watch` 或 `Reject` 均不是可下注建議；亞洲盤以 ROI 為主，半中／半輸的命中定義見 JSON。",
         "",
         "## 選中的 holdout 候選",
@@ -587,6 +594,9 @@ def markdown(report: dict[str, Any]) -> str:
     lines += ["", "### 原始列分布（stage｜origin｜provider｜market）"]
     for key, value in sorted(cov["raw_rows_by_stage_origin_provider_market"].items()):
         lines.append(f"- `{key}`：{value}")
+    lines += ["", "### 真初盤主線標示（provider｜market｜is_main）"]
+    for key, value in sorted(cov["initial_external_main_flags"].items()):
+        lines.append(f"- `{key}`：{value}")
     lines += [
         "- 無可靠正式 score、無完整雙邊、不能解讀 line/selection、非真初盤或開賽後報價均已排除。",
         "- 前瞻只應固定本報告已選政策、以 T30 價格下單（本回測沒有下單或通知），累積至少 50 個新 holdout fixtures 才重評；100 場前不可把單聯賽視為獨立候選。",
@@ -614,6 +624,10 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         f"{str(row.get('stage'))}|{str(row.get('origin'))}|{str(row.get('provider'))}|{str(row.get('market'))}"
         for row in rows
     )
+    opening_main_flags = Counter(
+        f"{str(row.get('provider'))}|{str(row.get('market'))}|{integer(row.get('is_main')) or 0}"
+        for row in rows if row.get("stage") == "initial" and row.get("origin") == "external_opening"
+    )
     report = {
         "audit": {"read_only": True, "decision_checkpoint": "T30", "t5_use": "confirmation only, never T30 selection",
                   "clv": "unavailable: no independently captured closing quote in export"},
@@ -623,9 +637,12 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "fixtures_by_cohort": dict(Counter(f["cohort"] for f in fixtures)), "exclusions": exclusions,
             "main_complete_two_sided_cells": dict(sorted(main_cells.items())),
             "raw_rows_by_stage_origin_provider_market": dict(sorted(raw_shape.items())),
+            "initial_external_main_flags": dict(sorted(opening_main_flags.items())),
         },
         "families": [evaluate(fixtures, bets, family, universe) for family, bets in family_bets],
         "league_summary": league_table(all_bets),
+        "planned_policy_templates": sum(POLICY_TEMPLATES.values()),
+        "planned_policy_templates_by_family": POLICY_TEMPLATES,
         "total_predefined_policy_tests": sum(len(set(b["policy"] for b in bets)) for _, bets in family_bets),
         "raw_candidate_counts": dict(Counter(b["family"] for b in all_bets)),
     }
