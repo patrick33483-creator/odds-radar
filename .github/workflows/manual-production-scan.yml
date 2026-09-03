@@ -1,4 +1,4 @@
-name: 皇冠今日賽事點解睇唔到（只讀）
+name: OU 訊號 Production 健康檢查（只讀）
 
 on:
   workflow_dispatch:
@@ -17,85 +17,43 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 檢查 9-03 皇冠賽事 API 表面
+      - name: 查 OU 訊號表、候選及日誌
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
-          import sqlite3, time, json
+          import sqlite3, json, time, datetime
           db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
           db.row_factory = sqlite3.Row
-          now_ms = int(time.time() * 1000)
+          now = int(time.time() * 1000)
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          start = int(datetime.datetime.now(hkt).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()*1000)
+          print(f"NOW={now} DAY_START={start}")
 
-          # 一日窗口
-          day_start = 1788336000000  # 2026-09-03 00:00 HKT
-          day_end   = 1788422400000  # 2026-09-04 00:00 HKT
+          for table in ["ou_signal_prealerts","ou_signal_observations","odds_latest","odds_snapshots","opportunities"]:
+              cols = [r["name"] for r in db.execute(f"PRAGMA table_info({table})")]
+              print("SCHEMA|" + table + "|" + ",".join(cols))
+              time_col = next((c for c in ["created_at","observed_at","captured_at","updated_at","detected_at"] if c in cols), None)
+              if time_col:
+                  row = db.execute(f"SELECT COUNT(*) n, MAX({time_col}) latest FROM {table} WHERE {time_col}>=?", (start,)).fetchone()
+              else:
+                  row = db.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()
+              print("COUNT|" + table + "|" + json.dumps(dict(row), ensure_ascii=False))
 
-          print("=== 今日 9-03 皇冠賽事整體 ===")
-          agg = db.execute("""
-              SELECT COUNT(*) total,
-                     SUM(CASE WHEN kickoff_utc<?  THEN 1 ELSE 0 END) already_started,
-                     SUM(CASE WHEN kickoff_utc>=? THEN 1 ELSE 0 END) upcoming,
-                     SUM(CASE WHEN status IS NULL THEN 1 ELSE 0 END) status_null,
-                     SUM(CASE WHEN status='live' THEN 1 ELSE 0 END) live,
-                     SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) finished,
-                     SUM(CASE WHEN status NOT IN ('live','finished') AND status IS NOT NULL THEN 1 ELSE 0 END) other_status
-                FROM matches
-               WHERE fixture_source='crown'
-                 AND kickoff_utc>=? AND kickoff_utc<?
-          """, (now_ms, now_ms, day_start, day_end)).fetchone()
-          print(dict(agg))
-
-          print("\n=== 有無 research_timeline_snapshots ===")
-          snap = db.execute("""
-              SELECT COUNT(DISTINCT m.id) matches_with_any_snapshot
-                FROM matches m
-                JOIN research_timeline_snapshots s ON s.match_id=m.id
-               WHERE m.fixture_source='crown'
-                 AND m.kickoff_utc>=? AND m.kickoff_utc<?
-          """, (day_start, day_end)).fetchone()
-          print(dict(snap))
-
-          print("\n=== 3 場樣本 ===")
-          samples = db.execute("""
-              SELECT id, kickoff_utc, home_team, away_team, status, fixture_source,
-                     (SELECT COUNT(*) FROM research_timeline_snapshots s WHERE s.match_id=m.id) snap_count,
-                     (SELECT COUNT(*) FROM crown_research_attempts a WHERE a.match_id=m.id) attempt_count
-                FROM matches m
-               WHERE fixture_source='crown'
-                 AND kickoff_utc>=? AND kickoff_utc<?
-               ORDER BY kickoff_utc
-               LIMIT 3
-          """, (day_start, day_end)).fetchall()
-          for r in samples:
-              print(json.dumps(dict(r), ensure_ascii=False, default=str))
-
-          print("\n=== research endpoint 過濾模擬 ===")
-          # server/routes.ts /api/research 通常會用 upcoming + has_opening
-          filt = db.execute("""
-              SELECT
-                SUM(CASE WHEN kickoff_utc>=? THEN 1 ELSE 0 END) upcoming_only,
-                SUM(CASE WHEN kickoff_utc>=? AND EXISTS(
-                     SELECT 1 FROM research_timeline_snapshots s
-                      WHERE s.match_id=m.id AND s.stage='initial' AND s.provider='crown'
-                ) THEN 1 ELSE 0 END) with_any_initial,
-                SUM(CASE WHEN kickoff_utc>=? AND EXISTS(
-                     SELECT 1 FROM research_timeline_snapshots s
-                      WHERE s.match_id=m.id AND s.stage='initial' AND s.provider='crown'
-                      GROUP BY s.match_id HAVING COUNT(DISTINCT s.market)>=2
-                ) THEN 1 ELSE 0 END) with_full_initial
-                FROM matches m
-               WHERE fixture_source='crown'
-                 AND kickoff_utc>=? AND kickoff_utc<?
-          """, (now_ms, now_ms, now_ms, day_start, day_end)).fetchone()
-          print(dict(filt))
-
-          print("\n=== live /api/research 實際回應 ===")
+          # 最近 10 筆 prealert / observation
+          for table in ["ou_signal_prealerts","ou_signal_observations"]:
+              cols = [r["name"] for r in db.execute(f"PRAGMA table_info({table})")]
+              order = next((c for c in ["created_at","observed_at","captured_at","updated_at","detected_at","id"] if c in cols), "rowid")
+              selected = [c for c in ["id","match_id","stage","status","signal","direction","reason","created_at","observed_at","updated_at"] if c in cols]
+              rows = db.execute(f"SELECT {','.join(selected)} FROM {table} ORDER BY {order} DESC LIMIT 10").fetchall()
+              for r in rows:
+                  print("ROW|" + table + "|" + json.dumps(dict(r), ensure_ascii=False, default=str))
           PY
-          # 用 curl 直接打 production 內部 endpoint
+
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
-            curl -sS -m 20 -u "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              "http://127.0.0.1:8000/api/research?date=2026-09-03" \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print(\"keys:\",list(d.keys())[:8]); v=d.get(\"matches\") or d.get(\"data\") or d.get(\"fixtures\") or []; print(\"count:\",len(v)); print(\"first:\", json.dumps(v[0], ensure_ascii=False)[:600] if v else None)"
+            cd /opt/odds-radar
+            sudo docker compose logs --since 24h radar 2>&1 |
+              grep -Ei "ou_signal|prealert|telegram|signal.*error|scan.*error" |
+              tail -n 250
           ' || true
