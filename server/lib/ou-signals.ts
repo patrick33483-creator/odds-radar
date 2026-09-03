@@ -686,3 +686,46 @@ export function markOuPrealertNotified(uniqueKey: string, notifiedAt = Date.now(
     "UPDATE ou_signal_prealerts SET notified_at=? WHERE unique_key=? AND notified_at IS NULL",
   ).run(notifiedAt, uniqueKey);
 }
+
+/**
+ * Historical hit rate for a specific OU trigger fingerprint (rule_id + line_key).
+ *
+ * Definition: among past observations of the same rule at the same line where a
+ * result has been decided (non-push), the fraction whose outcome was a hit.
+ *
+ * Returned `sample` counts only decided rows. Push and pending rows do not enter
+ * the denominator. Callers decide the minimum-sample threshold (currently 20).
+ */
+export interface OuHitRateResult {
+  hits: number;
+  sample: number; // decided (non-push) count
+  hitRate: number | null; // null when sample === 0
+}
+
+export function computeOuRuleHitRate(ruleId: string, lineKey: string): OuHitRateResult {
+  const rule = RULE_BY_ID.get(ruleId);
+  if (!rule) return { hits: 0, sample: 0, hitRate: null };
+  const line = Number(lineKey);
+  if (!Number.isFinite(line)) return { hits: 0, sample: 0, hitRate: null };
+  const rows = rawDb.prepare(
+    `SELECT r.home_score, r.away_score
+       FROM ou_signal_observations o
+       JOIN research_results r ON r.match_id=o.match_id
+      WHERE o.rule_id=? AND o.line_key=?
+        AND r.home_score IS NOT NULL AND r.away_score IS NOT NULL`,
+  ).all(ruleId, lineKey) as Array<{ home_score: number; away_score: number }>;
+  let hits = 0;
+  let sample = 0;
+  for (const row of rows) {
+    const total = row.home_score + row.away_score;
+    if (total === line) continue; // push
+    sample += 1;
+    const actual = total > line ? "O" : "U";
+    if (actual === rule.signalSelection) hits += 1;
+  }
+  return {
+    hits,
+    sample,
+    hitRate: sample === 0 ? null : hits / sample,
+  };
+}
