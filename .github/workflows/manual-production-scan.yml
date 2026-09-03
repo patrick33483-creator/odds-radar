@@ -1,4 +1,4 @@
-name: 手動掃描盤路雷達
+name: 皇冠研究 Production 只讀核對
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 執行一次賽前窗口掃描
+      - name: 核對健康狀態及皇冠研究資料
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -25,13 +25,36 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
-            set -a
-            . ./.env
-            set +a
-            test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
             docker compose ps
-            curl --fail --silent --show-error \
-              --max-time 240 \
-              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/scan/window
+            sudo ./deploy/health-check.sh
           '
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
+          import sqlite3, time
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          now = int(time.time() * 1000)
+          upcoming = db.execute(
+              "SELECT COUNT(*) FROM matches "
+              "WHERE fixture_source='crown' AND kickoff_utc>=?",
+              (now,),
+          ).fetchone()[0]
+          with_snapshots = db.execute(
+              "SELECT COUNT(DISTINCT m.id) FROM matches m "
+              "JOIN research_timeline_snapshots s ON s.match_id=m.id "
+              "WHERE m.fixture_source='crown'"
+          ).fetchone()[0]
+          results = db.execute(
+              "SELECT COUNT(*) FROM research_results WHERE result_source='crown'"
+          ).fetchone()[0]
+          print(f"CROWN_UPCOMING={upcoming}")
+          print(f"CROWN_WITH_SNAPSHOTS={with_snapshots}")
+          print(f"CROWN_RESULTS={results}")
+          print("CROWN_SAMPLE=")
+          for row in db.execute(
+              "SELECT id, league, home_team, away_team, kickoff_utc "
+              "FROM matches WHERE fixture_source='crown' AND kickoff_utc>=? "
+              "ORDER BY kickoff_utc LIMIT 10",
+              (now,),
+          ):
+              print("|".join(map(str, row)))
+          PY
