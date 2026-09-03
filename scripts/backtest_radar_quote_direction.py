@@ -557,6 +557,8 @@ def markdown(report: dict[str, Any]) -> str:
         "| 家族 | 政策 | cohort | 市場 | holdout n | W/HW/P/HL/L | 平均賠率 | ROI | Bootstrap 95% CI | Wilson 下界 | 對照 ROI 差 | Holm p | 結論 |",
         "|---|---|---|---|---:|---|---:|---:|---|---:|---:|---:|---|",
     ]
+    if report["audit"].get("source_workflow_run_url"):
+        lines.insert(7, f"- 證據 workflow：{report['audit']['source_workflow_run_url']}；資料匯出 SHA-256：{report['audit'].get('export_sha256', '—')}。")
     selected = [x for family in report["families"] for x in family["selected_holdout"]]
     for x in selected:
         h, cc = x["holdout"], x["control_comparison"]
@@ -605,7 +607,7 @@ def markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_report(rows: list[dict[str, Any]], provenance: dict[str, Any] | None = None) -> dict[str, Any]:
     fixtures, exclusions = build_fixtures(rows)
     universe = independent_universe(fixtures)
     family_bets = [
@@ -630,7 +632,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     report = {
         "audit": {"read_only": True, "decision_checkpoint": "T30", "t5_use": "confirmation only, never T30 selection",
-                  "clv": "unavailable: no independently captured closing quote in export"},
+                  "clv": "unavailable: no independently captured closing quote in export", **(provenance or {})},
         "coverage": {
             "raw_quote_rows": len(rows), "settled_fixtures": len(fixtures),
             "data_period_utc": None if not periods else f"{datetime.fromtimestamp(min(periods)/1000, UTC).isoformat()} 至 {datetime.fromtimestamp(max(periods)/1000, UTC).isoformat()}",
@@ -658,8 +660,17 @@ def main() -> int:
     parser.add_argument("input", type=Path)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--markdown-output", type=Path, required=True)
+    parser.add_argument("--source-run-url")
+    parser.add_argument("--source-commit")
+    parser.add_argument("--source-data-sha256")
     args = parser.parse_args()
-    report = build_report(read_jsonl(args.input))
+    report = build_report(read_jsonl(args.input), {
+        key: value for key, value in {
+            "source_workflow_run_url": args.source_run_url,
+            "audit_branch_commit": args.source_commit,
+            "export_sha256": args.source_data_sha256,
+        }.items() if value
+    })
     args.json_output.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     args.markdown_output.write_text(markdown(report), encoding="utf-8")
     return 0
