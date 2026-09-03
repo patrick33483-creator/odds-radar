@@ -591,10 +591,16 @@ function summaries(observations: OuSignalObservation[]): OuSignalRuleSummary[] {
 export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
   syncOuSignalObservations();
   const rows = rawDb.prepare(
-    `SELECT o.*,m.league,m.home_team,m.away_team,m.kickoff_utc,m.status,m.inplay,
+    `SELECT o.*,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+            m.kickoff_utc,m.status,m.inplay,
             r.home_score,r.away_score
        FROM ou_signal_observations o
        JOIN matches m ON m.id=o.match_id
+       LEFT JOIN pinnacle_translations pt
+         ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
       WHERE m.fixture_source IN ('hkjc','pinnacle')
       ORDER BY CASE
@@ -626,10 +632,16 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
   );
   const filter = matchIds.length ? `AND o.match_id IN (${matchIds.map(() => "?").join(",")})` : "";
   const rows = rawDb.prepare(
-    `SELECT o.*,m.league,m.home_team,m.away_team,m.kickoff_utc,m.status,m.inplay,
+    `SELECT o.*,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+            m.kickoff_utc,m.status,m.inplay,
             r.home_score,r.away_score
        FROM ou_signal_observations o
        JOIN matches m ON m.id=o.match_id
+       LEFT JOIN pinnacle_translations pt
+         ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
       WHERE m.fixture_source IN ('hkjc','pinnacle') AND o.notified_at IS NULL AND o.detected_at>=? ${filter}
       ORDER BY o.detected_at`,
@@ -646,9 +658,15 @@ export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
   );
   const filter = matchIds.length ? `AND p.match_id IN (${matchIds.map(() => "?").join(",")})` : "";
   const rows = rawDb.prepare(
-    `SELECT p.*,m.league,m.home_team,m.away_team,m.kickoff_utc
+    `SELECT p.*,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+            CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+            m.kickoff_utc
        FROM ou_signal_prealerts p
        JOIN matches m ON m.id=p.match_id
+       LEFT JOIN pinnacle_translations pt
+         ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
       WHERE m.fixture_source IN ('hkjc','pinnacle') AND p.notified_at IS NULL AND p.detected_at>=? ${filter}
       ORDER BY p.detected_at`,
   ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
