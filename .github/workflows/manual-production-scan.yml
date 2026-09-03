@@ -49,6 +49,29 @@ jobs:
               rows = db.execute(f"SELECT {','.join(selected)} FROM {table} ORDER BY {order} DESC LIMIT 10").fetchall()
               for r in rows:
                   print("ROW|" + table + "|" + json.dumps(dict(r), ensure_ascii=False, default=str))
+
+          print("=== UPCOMING HKJC MATCHES ===")
+          rows = db.execute("""
+            SELECT id,league,home_team,away_team,kickoff_utc,
+                   (SELECT COUNT(*) FROM odds_latest o WHERE o.match_id=m.id AND o.market='OU') ou_latest,
+                   (SELECT MAX(fetched_at) FROM odds_latest o WHERE o.match_id=m.id AND o.market='OU') last_ou
+              FROM matches m
+             WHERE m.fixture_source='hkjc' AND m.kickoff_utc>=?
+             ORDER BY m.kickoff_utc LIMIT 20
+          """, (now,)).fetchall()
+          print("UPCOMING_COUNT|" + str(db.execute(
+            "SELECT COUNT(*) FROM matches WHERE fixture_source='hkjc' AND kickoff_utc>=?", (now,)
+          ).fetchone()[0]))
+          for r in rows:
+              print("UPCOMING|" + json.dumps(dict(r), ensure_ascii=False))
+
+          print("=== STATE ===")
+          for r in db.execute("""
+            SELECT key,value,updated_at FROM state
+             WHERE key LIKE '%scan%' OR key LIKE '%telegram%' OR key LIKE '%signal%'
+             ORDER BY updated_at DESC LIMIT 50
+          """):
+              print("STATE|" + json.dumps(dict(r), ensure_ascii=False, default=str))
           PY
 
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
