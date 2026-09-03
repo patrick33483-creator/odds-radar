@@ -210,15 +210,30 @@ CREATE TABLE IF NOT EXISTS pinnacle_translations (
   zh_home TEXT,
   zh_away TEXT,
   zh_league TEXT,
-  source TEXT NOT NULL CHECK(source IN ('titan','optic')),
+  source TEXT NOT NULL CHECK(source IN ('titan','optic','wikidata')),
   updated_at INTEGER NOT NULL,
   attempted_at INTEGER,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT);
 CREATE INDEX IF NOT EXISTS pinnacle_translations_updated_idx
   ON pinnacle_translations(updated_at);
+
+CREATE TABLE IF NOT EXISTS pinnacle_translation_entities (
+  normalized_name TEXT NOT NULL,
+  entity_type TEXT NOT NULL CHECK(entity_type IN ('team','league')),
+  zh_label TEXT,
+  label_language TEXT,
+  wikidata_id TEXT,
+  updated_at INTEGER NOT NULL,
+  attempted_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  PRIMARY KEY(normalized_name,entity_type));
+CREATE INDEX IF NOT EXISTS pinnacle_translation_entities_updated_idx
+  ON pinnacle_translation_entities(updated_at);
 `);
   migrateFixtureSources();
+  migratePinnacleTranslations();
   // The activation watermark prevents a new deployment from sending Telegram
   // alerts for historical rows that are backfilled into the signal page.
   const activatedAt = Date.now();
@@ -374,6 +389,60 @@ CREATE INDEX IF NOT EXISTS pinnacle_translations_updated_idx
       ON simulation_bets(excluded_from_stats, category, placed_at);
   `);
   sqlite.exec("CREATE INDEX IF NOT EXISTS pinnacle_source_map_pinnapi_idx ON pinnacle_source_map(pinnapi_id)");
+}
+
+/**
+ * SQLite cannot alter a CHECK enum in place. Inspect only the CHECK attached
+ * to `source` (rather than scanning the whole CREATE statement for a word that
+ * may occur in a column name), then rebuild without losing fixture cache rows.
+ */
+function migratePinnacleTranslations(): void {
+  const tableSql = String(
+    (sqlite.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='pinnacle_translations'",
+    ).get() as { sql?: string } | undefined)?.sql ?? "",
+  );
+  const sourceCheck = /CHECK\s*\(\s*source\s+IN\s*\(([^)]*)\)/i.exec(tableSql);
+  const sourceEnum = sourceCheck?.[1] ?? "";
+  if (!/['"]wikidata['"]/i.test(sourceEnum)) {
+    sqlite.transaction(() => {
+      sqlite.exec(`
+        DROP INDEX IF EXISTS pinnacle_translations_updated_idx;
+        ALTER TABLE pinnacle_translations RENAME TO pinnacle_translations_pre_wikidata;
+        CREATE TABLE pinnacle_translations (
+          pinnapi_id TEXT PRIMARY KEY,
+          zh_home TEXT,
+          zh_away TEXT,
+          zh_league TEXT,
+          source TEXT NOT NULL CHECK(source IN ('titan','optic','wikidata')),
+          updated_at INTEGER NOT NULL,
+          attempted_at INTEGER,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT);
+        INSERT INTO pinnacle_translations(
+          pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error
+        )
+        SELECT pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error
+          FROM pinnacle_translations_pre_wikidata;
+        DROP TABLE pinnacle_translations_pre_wikidata;
+        CREATE INDEX pinnacle_translations_updated_idx ON pinnacle_translations(updated_at);
+      `);
+    })();
+  }
+
+  // One-time eligibility reset for attempts made before the Wikidata source
+  // existed. Successful and partial translations are deliberately untouched.
+  const marker = sqlite.prepare(
+    `INSERT OR IGNORE INTO app_state(key,value,updated_at)
+     VALUES('pinnacle_wikidata_retry_v1','1',?)`,
+  ).run(Date.now());
+  if (marker.changes) {
+    sqlite.prepare(
+      `UPDATE pinnacle_translations
+          SET attempted_at=NULL,attempt_count=0,last_error=NULL
+        WHERE source='titan' AND zh_home IS NULL AND zh_away IS NULL AND zh_league IS NULL`,
+    ).run();
+  }
 }
 
 /**
@@ -598,7 +667,7 @@ export interface PinnacleTranslationRow {
   zh_home: string | null;
   zh_away: string | null;
   zh_league: string | null;
-  source: "titan" | "optic";
+  source: "titan" | "optic" | "wikidata";
   updated_at: number;
   attempted_at: number | null;
   attempt_count: number;
@@ -617,7 +686,7 @@ export function upsertPinnacleTranslation(t: {
   zhHome: string | null;
   zhAway: string | null;
   zhLeague: string | null;
-  source: "titan" | "optic";
+  source: "titan" | "optic" | "wikidata";
 }, now = Date.now()): void {
   rawDb
     .prepare(
@@ -628,6 +697,75 @@ export function upsertPinnacleTranslation(t: {
          attempted_at=excluded.attempted_at,attempt_count=0,last_error=NULL`,
     )
     .run(t.pinnapiId, t.zhHome, t.zhAway, t.zhLeague, t.source, now, now);
+}
+
+export type PinnacleTranslationEntityType = "team" | "league";
+
+export interface PinnacleTranslationEntityRow {
+  normalized_name: string;
+  entity_type: PinnacleTranslationEntityType;
+  zh_label: string | null;
+  label_language: string | null;
+  wikidata_id: string | null;
+  updated_at: number;
+  attempted_at: number | null;
+  attempt_count: number;
+  last_error: string | null;
+}
+
+export function getPinnacleTranslationEntity(
+  normalizedName: string,
+  entityType: PinnacleTranslationEntityType,
+): PinnacleTranslationEntityRow | null {
+  return (rawDb.prepare(
+    `SELECT * FROM pinnacle_translation_entities
+      WHERE normalized_name=? AND entity_type=?`,
+  ).get(normalizedName, entityType) as PinnacleTranslationEntityRow | undefined) ?? null;
+}
+
+export function recordPinnacleTranslationEntitySuccess(input: {
+  normalizedName: string;
+  entityType: PinnacleTranslationEntityType;
+  zhLabel: string;
+  labelLanguage: string;
+  wikidataId: string;
+}, now = Date.now()): void {
+  rawDb.prepare(
+    `INSERT INTO pinnacle_translation_entities(
+       normalized_name,entity_type,zh_label,label_language,wikidata_id,
+       updated_at,attempted_at,attempt_count,last_error
+     ) VALUES(?,?,?,?,?,?,?,1,NULL)
+     ON CONFLICT(normalized_name,entity_type) DO UPDATE SET
+       zh_label=excluded.zh_label,label_language=excluded.label_language,
+       wikidata_id=excluded.wikidata_id,updated_at=excluded.updated_at,
+       attempted_at=excluded.attempted_at,
+       attempt_count=pinnacle_translation_entities.attempt_count+1,last_error=NULL`,
+  ).run(
+    input.normalizedName,
+    input.entityType,
+    input.zhLabel,
+    input.labelLanguage,
+    input.wikidataId,
+    now,
+    now,
+  );
+}
+
+export function recordPinnacleTranslationEntityFailure(input: {
+  normalizedName: string;
+  entityType: PinnacleTranslationEntityType;
+  lastError: string;
+}, now = Date.now()): void {
+  rawDb.prepare(
+    `INSERT INTO pinnacle_translation_entities(
+       normalized_name,entity_type,zh_label,label_language,wikidata_id,
+       updated_at,attempted_at,attempt_count,last_error
+     ) VALUES(?,?,NULL,NULL,NULL,?,?,1,?)
+     ON CONFLICT(normalized_name,entity_type) DO UPDATE SET
+       updated_at=excluded.updated_at,attempted_at=excluded.attempted_at,
+       attempt_count=pinnacle_translation_entities.attempt_count+1,
+       last_error=excluded.last_error`,
+  ).run(input.normalizedName, input.entityType, now, now, input.lastError);
 }
 
 export function markPinnacleTranslationAttempt(

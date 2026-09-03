@@ -46,6 +46,10 @@ import { captureResearchTimelinePrices } from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
+  createWikidataEntityLookup,
+  WikidataLookupBudgetExhaustedError,
+} from "./wikidataTranslation";
+import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
@@ -298,6 +302,7 @@ export class RadarEngine {
   private lastScan: ScanOutcome | null = null;
   private scanning = false;
   private matchRefreshes = new Map<string, Promise<MatchRefreshResponse>>();
+  private pinnacleTranslationRefreshRunning = false;
   // The board is a read-only projection.  Build it after a refresh and reuse
   // that immutable object for API polls so a busy provider/scan cannot make a
   // client request synchronously rebuild every market calculation.
@@ -813,34 +818,9 @@ export class RadarEngine {
     });
     upsertTx();
 
-    // Translate the Pinnacle-only fixtures into Chinese as a side effect. The
-    // translation table is joined into the UI at read time; a failure here must
-    // never block price collection below.
-    for (const target of targets) {
-      const existing = getPinnacleTranslation(target.eventId);
-      if (!shouldFetchTranslation(existing, now)) continue;
-      try {
-        const t = await translatePinnacleFixture(
-          {
-            pinnapiId: target.eventId,
-            homeTeam: target.homeTeam,
-            awayTeam: target.awayTeam,
-            league: target.league,
-            kickoffUtc: target.kickoffUtc,
-          },
-          { pinnacle: this.pinnacle, optic: this.optic },
-        );
-        if (t) {
-          upsertPinnacleTranslation(t, Date.now());
-        } else {
-          markPinnacleTranslationAttempt(target.eventId, null, Date.now());
-        }
-      } catch (err) {
-        markPinnacleTranslationAttempt(target.eventId, (err as Error).message, Date.now());
-        log("pinnacle_translation_error", { pinnapiId: target.eventId, error: (err as Error).message });
-      }
-      if (Date.now() > now + MAX_LOOP_MS) break;
-    }
+    // Translation is a detached, guarded side effect. Slow public metadata
+    // lookups can therefore never delay Pinnacle prices, OU signals, or HKJC.
+    void this.translatePinnacleOnlyTargets(targets, now);
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
@@ -909,6 +889,58 @@ export class RadarEngine {
 
     log("pinnacle_only_research", { fixtures: targets.length, fetched, failed, rows });
     return { fixtures: targets.length, fetched, failed, rows };
+  }
+
+  private async translatePinnacleOnlyTargets(
+    targets: Array<{
+      eventId: string;
+      kickoffUtc: number;
+      league: string;
+      homeTeam: string;
+      awayTeam: string;
+    }>,
+    now: number,
+  ): Promise<void> {
+    if (this.pinnacleTranslationRefreshRunning) return;
+    this.pinnacleTranslationRefreshRunning = true;
+    // Resolver tests inject deterministic responses. Keep unrelated engine
+    // tests hermetic while production gets a fresh 60-entity budget per tick.
+    const wikidata = process.env.NODE_ENV === "test"
+      ? undefined
+      : createWikidataEntityLookup({ maxDistinct: 60 });
+    try {
+      for (const target of targets) {
+        const existing = getPinnacleTranslation(target.eventId);
+        if (!shouldFetchTranslation(existing, now)) continue;
+        try {
+          const translation = await translatePinnacleFixture(
+            {
+              pinnapiId: target.eventId,
+              homeTeam: target.homeTeam,
+              awayTeam: target.awayTeam,
+              league: target.league,
+              kickoffUtc: target.kickoffUtc,
+            },
+            { pinnacle: this.pinnacle, optic: this.optic, wikidata },
+          );
+          if (translation) {
+            upsertPinnacleTranslation(translation, Date.now());
+          } else {
+            markPinnacleTranslationAttempt(target.eventId, null, Date.now());
+          }
+        } catch (error) {
+          if (error instanceof WikidataLookupBudgetExhaustedError) break;
+          const message = error instanceof Error ? error.message : String(error);
+          markPinnacleTranslationAttempt(target.eventId, message, Date.now());
+          log("pinnacle_translation_error", {
+            pinnapiId: target.eventId,
+            error: message,
+          });
+        }
+      }
+    } finally {
+      this.pinnacleTranslationRefreshRunning = false;
+    }
   }
 
   private sourceMap(matchId: string): {

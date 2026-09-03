@@ -112,7 +112,8 @@ describe("pinnacleTranslation.translatePinnacleFixture", () => {
   it("returns titan translation when titan matches", async () => {
     const pinnacle = { fetchTitanResearchFixtures: vi.fn().mockResolvedValue([titanFixture()]) };
     const optic = { fetchFixtures: vi.fn() };
-    const result = await translatePinnacleFixture(fixture, { pinnacle, optic });
+    const wikidata = { lookup: vi.fn() };
+    const result = await translatePinnacleFixture(fixture, { pinnacle, optic, wikidata });
     expect(result).toEqual({
       pinnapiId: "abc123",
       zhHome: "阿仙奴",
@@ -121,6 +122,7 @@ describe("pinnacleTranslation.translatePinnacleFixture", () => {
       source: "titan",
     });
     expect(optic.fetchFixtures).not.toHaveBeenCalled();
+    expect(wikidata.lookup).not.toHaveBeenCalled();
   });
 
   it("falls back to OpticOdds when titan misses and Optic provides Chinese labels", async () => {
@@ -128,6 +130,7 @@ describe("pinnacleTranslation.translatePinnacleFixture", () => {
     const optic = { fetchFixtures: vi.fn().mockResolvedValue([
       titanFixture({ providerMatchId: "optic-1", league: "西甲", homeTeam: "皇家馬德里", awayTeam: "巴塞隆拿" }),
     ]) };
+    const wikidata = { lookup: vi.fn() };
     const result = await translatePinnacleFixture(
       {
         pinnapiId: "abc456",
@@ -136,7 +139,7 @@ describe("pinnacleTranslation.translatePinnacleFixture", () => {
         league: "La Liga",
         kickoffUtc: KICKOFF,
       },
-      { pinnacle, optic },
+      { pinnacle, optic, wikidata },
     );
     expect(result).toEqual({
       pinnapiId: "abc456",
@@ -144,6 +147,30 @@ describe("pinnacleTranslation.translatePinnacleFixture", () => {
       zhAway: "巴塞隆拿",
       zhLeague: "西甲",
       source: "optic",
+    });
+    expect(wikidata.lookup).not.toHaveBeenCalled();
+  });
+
+  it("uses Wikidata only after titan and Optic both yield no Chinese result", async () => {
+    const pinnacle = { fetchTitanResearchFixtures: vi.fn().mockResolvedValue([]) };
+    const optic = { fetchFixtures: vi.fn().mockResolvedValue([]) };
+    const wikidata = {
+      lookup: vi.fn(async (name: string, type: "team" | "league") => ({
+        label: type === "league" ? "英格蘭超級足球聯賽" : name === "阿仙奴" ? "阿仙奴" : "利物浦",
+        language: "zh-hk" as const,
+        wikidataId: type === "league" ? "Q9448" : "Q1",
+      })),
+    };
+    const result = await translatePinnacleFixture(fixture, { pinnacle, optic, wikidata });
+    expect(pinnacle.fetchTitanResearchFixtures).toHaveBeenCalledTimes(1);
+    expect(optic.fetchFixtures).toHaveBeenCalledTimes(1);
+    expect(wikidata.lookup).toHaveBeenCalledTimes(3);
+    expect(result).toEqual({
+      pinnapiId: "abc123",
+      zhHome: "阿仙奴",
+      zhAway: "利物浦",
+      zhLeague: "英格蘭超級足球聯賽",
+      source: "wikidata",
     });
   });
 
