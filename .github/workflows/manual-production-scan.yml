@@ -23,10 +23,12 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
-            set -e
             cd /opt/odds-radar
             docker compose ps
-            sudo ./deploy/health-check.sh
+            sudo ./deploy/health-check.sh || true
+            container_id="$(docker compose ps -q radar)"
+            docker inspect --format "STATUS={{.State.Status}} HEALTH={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} RESTARTS={{.RestartCount}} ERROR={{.State.Error}}" "$container_id"
+            docker compose logs --tail 250 radar
           '
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
           import sqlite3, time
