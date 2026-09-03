@@ -745,10 +745,10 @@ export class RadarEngine {
    * signal path (rule provider='pinnacle', >1.70 gate) can evaluate them.
    */
   async refreshPinnacleOnlyResearch(now = Date.now()): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
-    if (!this.fixtureCache) {
-      // Load the shared fixture cache without disturbing HKJC mapping.
-      await this.refreshPinnacleFixtures();
-    }
+    // Requires the caller to have already populated fixtureCache via
+    // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
+    // mock refreshPinnacleFixtures can still assert exact call counts, and so
+    // the runResearchTimelineTick order-of-operations stays deterministic.
     const pinnapi = this.fixtureCache?.pinnapi ?? [];
     if (!pinnapi.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
