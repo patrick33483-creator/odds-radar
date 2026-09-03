@@ -10,13 +10,13 @@ import type * as z from "zod/mini";
  * below are sized for that order of magnitude).
  * ------------------------------------------------------------------ */
 
-export type FixtureSource = "hkjc" | "crown";
+export type FixtureSource = "hkjc" | "pinnacle" | "crown";
 
 /** Canonical pre-match event. One row per actual fixture across research sources. */
 export const matches = sqliteTable(
   "matches",
   {
-    id: text("id").primaryKey(), // hkjc:<id>, or crown:<titan sid> until reconciled
+    id: text("id").primaryKey(), // hkjc:<id>, pinnacle:<PinnAPI event id>, or retained crown:<titan sid>
     hkjcId: text("hkjc_id"),
     fixtureSource: text("fixture_source").notNull().default("hkjc"),
     titanId: text("titan_id"),
