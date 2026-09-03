@@ -1,0 +1,99 @@
+name: Radar 報價方向完整回測（production 唯讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: radar-quote-direction-backtest-read-only
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 設定 SSH（僅供 production 唯讀資料庫查詢）
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 匯出 AH／OU 真初盤、T30、T5 及正式賽果（SQLite mode=ro）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          umask 077
+          timeout 240 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo timeout 180 python3 -' > radar-quote-direction.jsonl <<'PY'
+          import json
+          import sqlite3
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True, timeout=1)
+          db.row_factory = sqlite3.Row
+          db.execute("PRAGMA query_only=ON")
+          db.execute("PRAGMA busy_timeout=1000")
+          db.execute("BEGIN")
+          sql = r"""
+          SELECT m.id AS match_id, m.hkjc_id, m.fixture_source, m.league,
+                 m.home_team, m.away_team, m.kickoff_utc,
+                 q.provider, q.market, q.stage, q.line_key, q.selection,
+                 q.decimal_odds, q.is_main, q.source_updated_at, q.captured_at,
+                 q.target_at, q.status AS quote_status, q.origin,
+                 q.source_name, q.source_match_id, q.source_url,
+                 COALESCE(rr.home_score, r.home_score) AS home_score,
+                 COALESCE(rr.away_score, r.away_score) AS away_score,
+                 COALESCE(rr.result_source, rr.source, r.source) AS result_source,
+                 COALESCE(rr.fetched_at, r.fetched_at) AS result_fetched_at
+            FROM research_timeline_snapshots q
+            JOIN matches m ON m.id=q.match_id
+            LEFT JOIN research_results rr ON rr.match_id=m.id
+            LEFT JOIN results r ON r.match_id=m.id
+           WHERE q.market IN ('AH','OU')
+             AND q.provider IN ('hkjc','pinnacle','crown')
+             AND q.stage IN ('initial','T30','T5')
+             AND q.captured_at < m.kickoff_utc
+           ORDER BY m.kickoff_utc,m.id,q.market,q.stage,q.provider,q.line_key,q.selection
+          """
+          try:
+              for row in db.execute(sql):
+                  print(json.dumps(dict(row), ensure_ascii=False, separators=(",", ":")))
+          finally:
+              db.rollback()
+              db.close()
+          PY
+          test -s radar-quote-direction.jsonl
+          wc -l radar-quote-direction.jsonl
+
+      - name: 執行離線回測與單元測試
+        run: |
+          python3 -m py_compile scripts/backtest_radar_quote_direction.py
+          python3 -m unittest scripts/tests/test_backtest_radar_quote_direction.py
+          python3 scripts/backtest_radar_quote_direction.py radar-quote-direction.jsonl \
+            --json-output radar_quote_direction_backtest_20260903.json \
+            --markdown-output radar_quote_direction_backtest_20260903.md
+          cat radar_quote_direction_backtest_20260903.md
+          sha256sum radar-quote-direction.jsonl radar_quote_direction_backtest_20260903.json \
+            radar_quote_direction_backtest_20260903.md > radar_quote_direction_backtest_20260903.sha256
+
+      - name: 上載唯讀回測證據
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-quote-direction-backtest-20260903
+          path: |
+            radar-quote-direction.jsonl
+            radar_quote_direction_backtest_20260903.json
+            radar_quote_direction_backtest_20260903.md
+            radar_quote_direction_backtest_20260903.sha256
+          retention-days: 7
+          if-no-files-found: error
