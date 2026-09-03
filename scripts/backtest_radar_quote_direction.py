@@ -681,6 +681,14 @@ def markdown(report: dict[str, Any]) -> str:
     lines += ["", "### 真初盤主線標示（provider｜market｜is_main）"]
     for key, value in sorted(cov["initial_external_main_flags"].items()):
         lines.append(f"- `{key}`：{value}")
+    lines += ["", "### external_opening 原始來源欄位核對"]
+    for provider, profile in sorted(cov["external_opening_contract_profile"].items()):
+        sources = "、".join(f"{name}={count}" for name, count in profile["source_name_counts"].items())
+        lines.append(
+            f"- `{provider}`：rows={profile['rows']}；source_name：{sources}；"
+            f"source_match_id null={profile['source_match_id_null']}／unique={profile['source_match_id_unique']}；"
+            f"非空 line_key={profile['line_key_nonempty']}；selection counts={profile['selection_counts']}。"
+        )
     lines += [
         "- 無可靠正式 score、無完整雙邊、不能解讀 line/selection、非真初盤或開賽後報價均已排除。",
         "- 根因：`tipsme-opening.ts` 對 HKJC 的歷史多線逐線取最早價而明確設 `isMain:false`；該外部合約不提供主線標誌，不能用後來 T30/T5 或賠率挑線回補。Pinnacle 的 `hdpBeginCap`／`hiloBeginCap` 為單一 begin-cap，先前同樣硬設 false，屬可最小修正的 collector 標示 bug。",
@@ -715,6 +723,30 @@ def build_report(rows: list[dict[str, Any]], provenance: dict[str, Any] | None =
         f"{str(row.get('provider'))}|{str(row.get('market'))}|{integer(row.get('is_main')) or 0}"
         for row in rows if row.get("stage") == "initial" and row.get("origin") == "external_opening"
     )
+    opening_contract_profile: dict[str, dict[str, Any]] = {}
+    for provider in ("hkjc", "pinnacle", "crown"):
+        external = [
+            row for row in rows
+            if row.get("stage") == "initial" and row.get("origin") == "external_opening"
+            and row.get("provider") == provider
+        ]
+        if not external:
+            continue
+        opening_contract_profile[provider] = {
+            "rows": len(external),
+            "source_name_counts": dict(sorted(Counter(str(row.get("source_name")) for row in external).items())),
+            "source_match_id_null": sum(row.get("source_match_id") is None for row in external),
+            "source_match_id_unique": len({
+                row.get("source_match_id") for row in external if row.get("source_match_id") is not None
+            }),
+            "line_key_nonempty": sum(bool(row.get("line_key")) for row in external),
+            "selection_counts": {
+                f"{market}|{selection}": count
+                for (market, selection), count in sorted(
+                    Counter((str(row.get("market")), str(row.get("selection"))) for row in external).items()
+                )
+            },
+        }
     report = {
         "audit": {"read_only": True, "decision_checkpoint": "T30", "t5_use": "confirmation only, never T30 selection",
                   "derived_is_main_rule": "Pinnacle initial only: exactly one complete two-sided line for fixture/provider/market; Tipsme v2 begin-cap contract. HKJC is never derived; multiple lines are excluded as ambiguous.",
@@ -728,6 +760,7 @@ def build_report(rows: list[dict[str, Any]], provenance: dict[str, Any] | None =
             "main_complete_two_sided_cells": dict(sorted(main_cells.items())),
             "raw_rows_by_stage_origin_provider_market": dict(sorted(raw_shape.items())),
             "initial_external_main_flags": dict(sorted(opening_main_flags.items())),
+            "external_opening_contract_profile": opening_contract_profile,
         },
         "families": [evaluate(fixtures, bets, family, universe) for family, bets in family_bets],
         "league_summary": league_table(all_bets),
