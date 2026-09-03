@@ -379,7 +379,13 @@ function migrateFixtureSources(): void {
     (sqlite.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='matches'").get() as { sql?: string } | undefined)?.sql ?? "",
   );
   const legacyMatches = !matchNames.has("fixture_source") || !matchNames.has("titan_id") || hkjcColumn?.notnull === 1;
-  const needsPinnacleSource = !/fixture_source[\s\S]*?pinnacle/i.test(matchSql);
+  // Detect the CHECK enum on fixture_source explicitly. A permissive scan for
+  // the literal "pinnacle" collides with the pinnacle_match_id column and can
+  // wrongly report the enum as up-to-date, leaving CHECK(fixture_source IN
+  // ('hkjc','crown')) in place after upgrade.
+  const fixtureSourceCheck = /CHECK\s*\(\s*fixture_source\s+IN\s*\(([^)]*)\)/i.exec(matchSql);
+  const fixtureSourceEnum = fixtureSourceCheck ? fixtureSourceCheck[1] : "";
+  const needsPinnacleSource = !/['"]pinnacle['"]/i.test(fixtureSourceEnum);
   if (legacyMatches || needsPinnacleSource) {
     sqlite.transaction(() => {
       sqlite.exec(`
