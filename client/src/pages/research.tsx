@@ -35,10 +35,10 @@ import {
   type Selection,
 } from "@shared/types";
 
-const PROVIDERS: ResearchProvider[] = ["hkjc", "pinnacle", "crown"];
+const PROVIDERS: ResearchProvider[] = ["hkjc", "pinnacle"];
 const MARKETS: ResearchMarket[] = ["AH", "OU", "COU"];
 const STAGES: ResearchStage[] = ["initial", "T30", "T15", "T5"];
-const PROVIDER_LABEL: Record<ResearchProvider, string> = { hkjc: "馬會", pinnacle: "Pinnacle", crown: "Crown" };
+const PROVIDER_LABEL: Record<ResearchProvider, string> = { hkjc: "馬會", pinnacle: "Pinnacle／平博", crown: "Crown" };
 const STAGE_LABEL: Record<ResearchStage, string> = {
   initial: "初盤",
   T30: "T-30",
@@ -421,7 +421,7 @@ export default function Research() {
           <RadarLogo className="h-7 w-7 text-pinnacle" />
           <div className="min-w-0">
             <h1 className="truncate text-sm font-semibold" data-testid="text-page-title">研究時間線</h1>
-            <p className="truncate text-[10px] text-muted-foreground">馬會 × Pinnacle × Crown · 莊家真初盤 / T-30 / T-15 / T-5 / 賽果</p>
+            <p className="truncate text-[10px] text-muted-foreground">馬會 × Pinnacle／平博 · 莊家真初盤 / T-30 / T-15 / T-5 / 賽果</p>
           </div>
           <div className="ml-auto flex items-center gap-1">
             <Link href="/" className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover-elevate" data-testid="link-tab-dashboard">
@@ -471,7 +471,7 @@ export default function Research() {
           )}
           <Select value={provider} onValueChange={(value) => setProvider(value as ResearchProvider | "all")}>
             <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-provider"><SelectValue /></SelectTrigger>
-            <SelectContent><SelectItem value="all">三個來源</SelectItem><SelectItem value="hkjc">馬會</SelectItem><SelectItem value="pinnacle">Pinnacle</SelectItem><SelectItem value="crown">Crown</SelectItem></SelectContent>
+            <SelectContent><SelectItem value="all">兩個來源</SelectItem><SelectItem value="hkjc">馬會</SelectItem><SelectItem value="pinnacle">Pinnacle／平博</SelectItem></SelectContent>
           </Select>
           <Select value={market} onValueChange={(value) => setMarket(value as ResearchMarket | "all")}>
             <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-market"><SelectValue /></SelectTrigger>

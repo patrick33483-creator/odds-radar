@@ -12,6 +12,7 @@ let syncOuSignalObservations: typeof import("../server/lib/ou-signals").syncOuSi
 let syncOuSignalPrealerts: typeof import("../server/lib/ou-signals").syncOuSignalPrealerts;
 let unsentOuPrealerts: typeof import("../server/lib/ou-signals").unsentOuPrealerts;
 let unsentOuSignals: typeof import("../server/lib/ou-signals").unsentOuSignals;
+let OU_SIGNAL_RULES: typeof import("../server/lib/ou-signals").OU_SIGNAL_RULES;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
@@ -24,6 +25,7 @@ beforeAll(async () => {
   syncOuSignalPrealerts = signals.syncOuSignalPrealerts;
   unsentOuPrealerts = signals.unsentOuPrealerts;
   unsentOuSignals = signals.unsentOuSignals;
+  OU_SIGNAL_RULES = signals.OU_SIGNAL_RULES;
   store.migrate();
 });
 
@@ -85,6 +87,16 @@ function addPath(
 }
 
 describe("OU signal monitor", () => {
+  it("labels Pinnacle rules correctly without changing their provider, selection or thresholds", () => {
+    const rules = OU_SIGNAL_RULES.filter((rule) => rule.provider === "pinnacle");
+    expect(rules.length).toBeGreaterThan(0);
+    expect(rules.every((rule) => rule.providerLabel === "Pinnacle／平博")).toBe(true);
+    expect(OU_SIGNAL_RULES.find((rule) => rule.id === "pinnacle-uoo-short-005-010")).toMatchObject({
+      provider: "pinnacle", signalSelection: "O", directionPath: "U→O→O",
+      historicalSample: 20, historicalHits: 16,
+    });
+  });
+
   it("locks active rules with exact drift boundaries and retires UUU reverse", () => {
     const now = afterWatchActivation;
     addPath("uoo", "pinnacle", {

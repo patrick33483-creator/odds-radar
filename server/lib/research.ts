@@ -1,12 +1,11 @@
 import type { HkjcProvider } from "../providers/hkjc";
 import { hkjcHktDate } from "../providers/hkjc";
-import { PinnacleProvider, type CrownResearchPrices } from "../providers/pinnacle";
 import {
   TipsmeOpeningProvider,
   type TipsmeOpeningResult,
   type TipsmeScheduleEvent,
 } from "../providers/tipsme-opening";
-import type { FinalResult, ProviderPrice } from "../providers/types";
+import type { ProviderPrice } from "../providers/types";
 import { lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { getState, rawDb, setState } from "./store";
@@ -36,7 +35,7 @@ const MAX_RESULT_LOOKBACK_DAYS = 30;
 export type ResearchWindow = "upcoming" | "finished" | "all";
 const MAX_EXPORT_ROWS = 100_000;
 const RESEARCH_MARKETS = ["AH", "OU", "COU"] as const;
-const RESEARCH_PROVIDERS = ["hkjc", "pinnacle", "crown"] as const;
+const RESEARCH_PROVIDERS = ["hkjc", "pinnacle"] as const;
 export const RESEARCH_STAGES: ResearchStage[] = ["initial", "T30", "T15", "T5"];
 
 export interface ResearchFilters {
@@ -553,7 +552,6 @@ function collectorStatus(): ResearchResultCollectorStatus {
 export async function collectResearchResults(
   hkjc: HkjcProvider,
   now = Date.now(),
-  titan: Pick<PinnacleProvider, "fetchResults"> = new PinnacleProvider(),
 ): Promise<{ candidates: number; collected: number }> {
   const configuredLookback = Number(process.env.RADAR_RESEARCH_RESULT_LOOKBACK_DAYS ?? 7);
   const lookbackDays = Number.isFinite(configuredLookback)
@@ -578,18 +576,7 @@ export async function collectResearchResults(
     kickoff_utc: number;
   }>;
 
-  const crownCandidates = rawDb.prepare(
-    `SELECT m.id,m.titan_id,m.kickoff_utc
-       FROM matches m LEFT JOIN research_results rr ON rr.match_id=m.id
-      WHERE rr.match_id IS NULL AND m.fixture_source='crown' AND m.titan_id IS NOT NULL
-        AND m.kickoff_utc<=? AND m.kickoff_utc>=?
-      ORDER BY m.kickoff_utc DESC LIMIT 500`,
-  ).all(now - RESULT_DELAY_MS, now - lookbackDays * 24 * 60 * 60_000) as Array<{
-    id: string;
-    titan_id: string;
-    kickoff_utc: number;
-  }>;
-  const candidateCount = hkjcCandidates.length + crownCandidates.length;
+  const candidateCount = hkjcCandidates.length;
 
   setState("researchResultsLastRunAt", String(now));
   if (!candidateCount) {
@@ -643,35 +630,6 @@ export async function collectResearchResults(
       });
       tx();
     }
-    if (crownCandidates.length) {
-      const results = await titan.fetchResults(
-        Array.from({ length: lookbackDays + 1 }, (_, index) => -index),
-      );
-      const byTitan = new Map(results.map((result) => [result.providerMatchId, result]));
-      const insertCrown = rawDb.prepare(
-        `INSERT INTO research_results(
-          match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at
-        ) VALUES(?,NULL,?,?,NULL,?,'titan007',?,?)
-        ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
-          away_score=excluded.away_score,source=excluded.source,result_source='titan007',
-          source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at`,
-      );
-      rawDb.transaction(() => {
-        for (const candidate of crownCandidates) {
-          const result = byTitan.get(candidate.titan_id);
-          if (!result) continue;
-          insertCrown.run(
-            candidate.id,
-            result.homeScore,
-            result.awayScore,
-            result.source,
-            candidate.titan_id,
-            now,
-          );
-          collected++;
-        }
-      })();
-    }
     setState("researchResultsLastSuccessAt", String(now));
     setState("researchResultsLastCollected", String(collected));
     setState("researchResultsLastError", "");
@@ -680,129 +638,6 @@ export async function collectResearchResults(
     setState("researchResultsLastError", (error as Error).message);
     throw error;
   }
-}
-
-/** Providers used by the today-Crown backfill; narrowed for tests. */
-export interface CrownBackfillProvider {
-  fetchResults(dayOffsets?: number[]): Promise<FinalResult[]>;
-  fetchCrownResearchPrices(sId: string): Promise<CrownResearchPrices>;
-}
-
-export interface CrownBackfillOutcome {
-  candidates: number;
-  results: number;
-  openings: number;
-  errors: number;
-}
-
-const TODAY_CROWN_BACKFILL_WINDOW_MS = 6 * 60 * 60_000;
-const TODAY_CROWN_BACKFILL_CONCURRENCY = 3;
-
-function logResearchEvent(event: string, payload: Record<string, unknown>): void {
-  console.log(JSON.stringify({ ts: new Date().toISOString(), scope: "radar", event, ...payload }));
-}
-
-/**
- * Research-only backfill for Crown fixtures that already kicked off today but
- * still have no official result or no opening snapshot.  It reads matches and
- * writes research tables only: execution prices, opportunities and simulations
- * are never touched.
- */
-export async function collectTodayCrownBackfill(
-  provider: CrownBackfillProvider = new PinnacleProvider(),
-  now = Date.now(),
-): Promise<CrownBackfillOutcome> {
-  const candidates = rawDb.prepare(
-    "SELECT id,titan_id,kickoff_utc FROM matches WHERE fixture_source='crown' AND kickoff_utc BETWEEN ? AND ? AND titan_id IS NOT NULL",
-  ).all(now - TODAY_CROWN_BACKFILL_WINDOW_MS, now) as Array<{
-    id: string;
-    titan_id: string;
-    kickoff_utc: number;
-  }>;
-  const outcome: CrownBackfillOutcome = {
-    candidates: candidates.length,
-    results: 0,
-    openings: 0,
-    errors: 0,
-  };
-  setState("crownBackfillLastRunAt", String(now));
-  if (!candidates.length) {
-    setState("crownBackfillLastError", "");
-    setState("crownBackfillLastCollected", "0");
-    logResearchEvent("today_crown_backfill", { ...outcome });
-    return outcome;
-  }
-
-  const hasResult = rawDb.prepare("SELECT 1 found FROM research_results WHERE match_id=?");
-  const insertResult = rawDb.prepare(
-    `INSERT OR REPLACE INTO research_results(
-      match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at
-    ) VALUES(?,NULL,?,?,NULL,?,'titan007',?,?)`,
-  );
-  try {
-    const results = await provider.fetchResults([0, -1]);
-    const byTitan = new Map(results.map((result) => [result.providerMatchId, result]));
-    rawDb.transaction(() => {
-      for (const candidate of candidates) {
-        if (hasResult.get(candidate.id)) continue;
-        const result = byTitan.get(candidate.titan_id);
-        if (!result) continue;
-        insertResult.run(
-          candidate.id,
-          result.homeScore,
-          result.awayScore,
-          result.source,
-          candidate.titan_id,
-          now,
-        );
-        outcome.results++;
-      }
-    })();
-  } catch (error) {
-    outcome.errors++;
-    logResearchEvent("today_crown_backfill_error", { stage: "results", error: (error as Error).message });
-  }
-
-  const openingStatus = rawDb.prepare(
-    "SELECT status FROM research_timeline_points WHERE match_id=? AND stage='initial'",
-  );
-  const pending = candidates.filter((candidate) => {
-    const point = openingStatus.get(candidate.id) as { status: string } | undefined;
-    return (point?.status ?? "pending") !== "captured";
-  });
-  let cursor = 0;
-  const worker = async (): Promise<void> => {
-    while (cursor < pending.length) {
-      const candidate = pending[cursor++];
-      try {
-        const prices = await provider.fetchCrownResearchPrices(candidate.titan_id);
-        outcome.openings += saveCrownResearchInitialSnapshots(
-          candidate.id,
-          candidate.titan_id,
-          prices.opening,
-          prices.sourceUrls,
-          now,
-        );
-      } catch (error) {
-        outcome.errors++;
-        logResearchEvent("today_crown_backfill_error", {
-          stage: "opening",
-          matchId: candidate.id,
-          titanId: candidate.titan_id,
-          error: (error as Error).message,
-        });
-      }
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(TODAY_CROWN_BACKFILL_CONCURRENCY, pending.length) }, () => worker()),
-  );
-
-  setState("crownBackfillLastCollected", String(outcome.results + outcome.openings));
-  setState("crownBackfillLastError", outcome.errors ? `${outcome.errors} backfill error(s)` : "");
-  if (!outcome.errors) setState("crownBackfillLastSuccessAt", String(now));
-  logResearchEvent("today_crown_backfill", { ...outcome });
-  return outcome;
 }
 
 function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: number } {
@@ -827,7 +662,12 @@ function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: 
 
 function filterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
-  const clauses = ["m.kickoff_utc>=?", "m.kickoff_utc<=?"];
+  const clauses = [
+    "m.fixture_source='hkjc'",
+    "q.provider IN ('hkjc','pinnacle')",
+    "m.kickoff_utc>=?",
+    "m.kickoff_utc<=?",
+  ];
   const params: unknown[] = [bounds.lo, bounds.hi];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
@@ -847,7 +687,7 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
  */
 function matchFilterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
-  const clauses = ["m.kickoff_utc>=?", "m.kickoff_utc<=?"];
+  const clauses = ["m.fixture_source='hkjc'", "m.kickoff_utc>=?", "m.kickoff_utc<=?"];
   const params: unknown[] = [bounds.lo, bounds.hi];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
@@ -857,12 +697,9 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
     clauses.push("q.market=?");
     params.push(filters.market);
   }
-  // Every tracked fixture source must surface on the research page even before
-  // a first snapshot or an official result exists; otherwise today's Crown and
-  // HKJC fixtures stay invisible until collection catches up.
+  // Keep HKJC fixtures pending even before their first snapshot or result.
   clauses.push(
-    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL"
-    + " OR m.fixture_source='crown' OR m.fixture_source='hkjc')",
+    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source='hkjc')",
   );
   return { clause: clauses.join(" AND "), params };
 }
@@ -1022,6 +859,7 @@ export function researchDataset(
                   q.origin,q.source_name,q.source_match_id,q.source_url
              FROM research_timeline_snapshots q
             WHERE q.match_id IN (${matchIds.map(() => "?").join(",")})
+              AND q.provider IN ('hkjc','pinnacle')
               ${filters.provider === "all" ? "" : "AND q.provider=?"}
               ${filters.market === "all" ? "" : "AND q.market=?"}
             ORDER BY q.match_id,q.stage,q.provider,q.market,q.is_main DESC,q.line_key,q.selection`,

@@ -23,7 +23,7 @@
  * bookmaker for Pinnacle.
  */
 
-import { PinnacleProvider, type PinnacleFixture } from "../providers/pinnacle";
+import { PinnacleProvider } from "../providers/pinnacle";
 import { OpticOddsProvider } from "../providers/opticodds";
 import { PinnapiProvider, type PinnapiFixture } from "../providers/pinnapi";
 import { HkjcProvider } from "../providers/hkjc";
@@ -42,10 +42,7 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
-import {
-  captureResearchTimelinePrices,
-  saveCrownResearchInitialSnapshots,
-} from "./research";
+import { captureResearchTimelinePrices } from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import {
   isSimulationPurchaseWindow,
@@ -114,47 +111,8 @@ import type {
 
 export const REFRESH_THROTTLE_MS = 30_000;
 export const FIXTURE_CACHE_MS = 10 * 60_000;
-export const CROWN_RESEARCH_BATCH_SIZE = 100;
-export const CROWN_RESEARCH_FAIR_SHARE = 25;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
-
-/** Idempotently add every unclaimed Titan fixture to the research universe. */
-export function upsertCrownResearchFixtures(fixtures: PinnacleFixture[], now = Date.now()): number {
-  return rawDb.transaction(() => {
-    const claimed = new Set(
-      (rawDb.prepare("SELECT titan_id FROM matches WHERE titan_id IS NOT NULL").all() as Array<{ titan_id: string }>)
-        .map((row) => row.titan_id),
-    );
-    const upsert = rawDb.prepare(
-      `INSERT INTO matches(
-        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
-        home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
-      ) VALUES(?,NULL,'crown',?,NULL,?,NULL,?,?,NULL,NULL,?,?,0,?)
-      ON CONFLICT(id) DO UPDATE SET league=excluded.league,home_team=excluded.home_team,
-        away_team=excluded.away_team,kickoff_utc=excluded.kickoff_utc,
-        status=excluded.status,inplay=0,updated_at=excluded.updated_at`,
-    );
-    let added = 0;
-    for (const fixture of fixtures) {
-      if (claimed.has(fixture.providerMatchId)) continue;
-      const existed = rawDb.prepare("SELECT 1 FROM matches WHERE id=?").get(`crown:${fixture.providerMatchId}`);
-      upsert.run(
-        `crown:${fixture.providerMatchId}`,
-        fixture.providerMatchId,
-        fixture.league,
-        fixture.homeTeam,
-        fixture.awayTeam,
-        fixture.kickoffUtc,
-        fixture.statusText || "scheduled",
-        now,
-      );
-      if (!existed) added++;
-      claimed.add(fixture.providerMatchId);
-    }
-    return added;
-  })();
-}
 
 /** Merge a Crown-first alias into the later HKJC canonical fixture atomically. */
 export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): boolean {
@@ -763,7 +721,6 @@ export class RadarEngine {
             .run(a.canonical, a.alias, a.provider, now);
         }
       }
-      upsertCrownResearchFixtures(titanFixtures, now);
     });
     mapTx();
     log("pinnacle_fixtures", {
@@ -1328,132 +1285,15 @@ export class RadarEngine {
     return selectWindowEvents(this.scanCandidates(), Date.now(), cfg);
   }
 
-  private researchCandidates(now = Date.now()): Array<{
-    id: string;
-    titanId: string;
-    kickoffUtc: number;
-    reversed: boolean;
-  }> {
-    const commonSelect = `
-      SELECT m.id,m.titan_id,m.kickoff_utc,COALESCE(p.titan_reversed,0) titan_reversed
-        FROM matches m
-        LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
-        LEFT JOIN crown_research_attempts a ON a.titan_id=m.titan_id`;
-    type CandidateRow = {
-      id: string;
-      titan_id: string;
-      kickoff_utc: number;
-      titan_reversed: number;
-    };
-    const urgent = rawDb.prepare(
-      `${commonSelect}
-       WHERE m.titan_id IS NOT NULL
-         AND m.kickoff_utc>? AND m.kickoff_utc<=?
-       ORDER BY COALESCE(a.last_attempt_at,0),m.kickoff_utc,m.id
-       LIMIT ?`,
-    ).all(now, now + 30 * 60_000, CROWN_RESEARCH_BATCH_SIZE) as CandidateRow[];
-    const fair = rawDb.prepare(
-      `SELECT m.id,m.titan_id,m.kickoff_utc,COALESCE(p.titan_reversed,0) titan_reversed
-         FROM matches m
-         LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
-         LEFT JOIN crown_research_attempts a ON a.titan_id=m.titan_id
-        WHERE m.titan_id IS NOT NULL AND m.kickoff_utc>?
-          AND NOT EXISTS (
-            SELECT 1 FROM research_timeline_snapshots s
-             WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial'
-             GROUP BY s.match_id HAVING COUNT(DISTINCT s.market)>=2
-          )
-          AND (a.last_attempt_at IS NULL OR a.last_attempt_at<=?)
-        ORDER BY CASE WHEN a.last_attempt_at IS NULL THEN 0 ELSE 1 END,
-                 a.last_attempt_at,m.kickoff_utc,m.id
-        LIMIT ?`,
-    ).all(
-      now + 30 * 60_000,
-      now - FIXTURE_CACHE_MS,
-      CROWN_RESEARCH_BATCH_SIZE,
-    ) as CandidateRow[];
-
-    // Reserve part of every finite batch for the fair, oldest-attempt-first
-    // opening queue. A permanently busy T30 window therefore cannot starve
-    // later fixtures; unused fair capacity is returned to urgent checkpoints.
-    const urgentReserved = urgent.slice(
-      0,
-      CROWN_RESEARCH_BATCH_SIZE - CROWN_RESEARCH_FAIR_SHARE,
-    );
-    const fairSelected = fair.slice(0, CROWN_RESEARCH_BATCH_SIZE - urgentReserved.length);
-    const urgentOverflow = urgent.slice(
-      urgentReserved.length,
-      urgentReserved.length + CROWN_RESEARCH_BATCH_SIZE - urgentReserved.length - fairSelected.length,
-    );
-    return [...urgentReserved, ...fairSelected, ...urgentOverflow].map((row) => ({
-      id: row.id,
-      titanId: row.titan_id,
-      kickoffUtc: row.kickoff_utc,
-      reversed: !!row.titan_reversed,
-    }));
-  }
-
-  /** Research-only Crown path: it cannot write execution odds or invoke signals. */
-  private async pollCrownResearchDetail(
-    targets: ReturnType<RadarEngine["researchCandidates"]>,
-    deadline: number,
-  ): Promise<{ fetched: number; failed: number }> {
-    let fetched = 0;
-    let failed = 0;
-    const queue = [...targets];
-    const recordAttempt = rawDb.prepare(
-      `INSERT INTO crown_research_attempts(titan_id,last_attempt_at) VALUES(?,?)
-       ON CONFLICT(titan_id) DO UPDATE SET last_attempt_at=excluded.last_attempt_at`,
-    );
-    const workers = Array.from({ length: 4 }, async () => {
-      while (queue.length && Date.now() <= deadline) {
-        const target = queue.shift();
-        if (!target) continue;
-        const attemptAt = Date.now();
-        recordAttempt.run(target.titanId, attemptAt);
-        try {
-          const research = await this.pinnacle.fetchCrownResearchPrices(target.titanId);
-          const orient = (prices: ProviderPrice[]) => target.reversed
-            ? this.reversePinnaclePrices(prices)
-            : prices;
-          const observedAt = Date.now();
-          saveCrownResearchInitialSnapshots(
-            target.id,
-            target.titanId,
-            orient(research.opening),
-            research.sourceUrls,
-            observedAt,
-          );
-          captureResearchTimelinePrices(
-            target.id,
-            "crown",
-            orient(research.current),
-            target.kickoffUtc,
-            observedAt,
-          );
-          fetched++;
-        } catch (error) {
-          failed++;
-          log("crown_research_detail_error", {
-            matchId: target.id,
-            titanId: target.titanId,
-            error: (error as Error).message,
-          });
-        }
-      }
-    });
-    await Promise.all(workers);
-    return { fetched, failed };
-  }
-
-  /** Read-only research pass independent of simulation capacity. */
+  /**
+   * Lightweight timeline preparation for the primary HKJC/Pinnacle paths.
+   * Crown-only research detail is intentionally not scheduled here: the window
+   * scanner must never wait behind a separate provider's research backlog.
+   */
   async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
-    const candidates = this.researchCandidates();
-    if (!candidates.length) return { selected: 0, detailCalls: 0 };
-    const result = await this.pollCrownResearchDetail(candidates, Date.now() + MAX_LOOP_MS);
-    return { selected: candidates.length, detailCalls: result.fetched };
+    return { selected: 0, detailCalls: 0 };
   }
 
   private persistPrices(

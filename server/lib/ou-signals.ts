@@ -81,7 +81,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
   {
     id: "pinnacle-uoo-short-005-010",
     provider: "pinnacle",
-    providerLabel: "皇冠",
+    providerLabel: "Pinnacle／平博",
     directionPath: "U→O→O",
     driftBucket: "收水 0.05–0.10",
     signalSelection: "O",
@@ -97,7 +97,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
   {
     id: "pinnacle-ooo-short-010-020",
     provider: "pinnacle",
-    providerLabel: "皇冠",
+    providerLabel: "Pinnacle／平博",
     directionPath: "O→O→O",
     driftBucket: "收水 0.10–0.20",
     signalSelection: "O",
@@ -113,7 +113,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
   {
     id: "pinnacle-ooo-line-gt-275-over-watch",
     provider: "pinnacle",
-    providerLabel: "皇冠",
+    providerLabel: "Pinnacle／平博",
     directionPath: "O→O→O",
     driftBucket: "任何水位走勢",
     lineMinExclusive: 2.75,
@@ -125,7 +125,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
   {
     id: "pinnacle-uoo-line-250-275-over-watch",
     provider: "pinnacle",
-    providerLabel: "皇冠",
+    providerLabel: "Pinnacle／平博",
     directionPath: "U→O→O",
     driftBucket: "任何水位走勢",
     lineMinExclusive: 2.5,
@@ -158,7 +158,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
     id: "pinnacle-ouu-t5-selected-180-190-over-watch",
     activatedAt: 1_788_350_822_000,
     provider: "pinnacle",
-    providerLabel: "皇冠",
+    providerLabel: "Pinnacle／平博",
     directionPath: "O→U→U",
     driftBucket: "任何水位走勢",
     selectedT5OddsMinInclusive: 1.8,
@@ -194,7 +194,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
   {
     id: "pinnacle-ouu-short-010-020-reverse",
     provider: "pinnacle",
-    providerLabel: "皇冠",
+    providerLabel: "Pinnacle／平博",
     directionPath: "O→U→U",
     driftBucket: "收水 0.10–0.20",
     signalSelection: "O",
@@ -224,7 +224,7 @@ export const OU_SIGNAL_RULES: OuSignalRule[] = [
 const RETIRED_OU_SIGNAL_RULES: OuSignalRule[] = [{
   id: "pinnacle-uuu-flat-wide-reverse",
   provider: "pinnacle",
-  providerLabel: "皇冠",
+  providerLabel: "Pinnacle／平博",
   directionPath: "U→U→U",
   driftBucket: "持平或拉闊",
   signalSelection: "O",
