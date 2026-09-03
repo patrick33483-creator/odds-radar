@@ -136,8 +136,17 @@ export function captureResearchTimelinePrices(
 
   const milestone = researchStageFor(kickoffUtc, observedAt);
   // Opening is a distinct external historical source.  A first observation
-  // from the live timeline must never be relabelled as an opening price.
+  // from the live timeline must never be relabelled as an opening price for
+  // HKJC-linked fixtures.  Pinnacle-only fixtures have no external Tipsme
+  // opening, so their earliest live snapshot (>30 minutes before kickoff) is
+  // frozen as the initial checkpoint just once via INSERT OR IGNORE.
   const stages: ResearchStage[] = milestone ? [milestone] : [];
+  if (!milestone && provider === "pinnacle") {
+    const identity = fixtureIdentity(matchId);
+    if (identity.fixture_source === "pinnacle" && observedAt < kickoffUtc - 30 * 60_000) {
+      stages.push("initial");
+    }
+  }
   if (!stages.length) return 0;
   const insert = rawDb.prepare(
     `INSERT OR IGNORE INTO research_timeline_snapshots(
@@ -286,12 +295,12 @@ function initialLineAmbiguities(matchId: string): string[] {
 }
 
 function fixtureIdentity(matchId: string): {
-  fixture_source: "hkjc" | "crown";
+  fixture_source: "hkjc" | "pinnacle" | "crown";
   titan_id: string | null;
 } {
   return (rawDb.prepare(
     "SELECT fixture_source,titan_id FROM matches WHERE id=?",
-  ).get(matchId) as { fixture_source: "hkjc" | "crown"; titan_id: string | null } | undefined)
+  ).get(matchId) as { fixture_source: "hkjc" | "pinnacle" | "crown"; titan_id: string | null } | undefined)
     ?? { fixture_source: "hkjc", titan_id: null };
 }
 
@@ -299,6 +308,12 @@ function fixtureIdentity(matchId: string): {
 export function expectedPairCount(matchId: string, stage: ResearchStage): number {
   const fixture = fixtureIdentity(matchId);
   if (fixture.fixture_source === "crown") return 2; // Crown AH + OU only.
+  if (fixture.fixture_source === "pinnacle") {
+    // Pinnacle-only fixtures have no HKJC or Crown counterpart.  Their COU
+    // opening never exists in Pinnacle's feed, so the initial checkpoint
+    // targets AH + OU (2) while T-30/T-15/T-5 also include Pinnacle COU (3).
+    return stage === "initial" ? 2 : 3;
+  }
   const base = stage === "initial" ? INITIAL_AVAILABLE_PAIRS : 6;
   return base + (fixture.titan_id ? 2 : 0);
 }
@@ -663,7 +678,7 @@ function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: 
 function filterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
   const clauses = [
-    "m.fixture_source='hkjc'",
+    "m.fixture_source IN ('hkjc','pinnacle')",
     "q.provider IN ('hkjc','pinnacle')",
     "m.kickoff_utc>=?",
     "m.kickoff_utc<=?",
@@ -687,7 +702,7 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
  */
 function matchFilterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
-  const clauses = ["m.fixture_source='hkjc'", "m.kickoff_utc>=?", "m.kickoff_utc<=?"];
+  const clauses = ["m.fixture_source IN ('hkjc','pinnacle')", "m.kickoff_utc>=?", "m.kickoff_utc<=?"];
   const params: unknown[] = [bounds.lo, bounds.hi];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
@@ -697,9 +712,10 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
     clauses.push("q.market=?");
     params.push(filters.market);
   }
-  // Keep HKJC fixtures pending even before their first snapshot or result.
+  // Keep HKJC and Pinnacle-only fixtures pending even before their first
+  // snapshot or result so they surface in the research view without waiting.
   clauses.push(
-    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source='hkjc')",
+    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source IN ('hkjc','pinnacle'))",
   );
   return { clause: clauses.join(" AND "), params };
 }
@@ -730,13 +746,16 @@ function researchCellStatus(
   targetAt: number | null,
   firstCapturedAt: number | null,
   collectionStartedAt: number | null,
-  fixtureSource: "hkjc" | "crown",
+  fixtureSource: "hkjc" | "pinnacle" | "crown",
   titanId: string | null,
 ): ResearchStageSnapshot["cells"][ResearchProvider][ResearchMarket] {
   const pairQuotes = stageQuotes.filter((quote) => quote.provider === provider && quote.market === market);
   if (pairQuotes.length >= 2) return "captured";
   if (pairQuotes.length > 0) return "partial";
   if (fixtureSource === "crown" && provider !== "crown") return "source_unavailable";
+  // Pinnacle-only fixtures have no HKJC or Crown counterpart, and their
+  // initial checkpoint has no external Tipsme opening.
+  if (fixtureSource === "pinnacle" && provider !== "pinnacle") return "source_unavailable";
   if (provider === "crown" && (market === "COU" || titanId === null)) return "source_unavailable";
   if (stage === "initial" && provider === "pinnacle" && market === "COU") return "source_unavailable";
   if (snapshotStatus === "pending") return "pending";
@@ -927,12 +946,16 @@ export function researchDataset(
       const matchId = String(row.match_id);
       const kickoffUtc = Number(row.kickoff_utc);
       const quotes = quotesByMatch.get(matchId) ?? [];
-      const fixtureSource = String(row.fixture_source) as "hkjc" | "crown";
+      const fixtureSource = String(row.fixture_source) as "hkjc" | "pinnacle" | "crown";
       const hkjcId = row.hkjc_id === null || row.hkjc_id === undefined ? null : String(row.hkjc_id);
       const titanId = row.titan_id === null || row.titan_id === undefined ? null : String(row.titan_id);
       return {
         matchId,
-        fixtureKey: titanId ? `titan:${titanId}` : `hkjc:${hkjcId}`,
+        fixtureKey: titanId
+          ? `titan:${titanId}`
+          : fixtureSource === "pinnacle"
+            ? `pinnacle:${matchId.replace(/^pinnacle:/, "")}`
+            : `hkjc:${hkjcId ?? matchId}`,
         fixtureSource,
         hkjcId,
         titanId,

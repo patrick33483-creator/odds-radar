@@ -326,7 +326,7 @@ export interface ResearchResultCollectorStatus {
 export type ResearchStage = "initial" | "T30" | "T15" | "T5";
 export type ResearchMarket = "AH" | "OU" | "COU";
 export type ResearchProvider = "hkjc" | "pinnacle" | "crown";
-export type FixtureSource = "hkjc" | "crown";
+export type FixtureSource = "hkjc" | "pinnacle" | "crown";
 export type ResearchCellStatus =
   | "captured"
   | "partial"

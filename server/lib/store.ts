@@ -33,7 +33,7 @@ export function migrate(): void {
   sqlite.exec(`
 CREATE TABLE IF NOT EXISTS matches (
   id TEXT PRIMARY KEY, hkjc_id TEXT, fixture_source TEXT NOT NULL DEFAULT 'hkjc'
-    CHECK(fixture_source IN ('hkjc','crown')), titan_id TEXT, pinnacle_match_id TEXT,
+    CHECK(fixture_source IN ('hkjc','pinnacle','crown')), titan_id TEXT, pinnacle_match_id TEXT,
   league TEXT NOT NULL, league_en TEXT, home_team TEXT NOT NULL, away_team TEXT NOT NULL,
   home_team_en TEXT, away_team_en TEXT, kickoff_utc INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'PREEVENT', inplay INTEGER NOT NULL DEFAULT 0,
@@ -205,7 +205,7 @@ CREATE TABLE IF NOT EXISTS provider_health (
 CREATE TABLE IF NOT EXISTS app_state (
   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
 `);
-  migrateCrownResearchFixtures();
+  migrateFixtureSources();
   // The activation watermark prevents a new deployment from sending Telegram
   // alerts for historical rows that are backfilled into the signal page.
   const activatedAt = Date.now();
@@ -364,17 +364,23 @@ CREATE TABLE IF NOT EXISTS app_state (
 }
 
 /**
- * SQLite cannot relax NOT NULL in place. Rebuild the two small identity/result
- * tables once, then backfill Titan identity before enforcing its DB invariant.
+ * SQLite cannot relax NOT NULL or evolve a CHECK constraint in place. Rebuild
+ * the identity/result tables when upgrading fixture sources, preserving all
+ * existing rows (including retained Crown history) without guessing identity.
  */
-function migrateCrownResearchFixtures(): void {
+function migrateFixtureSources(): void {
   const matchInfo = sqlite.prepare("PRAGMA table_info(matches)").all() as Array<{
     name: string;
     notnull: number;
   }>;
   const matchNames = new Set(matchInfo.map((column) => column.name));
   const hkjcColumn = matchInfo.find((column) => column.name === "hkjc_id");
-  if (!matchNames.has("fixture_source") || !matchNames.has("titan_id") || hkjcColumn?.notnull === 1) {
+  const matchSql = String(
+    (sqlite.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='matches'").get() as { sql?: string } | undefined)?.sql ?? "",
+  );
+  const legacyMatches = !matchNames.has("fixture_source") || !matchNames.has("titan_id") || hkjcColumn?.notnull === 1;
+  const needsPinnacleSource = !/fixture_source[\s\S]*?pinnacle/i.test(matchSql);
+  if (legacyMatches || needsPinnacleSource) {
     sqlite.transaction(() => {
       sqlite.exec(`
         DROP INDEX IF EXISTS matches_kickoff_idx;
@@ -383,19 +389,29 @@ function migrateCrownResearchFixtures(): void {
         CREATE TABLE matches (
           id TEXT PRIMARY KEY, hkjc_id TEXT,
           fixture_source TEXT NOT NULL DEFAULT 'hkjc'
-            CHECK(fixture_source IN ('hkjc','crown')),
+            CHECK(fixture_source IN ('hkjc','pinnacle','crown')),
           titan_id TEXT, pinnacle_match_id TEXT,
           league TEXT NOT NULL, league_en TEXT, home_team TEXT NOT NULL, away_team TEXT NOT NULL,
           home_team_en TEXT, away_team_en TEXT, kickoff_utc INTEGER NOT NULL,
           status TEXT NOT NULL DEFAULT 'PREEVENT', inplay INTEGER NOT NULL DEFAULT 0,
           updated_at INTEGER NOT NULL);
-        INSERT INTO matches(
-          id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
-          home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
-        )
-        SELECT id,hkjc_id,'hkjc',NULL,pinnacle_match_id,league,league_en,
-               home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
-          FROM matches_pre_crown;
+        ${legacyMatches ? `
+          INSERT INTO matches(
+            id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
+            home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+          )
+          SELECT id,hkjc_id,'hkjc',NULL,pinnacle_match_id,league,league_en,
+                 home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+            FROM matches_pre_crown;
+        ` : `
+          INSERT INTO matches(
+            id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
+            home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+          )
+          SELECT id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
+                 home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+            FROM matches_pre_crown;
+        `}
         DROP TABLE matches_pre_crown;
         CREATE INDEX matches_kickoff_idx ON matches(kickoff_utc);
         CREATE INDEX matches_pinnacle_idx ON matches(pinnacle_match_id);
