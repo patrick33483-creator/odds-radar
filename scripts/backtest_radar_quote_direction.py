@@ -30,6 +30,7 @@ POLICY_TEMPLATES = {
     "F2_double_external_hkjc_lag": 3,  # 0.03, 0.05, 0.08
     "F3_line_odds_contradiction": 6,  # 3 odds rises × follow/fade
     "F4_AH_OU_script": 18,  # 3 AH states × 3 OU states × AH/OU execution
+    "N1_no_initial_T30_price_lag": 3,  # T30 HKJC/Pinnacle gap 0.03, 0.05, 0.08
 }
 
 
@@ -141,6 +142,17 @@ def main_provider(fixture: dict[str, Any]) -> str:
     return "crown" if fixture["cohort"] == "crown_only" else "hkjc"
 
 
+def signal_provider(fixture: dict[str, Any]) -> str:
+    """HKJC cohort uses the uniquely-derived Pinnacle begin-cap; Crown is native."""
+    return "crown" if fixture["cohort"] == "crown_only" else "pinnacle"
+
+
+def execution_cell(fixture: dict[str, Any], market: str, signal_line: float) -> tuple[float, dict[str, float]] | None:
+    provider = main_provider(fixture)
+    cell = stage_line(fixture, "T30", provider, market)
+    return cell if cell and abs(cell[0] - signal_line) < EPS else None
+
+
 def make_bet(
     fixture: dict[str, Any], policy: str, family: str, market: str, selection: str,
     line: float, odds: float, *, detail: dict[str, Any] | None = None,
@@ -206,20 +218,18 @@ def build_fixtures(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
             continue
         main: dict[tuple[str, str, str], tuple[float, dict[str, float]]] = {}
         captured: dict[tuple[str, str, str], int] = {}
+        derived_main: set[tuple[str, str, str]] = set()
         for key, cells in groups.items():
             candidates: list[tuple[tuple[int, int], float, dict[str, float], int]] = []
             by_line: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
             for compound, row in cells.items():
                 line_text, selection = compound.rsplit("|", 1)
                 by_line[line_text][selection] = row
+            complete_lines: list[tuple[tuple[int, int], float, dict[str, float], int]] = []
             for line_text, two in by_line.items():
                 market = key[2]
                 if any(s not in two for s in SIDE[market]):
                     diag["incomplete_two_sided_line"] += 1
-                    continue
-                # A line is admissible only when it was marked main.  Selecting the
-                # latest side's timestamp protects historical duplicate exports.
-                if not any(integer(row.get("is_main")) == 1 for row in two.values()):
                     continue
                 line = num(line_text)
                 prices = {s: num(two[s].get("decimal_odds")) for s in SIDE[market]}
@@ -227,7 +237,23 @@ def build_fixtures(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
                     continue
                 latest = max(qkey(row) for row in two.values())
                 cap = max(integer(row.get("captured_at")) or 0 for row in two.values())
-                candidates.append((latest, line, prices, cap))  # type: ignore[arg-type]
+                complete_lines.append((latest, line, prices, cap))  # type: ignore[arg-type]
+                # A line is admissible only when it was marked main. Selecting the
+                # latest side's timestamp protects historical duplicate exports.
+                if any(integer(row.get("is_main")) == 1 for row in two.values()):
+                    candidates.append((latest, line, prices, cap))  # type: ignore[arg-type]
+            # Tipsme's Pinnacle v2 contract exposes one named begin-cap per market.
+            # When the exported fixture/provider/market has exactly one complete
+            # line, it is therefore mechanically (not outcome) derivable as main.
+            # HKJC history exposes a list of historical lines without a main flag,
+            # so the same inference is deliberately forbidden for HKJC.
+            is_derived_pinnacle_opening = key[0] == "initial" and key[1] == "pinnacle" and not candidates
+            if is_derived_pinnacle_opening and len(complete_lines) == 1:
+                candidates = complete_lines
+                derived_main.add(key)
+                diag["derived_pinnacle_initial_unique_complete_line"] += 1
+            elif is_derived_pinnacle_opening and len(complete_lines) > 1:
+                diag["ambiguous_pinnacle_initial_multiple_complete_lines"] += 1
             if len(candidates) > 1:
                 diag["multiple_main_lines_latest_used"] += 1
             if candidates:
@@ -235,14 +261,14 @@ def build_fixtures(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
                 main[key] = (line, prices)
                 captured[key] = cap
         cohort = "crown_only" if info["fixture_source"] == "crown" and not info["hkjc_id"] else "hkjc"
-        fixtures.append({**info, "cohort": cohort, "main": main, "captured": captured})
+        fixtures.append({**info, "cohort": cohort, "main": main, "captured": captured, "derived_main": derived_main})
     return fixtures, dict(diag)
 
 
 def family_one(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
     raw: list[dict[str, Any]] = []
     for f in fixtures:
-        p = main_provider(f)
+        p = signal_provider(f)
         for market in SIDE:
             if not all(usable(f, s, p, market) for s in STAGES):
                 continue
@@ -250,9 +276,12 @@ def family_one(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
             assert initial and t30 and t5
             if abs(initial[0] - t30[0]) > EPS or abs(t30[0] - t5[0]) > EPS:
                 continue
+            execution = execution_cell(f, market, t30[0])
+            if not execution:
+                continue
             for side in SIDE[market]:
                 raw.append({"fixture": f, "provider": p, "market": market, "selection": side,
-                            "line": t30[0], "odds": t30[1][side],
+                            "line": t30[0], "odds": execution[1][side],
                             "water": initial[1][side] - t30[1][side],
                             "t5_change": t30[1][side] - t5[1][side]})
     by_bucket: dict[tuple[str, str, str], list[float]] = defaultdict(list)
@@ -267,7 +296,8 @@ def family_one(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if group == "tail":
             continue
         bet = make_bet(x["fixture"], f"F1_{group}", "F1_league_water", x["market"], x["selection"], x["line"], x["odds"],
-                       detail={"water": x["water"], "league_percentile": pct, "t5_change": x["t5_change"],
+                       detail={"signal_provider": x["provider"], "execution_provider": main_provider(x["fixture"]),
+                               "water": x["water"], "league_percentile": pct, "t5_change": x["t5_change"],
                                "t5_label": "continue" if x["t5_change"] >= .01 else "reverse" if x["t5_change"] <= -.01 else "flat"})
         if bet:
             bets.append(bet)
@@ -311,12 +341,15 @@ def oriented_line_move(market: str, selection: str, initial: float, t30: float) 
 def family_three(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
     bets: list[dict[str, Any]] = []
     for f in fixtures:
-        p = main_provider(f)
+        p = signal_provider(f)
         for market in SIDE:
             if not all(usable(f, s, p, market) for s in ("initial", "T30")):
                 continue
             ini, t30 = stage_line(f, "initial", p, market), stage_line(f, "T30", p, market)
             assert ini and t30
+            execution = execution_cell(f, market, t30[0])
+            if not execution:
+                continue
             t5 = stage_line(f, "T5", p, market) if usable(f, "T5", p, market) else None
             for side in SIDE[market]:
                 movement = oriented_line_move(market, side, ini[0], t30[0])
@@ -327,10 +360,11 @@ def family_three(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if rising + EPS < threshold:
                         continue
                     t5_change = None if not t5 or abs(t5[0] - t30[0]) > EPS else t30[1][side] - t5[1][side]
-                    detail = {"line_move_toward_selection": movement, "odds_rise": rising, "t5_same_line_change": t5_change,
+                    detail = {"signal_provider": p, "execution_provider": main_provider(f),
+                              "line_move_toward_selection": movement, "odds_rise": rising, "t5_same_line_change": t5_change,
                               "t5_label": "continue_water" if t5_change is not None and t5_change >= .01 else "t5_reverse" if t5_change is not None and t5_change <= -.01 else "not_confirmed"}
                     for action, pick in (("follow", side), ("fade", opposite(market, side))):
-                        bet = make_bet(f, f"F3_{action}_{threshold:.2f}", "F3_line_odds_contradiction", market, pick, t30[0], t30[1][pick], detail=detail)
+                        bet = make_bet(f, f"F3_{action}_{threshold:.2f}", "F3_line_odds_contradiction", market, pick, t30[0], execution[1][pick], detail=detail)
                         if bet:
                             bets.append(bet)
     return bets
@@ -347,12 +381,15 @@ def favorite_side(line: float, prices: dict[str, float]) -> str:
 def family_four(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
     bets: list[dict[str, Any]] = []
     for f in fixtures:
-        p = main_provider(f)
+        p = signal_provider(f)
         if not all(usable(f, s, p, market) for market in ("AH", "OU") for s in ("initial", "T30")):
             continue
         ah0, ah = stage_line(f, "initial", p, "AH"), stage_line(f, "T30", p, "AH")
         ou0, ou = stage_line(f, "initial", p, "OU"), stage_line(f, "T30", p, "OU")
         assert ah0 and ah and ou0 and ou
+        ah_execution, ou_execution = execution_cell(f, "AH", ah[0]), execution_cell(f, "OU", ou[0])
+        if not ah_execution or not ou_execution:
+            continue
         fav = favorite_side(ah[0], ah[1])
         depth_delta = abs(ah[0]) - abs(ah0[0])
         if depth_delta >= .25 - EPS:
@@ -376,15 +413,54 @@ def family_four(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             continue
         key = f"F4_AH_{ah_state}__OU_{ou_state}"
-        for market, selection, line, prices in (("AH", ah_pick, ah[0], ah[1]), ("OU", ou_pick, ou[0], ou[1])):
+        for market, selection, line, prices in (("AH", ah_pick, ah[0], ah_execution[1]), ("OU", ou_pick, ou[0], ou_execution[1])):
             t5 = stage_line(f, "T5", p, market) if usable(f, "T5", p, market) else None
             t5_label = "unavailable"
             if t5:
                 t5_label = "same_line" if abs(t5[0] - line) < EPS else "line_changed"
             bet = make_bet(f, f"{key}_{market}", "F4_AH_OU_script", market, selection, line, prices[selection],
-                           detail={"ah_state": ah_state, "ou_state": ou_state, "t5_confirmation": t5_label})
+                           detail={"signal_provider": p, "execution_provider": main_provider(f),
+                                   "ah_state": ah_state, "ou_state": ou_state, "t5_confirmation": t5_label})
             if bet:
                 bets.append(bet)
+    return bets
+
+
+def no_initial_t30_price_lag(fixtures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Independent second-tier path: decide from T30, inspect T5 only afterwards."""
+    bets: list[dict[str, Any]] = []
+    for f in fixtures:
+        if f["cohort"] != "hkjc":
+            continue
+        for market in SIDE:
+            if not (usable(f, "T30", "hkjc", market) and usable(f, "T30", "pinnacle", market)):
+                continue
+            hkjc = stage_line(f, "T30", "hkjc", market)
+            pinnacle = stage_line(f, "T30", "pinnacle", market)
+            assert hkjc and pinnacle
+            if abs(hkjc[0] - pinnacle[0]) > EPS:
+                continue
+            t5 = stage_line(f, "T5", "pinnacle", market) if usable(f, "T5", "pinnacle", market) else None
+            for threshold in (.03, .05, .08):
+                eligible = [s for s in SIDE[market] if hkjc[1][s] - pinnacle[1][s] >= threshold - EPS]
+                if not eligible:
+                    continue
+                side = max(eligible, key=lambda s: (hkjc[1][s] - pinnacle[1][s], s))
+                t5_label, t5_change = "unavailable", None
+                if t5 and abs(t5[0] - pinnacle[0]) < EPS:
+                    t5_change = pinnacle[1][side] - t5[1][side]
+                    t5_label = "continue_water" if t5_change >= .01 else "reverse" if t5_change <= -.01 else "flat"
+                elif t5:
+                    t5_label = "line_changed"
+                bet = make_bet(
+                    f, f"N1_T30_lag_{threshold:.2f}", "N1_no_initial_T30_price_lag", market, side,
+                    hkjc[0], hkjc[1][side],
+                    detail={"path": "無初盤路徑，T30決策/T5僅確認",
+                            "gap_hkjc_minus_pinnacle": hkjc[1][side] - pinnacle[1][side],
+                            "t5_same_line_change": t5_change, "t5_label": t5_label},
+                )
+                if bet:
+                    bets.append(bet)
     return bets
 
 
@@ -550,7 +626,7 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         f"- 資料期間：{cov['data_period_utc']}；有效已結算 fixtures：{cov['settled_fixtures']}，原始報價列：{cov['raw_quote_rows']}。",
         f"- 預先定義 {report['planned_policy_templates']} 條政策模板，實際可執行掃描 {report['total_predefined_policy_tests']} 條；每家族只以 discovery 選最多三條，固定後才查看 holdout。",
-        "- 本資料切片沒有一條可執行政策：HKJC 與 Pinnacle 的真初盤完整雙邊全部未標示主線，嚴格規則下不能以其他線代替；這是資料完整性阻塞，並非 ROI 反證。",
+        "- HKJC 真初盤沒有主線標示，故不作歷史派生；Pinnacle 僅在來源契約的唯一 begin-cap 情況下作審計派生，任何多線 fixture-market 均排除，避免以結果挑線。",
         "- 任何 `Watch` 或 `Reject` 均不是可下注建議；亞洲盤以 ROI 為主，半中／半輸的命中定義見 JSON。",
         "",
         "## 選中的 holdout 候選",
@@ -575,12 +651,17 @@ def markdown(report: dict[str, Any]) -> str:
         "", "## 方法與防呆", "",
         "- 僅使用 `research_timeline_snapshots`；initial 限 `origin=external_opening`，T30/T5 限實際已捕獲且開賽前的同 stage 報價；不以 T15 或事後盤補代。",
         "- 主線只取 `is_main=1`；若匯出出現多個主線，按 `source_updated_at`、`captured_at` 最新者，完整雙邊才可入樣。",
+        "- 唯一例外是 audit 的 `derived_is_main`：僅 Pinnacle 真初盤同 fixture/provider/market 恰有一條完整雙邊時，才以 Tipsme v2 的單一 begin-cap 派生；兩條或以上一律 ambiguity 排除。HKJC 歷史列從不派生主線。",
         "- hkjc fixture 與 crown-only fixture 分開；主 cohort 以 HKJC 的 T30 可下注賠率結算，crown-only 以 Crown 結算。",
         "- 70/30 split 依 UTC kickoff 日期，整日不交叉。對照為同 cohort、聯賽、市場、方向且未被規則選中的一對一 fixtures；permutation 在配對內交換標籤。",
         "", "## 各家族掃描與限制", "",
     ]
     for family in report["families"]:
         lines += [f"### {family['family']}", f"- 預定模板：{family['planned_policy_templates']}；可執行政策：{family['predefined_policy_tests']}；{family['selection_rule']}"]
+        if family["family"] == "N1_no_initial_T30_price_lag":
+            lines.append("- **無初盤路徑，T30決策/T5僅確認**：只以 T30 同線 HKJC−Pinnacle 價格差選擇，T5 從不參與入選，僅分類為後續 continue／reverse／flat。")
+        if family["family"] == "F2_double_external_hkjc_lag" and family["predefined_policy_tests"] == 0:
+            lines.append("- 未能執行：條件要求 HKJC 也有可辨識的 initial→T30 同方向；Tipsme HKJC 歷史合約沒有主線標示，故未作推斷。")
         for x in family["scanned"]:
             d, h = x["discovery"], x["holdout"]
             lines.append(f"- `{x['policy']}`：discovery n={d['n']} ROI={'—' if d['roi'] is None else f'{d['roi']*100:+.1f}%'}；holdout n={h['n']} ROI={'—' if h['roi'] is None else f'{h['roi']*100:+.1f}%'}。")
@@ -602,6 +683,8 @@ def markdown(report: dict[str, Any]) -> str:
         lines.append(f"- `{key}`：{value}")
     lines += [
         "- 無可靠正式 score、無完整雙邊、不能解讀 line/selection、非真初盤或開賽後報價均已排除。",
+        "- 根因：`tipsme-opening.ts` 對 HKJC 的歷史多線逐線取最早價而明確設 `isMain:false`；該外部合約不提供主線標誌，不能用後來 T30/T5 或賠率挑線回補。Pinnacle 的 `hdpBeginCap`／`hiloBeginCap` 為單一 begin-cap，先前同樣硬設 false，屬可最小修正的 collector 標示 bug。",
+        "- 建議的最小 production 修正（本次未實施）：只在 `parseTipsmeOpeningQuotes` 的 `pinnacleBase` 設 `isMain:true`，並加一個 parser 測試；HKJC 保持 false，直到來源合約加入正式 main-line 欄位。另在 `saveResearchInitialSnapshots` 於已取得完整 provider-market pair 後拒絕後續不同 line，保留一次開盤的唯一性。",
         "- 前瞻只應固定本報告已選政策、以 T30 價格下單（本回測沒有下單或通知），累積至少 50 個新 holdout fixtures 才重評；100 場前不可把單聯賽視為獨立候選。",
         "- CLV：本匯出沒有獨立 closing quote；T5 僅是後續確認，不可冒充 closing，故 CLV 報為 unavailable。",
     ]
@@ -616,6 +699,7 @@ def build_report(rows: list[dict[str, Any]], provenance: dict[str, Any] | None =
         ("F2_double_external_hkjc_lag", family_two(fixtures)),
         ("F3_line_odds_contradiction", family_three(fixtures)),
         ("F4_AH_OU_script", family_four(fixtures)),
+        ("N1_no_initial_T30_price_lag", no_initial_t30_price_lag(fixtures)),
     ]
     all_bets = [b for _, bets in family_bets for b in bets]
     periods = [f["kickoff_utc"] for f in fixtures]
@@ -633,6 +717,9 @@ def build_report(rows: list[dict[str, Any]], provenance: dict[str, Any] | None =
     )
     report = {
         "audit": {"read_only": True, "decision_checkpoint": "T30", "t5_use": "confirmation only, never T30 selection",
+                  "derived_is_main_rule": "Pinnacle initial only: exactly one complete two-sided line for fixture/provider/market; Tipsme v2 begin-cap contract. HKJC is never derived; multiple lines are excluded as ambiguous.",
+                  "root_cause": "tipsme-opening.ts explicitly writes isMain:false for both hkjcBase and pinnacleBase. HKJC historical contract lists first row per line without an authoritative main designation; Pinnacle v2 exposes one hdpBeginCap/hiloBeginCap.",
+                  "production_fix_proposal": "Set pinnacleBase isMain:true and test it; do not infer HKJC. In saveResearchInitialSnapshots, avoid admitting a later alternate line after a complete provider-market opening pair exists.",
                   "clv": "unavailable: no independently captured closing quote in export", **(provenance or {})},
         "coverage": {
             "raw_quote_rows": len(rows), "settled_fixtures": len(fixtures),
