@@ -53,7 +53,7 @@ jobs:
               "SELECT provider,stage,COUNT(*),MAX(captured_at) FROM research_timeline_snapshots "
               "WHERE provider IN ('hkjc','pinnacle') GROUP BY provider,stage ORDER BY provider,stage"
           ).fetchall()
-          print(json.dumps({
+          print("::notice title=Phase1 read-only production audit::" + json.dumps({
               'read_only_connection': True,
               'production_commit': os.environ['COMMIT'],
               'radar_health': os.environ['HEALTH'],
