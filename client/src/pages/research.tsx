@@ -317,14 +317,22 @@ function MatchTimeline({
   );
 }
 
+type ResearchView = "upcoming" | "finished";
+
 export default function Research() {
+  // Rolling window default: show only fixtures whose kickoff is still ahead of
+  // "now" so the study page auto-refreshes and never appears to lose data.
+  const [view, setView] = useState<ResearchView>("upcoming");
+  const [horizonDays, setHorizonDays] = useState("14");
   const [days, setDays] = useState("7");
   const [provider, setProvider] = useState<ResearchProvider | "all">("all");
   const [market, setMarket] = useState<ResearchMarket | "all">("all");
   const [dataState, setDataState] = useState<DataStateFilter>("all");
   const [search, setSearch] = useState("");
   const [downloading, setDownloading] = useState<"timeline" | "results" | null>(null);
-  const query = `/api/research?days=${days}&provider=${provider}&market=${market}`;
+  const query = view === "upcoming"
+    ? `/api/research?window=upcoming&horizonDays=${horizonDays}&provider=${provider}&market=${market}`
+    : `/api/research?window=finished&days=${days}&provider=${provider}&market=${market}`;
   const { data, isLoading, isError } = useQuery<ResearchDatasetResponse>({
     queryKey: [query],
     refetchInterval: 60_000,
@@ -388,7 +396,10 @@ export default function Research() {
   const download = async (kind: "timeline" | "results") => {
     setDownloading(kind);
     try {
-      const response = await apiRequest("GET", `/api/research/export?kind=${kind}&days=${days}&provider=${provider}&market=${market}`);
+      const exportUrl = view === "upcoming"
+        ? `/api/research/export?kind=${kind}&window=upcoming&horizonDays=${horizonDays}&provider=${provider}&market=${market}`
+        : `/api/research/export?kind=${kind}&window=finished&days=${days}&provider=${provider}&market=${market}`;
+      const response = await apiRequest("GET", exportUrl);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
@@ -434,10 +445,30 @@ export default function Research() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-2">
-          <Select value={days} onValueChange={setDays}>
-            <SelectTrigger className="h-8 w-[110px] text-xs" data-testid="select-research-days"><SelectValue /></SelectTrigger>
-            <SelectContent><SelectItem value="1">最近 1 日</SelectItem><SelectItem value="7">最近 7 日</SelectItem><SelectItem value="30">最近 30 日</SelectItem><SelectItem value="120">最近 120 日</SelectItem></SelectContent>
+          <Select value={view} onValueChange={(value) => setView(value as ResearchView)}>
+            <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-view"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="upcoming">未開賽賽事</SelectItem>
+              <SelectItem value="finished">已開賽 / 歷史</SelectItem>
+            </SelectContent>
           </Select>
+          {view === "upcoming" ? (
+            <Select value={horizonDays} onValueChange={setHorizonDays}>
+              <SelectTrigger className="h-8 w-[130px] text-xs" data-testid="select-research-horizon"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="3">未來 3 日</SelectItem>
+                <SelectItem value="7">未來 7 日</SelectItem>
+                <SelectItem value="14">未來 14 日</SelectItem>
+                <SelectItem value="30">未來 30 日</SelectItem>
+                <SelectItem value="60">未來 60 日</SelectItem>
+              </SelectContent>
+            </Select>
+          ) : (
+            <Select value={days} onValueChange={setDays}>
+              <SelectTrigger className="h-8 w-[110px] text-xs" data-testid="select-research-days"><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="1">最近 1 日</SelectItem><SelectItem value="7">最近 7 日</SelectItem><SelectItem value="30">最近 30 日</SelectItem><SelectItem value="120">最近 120 日</SelectItem></SelectContent>
+            </Select>
+          )}
           <Select value={provider} onValueChange={(value) => setProvider(value as ResearchProvider | "all")}>
             <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-provider"><SelectValue /></SelectTrigger>
             <SelectContent><SelectItem value="all">三個來源</SelectItem><SelectItem value="hkjc">馬會</SelectItem><SelectItem value="pinnacle">Pinnacle</SelectItem><SelectItem value="crown">Crown</SelectItem></SelectContent>
