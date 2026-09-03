@@ -1192,33 +1192,6 @@ export class RadarEngine {
    * helper endpoint, or an external scheduler. This method creates no schedule.
    */
   async runScan(): Promise<ScanOutcome> {
-    const currentBets = db
-      .select()
-      .from(simulationBets)
-      .where(eq(simulationBets.excludedFromStats, 0))
-      .all().length;
-    const target = simulationTarget();
-    if (simulationTargetReached(currentBets, target)) {
-      const cfg = scanConfig();
-      const at = Date.now();
-      const outcome: ScanOutcome = {
-        result: "TARGET_REACHED",
-        startedAt: at,
-        finishedAt: at,
-        runtimeMs: 0,
-        windowMinutes: cfg.windowMinutes,
-        intervalSec: cfg.intervalSec,
-        maxRuntimeSec: cfg.maxRuntimeSec,
-        selected: [],
-        passes: 0,
-        detailCalls: 0,
-        newOpportunityKeys: [],
-        message: `模擬注單目標已達 ${currentBets}/${target}，自動視窗掃描不執行。`,
-      };
-      this.lastScan = outcome;
-      setState("lastScan", JSON.stringify(outcome));
-      return outcome;
-    }
     if (this.scanning) {
       const cfg = scanConfig();
       const at = Date.now();

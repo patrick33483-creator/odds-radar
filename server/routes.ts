@@ -157,7 +157,6 @@ function installAutoWindowScan(): void {
             detailCalls: research.detailCalls,
           }),
         );
-        if (engine.scanConfigInfo().simulationTargetReached) return;
         const inWindow = engine.windowPreview();
         if (!inWindow.length) return;
         const outcome = await engine.runScan();
