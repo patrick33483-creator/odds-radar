@@ -30,7 +30,8 @@ jobs:
           commit="$(git rev-parse HEAD)"
           container_id="$(sudo docker compose ps -aq radar)"
           health="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id")"
-          COMMIT="$commit" HEALTH="$health" python3 - <<'PY'
+          radar_settings="$(sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" | grep -E '^RADAR_(AUTO_SCAN|SIM_TARGET|SCAN_WINDOW_MIN|SCAN_INTERVAL_SEC|TODAY_CROWN_BACKFILL)=' || true)"
+          COMMIT="$commit" HEALTH="$health" RADAR_SETTINGS="$radar_settings" python3 - <<'PY'
           import json
           import os
           import re
@@ -46,6 +47,12 @@ jobs:
           pinnacle_latest_max = scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='pinnacle'")
           pinnacle_latest_rows = scalar("SELECT COUNT(*) FROM odds_latest WHERE provider='pinnacle'")
           hkjc_latest_max = scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='hkjc'")
+          simulation_bets = scalar("SELECT COUNT(*) FROM simulation_bets WHERE excluded_from_stats=0")
+          fixture_sources = db.execute("SELECT fixture_source,COUNT(*) FROM matches GROUP BY fixture_source ORDER BY fixture_source").fetchall()
+          timeline_by_stage = db.execute(
+              "SELECT provider,stage,COUNT(*),MAX(captured_at) FROM research_timeline_snapshots "
+              "WHERE provider IN ('hkjc','pinnacle') GROUP BY provider,stage ORDER BY provider,stage"
+          ).fetchall()
           print(json.dumps({
               'read_only_connection': True,
               'production_commit': os.environ['COMMIT'],
@@ -54,6 +61,10 @@ jobs:
               'pinnacle_odds_latest_max_fetched_at': pinnacle_latest_max,
               'pinnacle_odds_latest_rows': pinnacle_latest_rows,
               'hkjc_odds_latest_max_fetched_at': hkjc_latest_max,
+              'simulation_bets_included': simulation_bets,
+              'fixture_sources': [dict(zip(('fixture_source','rows'), row)) for row in fixture_sources],
+              'research_timeline_by_provider_stage': [dict(zip(('provider','stage','rows','max_captured_at'), row)) for row in timeline_by_stage],
+              'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
               'provider_health': [dict(zip(('provider','ok','last_success_at','last_attempt_at','last_error_at','last_error','consecutive_failures','item_count','mode'), row)) for row in provider_health],
               'app_state': states,
           }, ensure_ascii=False, sort_keys=True))
@@ -61,6 +72,6 @@ jobs:
           PY
           printf '%s\n' '=== relevant radar logs (last 900) ==='
           sudo docker compose logs --tail 900 radar 2>&1 \
-            | grep -E 'pinnapi_fixtures_error|pinnacle_detail_error|pinnacle_detail_scan|auto_research_timeline|auto_window_scan|window_scan|crown_research_detail_error|today_crown_backfill' \
+            | grep -Ei 'pinnapi_fixtures_error|pinnacle_detail_error|pinnacle_detail_scan|auto_research_timeline|auto_window_scan|window_scan|crown_research_detail_error|today_crown_backfill|error|failed' \
             | tail -80 || true
           REMOTE
