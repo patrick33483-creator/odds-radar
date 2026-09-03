@@ -1,10 +1,10 @@
-name: 皇冠研究 Production 只讀核對
+name: 暫時回復 Radar 上一健康版本
 
 on:
   workflow_dispatch:
 
 jobs:
-  scan:
+  recover:
     runs-on: ubuntu-24.04
     steps:
       - name: 設定 SSH
@@ -17,46 +17,22 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 核對健康狀態及皇冠研究資料
+      - name: 回復上一健康版本並核對
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
             cd /opt/odds-radar
-            sudo docker compose ps
-            sudo ./deploy/health-check.sh || true
-            container_id="$(sudo docker compose ps -aq radar)"
-            sudo docker inspect --format "STATUS={{.State.Status}} HEALTH={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} RESTARTS={{.RestartCount}} ERROR={{.State.Error}}" "$container_id"
-            sudo docker compose logs --tail 250 radar
+            git fetch origin master
+            git reset --hard a12cfb279ffde98b919de574124b80f4e67918e3
+            timeout 300s sudo docker compose --env-file /opt/odds-radar/.env -f /opt/odds-radar/compose.yaml up -d --build
+            for attempt in $(seq 1 60); do
+              container_id="$(sudo docker compose ps -aq radar)"
+              health="$(sudo docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" "$container_id")"
+              [ "$health" = healthy ] && break
+              sleep 5
+            done
+            sudo ./deploy/health-check.sh
           '
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
-          import sqlite3, time
-
-          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
-          now = int(time.time() * 1000)
-          upcoming = db.execute(
-              "SELECT COUNT(*) FROM matches "
-              "WHERE fixture_source='crown' AND kickoff_utc>=?",
-              (now,),
-          ).fetchone()[0]
-          with_snapshots = db.execute(
-              "SELECT COUNT(DISTINCT m.id) FROM matches m "
-              "JOIN research_timeline_snapshots s ON s.match_id=m.id "
-              "WHERE m.fixture_source='crown'"
-          ).fetchone()[0]
-          results = db.execute(
-              "SELECT COUNT(*) FROM research_results WHERE result_source='crown'"
-          ).fetchone()[0]
-          print(f"CROWN_UPCOMING={upcoming}")
-          print(f"CROWN_WITH_SNAPSHOTS={with_snapshots}")
-          print(f"CROWN_RESULTS={results}")
-          print("CROWN_SAMPLE=")
-          for row in db.execute(
-              "SELECT id, league, home_team, away_team, kickoff_utc "
-              "FROM matches WHERE fixture_source='crown' AND kickoff_utc>=? "
-              "ORDER BY kickoff_utc LIMIT 10",
-              (now,),
-          ):
-              print("|".join(map(str, row)))
-          PY
