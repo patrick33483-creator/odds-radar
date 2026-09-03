@@ -1,4 +1,4 @@
-name: 核對重覆 Titan fixture（只讀）
+name: Radar Production endpoint 診斷（只讀）
 
 on:
   workflow_dispatch:
@@ -17,34 +17,39 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 匯出重覆 Titan 對應
+      - name: 核對 API、資料量及 container logs
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo bash -s' <<'SH'
+          cd /opt/odds-radar
+          set -a
+          . ./.env
+          set +a
+          docker compose ps
+          for endpoint in healthz api/status api/scan/window api/research; do
+            echo "ENDPOINT=$endpoint"
+            curl --silent --show-error --max-time 45 \
+              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
+              --output /dev/null \
+              --write-out "HTTP=%{http_code} SECONDS=%{time_total} BYTES=%{size_download}\n" \
+              "http://127.0.0.1:5001/$endpoint" || true
+          done
+          docker compose logs --since 20m --tail 350 radar
+          SH
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
-          import sqlite3
+          import sqlite3, time
 
           db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
-          duplicate_ids = [
-              row[0]
-              for row in db.execute(
-                  "SELECT titan_id FROM matches WHERE titan_id IS NOT NULL "
-                  "GROUP BY titan_id HAVING COUNT(*)>1 ORDER BY titan_id"
-              )
-          ]
-          print(f"DUPLICATE_GROUPS={len(duplicate_ids)}")
-          for titan_id in duplicate_ids:
-              print(f"TITAN={titan_id}")
-              for row in db.execute(
-                  "SELECT m.id,m.hkjc_id,m.fixture_source,m.league,m.home_team,"
-                  "m.away_team,m.kickoff_utc,m.updated_at,"
-                  "(SELECT COUNT(*) FROM research_timeline_snapshots s WHERE s.match_id=m.id),"
-                  "(SELECT COUNT(*) FROM research_timeline_points p WHERE p.match_id=m.id),"
-                  "(SELECT COUNT(*) FROM research_results r WHERE r.match_id=m.id),"
-                  "(SELECT COUNT(*) FROM odds_snapshots o WHERE o.match_id=m.id) "
-                  "FROM matches m WHERE m.titan_id=? ORDER BY m.kickoff_utc,m.id",
-                  (titan_id,),
-              ):
-                  print("|".join(map(str, row)))
+          now = int(time.time() * 1000)
+          queries = {
+              "MATCHES_TOTAL": "SELECT COUNT(*) FROM matches",
+              "CROWN_TOTAL": "SELECT COUNT(*) FROM matches WHERE fixture_source='crown'",
+              "CROWN_UPCOMING": f"SELECT COUNT(*) FROM matches WHERE fixture_source='crown' AND kickoff_utc>={now}",
+              "CROWN_SNAPSHOTS": "SELECT COUNT(*) FROM research_timeline_snapshots WHERE provider='crown'",
+              "DUPLICATE_TITAN": "SELECT COUNT(*) FROM (SELECT titan_id FROM matches WHERE titan_id IS NOT NULL GROUP BY titan_id HAVING COUNT(*)>1)",
+          }
+          for label, sql in queries.items():
+              print(f"{label}={db.execute(sql).fetchone()[0]}")
           PY
