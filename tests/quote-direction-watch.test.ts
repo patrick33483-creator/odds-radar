@@ -121,6 +121,18 @@ describe("isolated quote-direction watches", () => {
     ]);
   });
 
+  it("requires the Pinnacle initial pair to be an external opening", () => {
+    activate();
+    ahT30Candidate("non-external-initial", 1_020_000);
+    pair("non-external-initial", "pinnacle", "initial", "AH", "-0.25", "H", 1.95, "A", 1.95, 1_010_000);
+    rawDb.prepare(
+      "UPDATE research_timeline_snapshots SET origin='legacy_live_observation' WHERE match_id=? AND stage='initial'",
+    ).run("non-external-initial");
+
+    expect(sync()).toEqual({ candidates: 1, inserted: 0, insufficientBaseline: 0, t5Confirmed: 0 });
+    expect(rawDb.prepare("SELECT COUNT(*) count FROM quote_direction_watch_observations").get()).toEqual({ count: 0 });
+  });
+
   it("freezes the audited AH league-water P70-P90 decision from prior same-line observations", () => {
     activate();
     for (let i = 0; i < 15; i++) {

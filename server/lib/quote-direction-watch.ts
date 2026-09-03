@@ -64,10 +64,11 @@ function mainPair(
 ): MainPair | null {
   const rows = rawDb.prepare(
     `SELECT line_key,selection,decimal_odds,captured_at
-       FROM research_timeline_snapshots
+      FROM research_timeline_snapshots
       WHERE match_id=? AND provider=? AND market=? AND stage=? AND is_main=1
+        AND (?<>'initial' OR origin='external_opening')
       ORDER BY line_key,selection`,
-  ).all(matchId, provider, market, stage) as Array<{
+  ).all(matchId, provider, market, stage, stage) as Array<{
     line_key: string; selection: string; decimal_odds: number; captured_at: number;
   }>;
   const byLine = new Map<string, MainPair>();
@@ -141,7 +142,7 @@ function waterBaseline(league: string, market: WatchMarket, beforeCapturedAt: nu
        FROM matches m
        JOIN research_timeline_snapshots i
          ON i.match_id=m.id AND i.provider='pinnacle' AND i.market=?
-        AND i.stage='initial' AND i.is_main=1
+        AND i.stage='initial' AND i.is_main=1 AND i.origin='external_opening'
        JOIN research_timeline_snapshots t
          ON t.match_id=i.match_id AND t.provider='pinnacle' AND t.market=?
         AND t.stage='T30' AND t.is_main=1
