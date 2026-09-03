@@ -818,9 +818,13 @@ export class RadarEngine {
     });
     upsertTx();
 
-    // Translation is a detached, guarded side effect. Slow public metadata
-    // lookups can therefore never delay Pinnacle prices, OU signals, or HKJC.
-    void this.translatePinnacleOnlyTargets(targets, now);
+    // Translation performs broad third-party metadata fetches and must stay
+    // disabled on the latency-sensitive research timeline unless an operator
+    // explicitly opts in. Existing cached translations remain available to
+    // the UI and OU notifications while capture always gets priority.
+    if (process.env.RADAR_PINNACLE_TRANSLATION_ENABLED === "1") {
+      void this.translatePinnacleOnlyTargets(targets, now);
+    }
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
