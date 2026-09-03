@@ -1,10 +1,10 @@
-name: 暫時回復 Radar 上一健康版本
+name: 核對重覆 Titan fixture（只讀）
 
 on:
   workflow_dispatch:
 
 jobs:
-  recover:
+  audit:
     runs-on: ubuntu-24.04
     steps:
       - name: 設定 SSH
@@ -17,22 +17,34 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 回復上一健康版本並核對
+      - name: 匯出重覆 Titan 對應
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" '
-            set -e
-            cd /opt/odds-radar
-            git fetch origin master
-            git reset --hard a12cfb279ffde98b919de574124b80f4e67918e3
-            timeout 300s sudo docker compose --env-file /opt/odds-radar/.env -f /opt/odds-radar/compose.yaml up -d --build
-            for attempt in $(seq 1 60); do
-              container_id="$(sudo docker compose ps -aq radar)"
-              health="$(sudo docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" "$container_id")"
-              [ "$health" = healthy ] && break
-              sleep 5
-            done
-            sudo ./deploy/health-check.sh
-          '
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          duplicate_ids = [
+              row[0]
+              for row in db.execute(
+                  "SELECT titan_id FROM matches WHERE titan_id IS NOT NULL "
+                  "GROUP BY titan_id HAVING COUNT(*)>1 ORDER BY titan_id"
+              )
+          ]
+          print(f"DUPLICATE_GROUPS={len(duplicate_ids)}")
+          for titan_id in duplicate_ids:
+              print(f"TITAN={titan_id}")
+              for row in db.execute(
+                  "SELECT m.id,m.hkjc_id,m.fixture_source,m.league,m.home_team,"
+                  "m.away_team,m.kickoff_utc,m.updated_at,"
+                  "(SELECT COUNT(*) FROM research_timeline_snapshots s WHERE s.match_id=m.id),"
+                  "(SELECT COUNT(*) FROM research_timeline_points p WHERE p.match_id=m.id),"
+                  "(SELECT COUNT(*) FROM research_results r WHERE r.match_id=m.id),"
+                  "(SELECT COUNT(*) FROM odds_snapshots o WHERE o.match_id=m.id) "
+                  "FROM matches m WHERE m.titan_id=? ORDER BY m.kickoff_utc,m.id",
+                  (titan_id,),
+              ):
+                  print("|".join(map(str, row)))
+          PY
