@@ -30,8 +30,7 @@ jobs:
           commit="$(git rev-parse HEAD)"
           container_id="$(sudo docker compose ps -aq radar)"
           health="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id")"
-          log_lines="$(sudo docker compose logs --tail 900 radar 2>&1 || true)"
-          COMMIT="$commit" HEALTH="$health" LOG_LINES="$log_lines" python3 - <<'PY'
+          COMMIT="$commit" HEALTH="$health" python3 - <<'PY'
           import json
           import os
           import re
@@ -47,11 +46,6 @@ jobs:
           pinnacle_latest_max = scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='pinnacle'")
           pinnacle_latest_rows = scalar("SELECT COUNT(*) FROM odds_latest WHERE provider='pinnacle'")
           hkjc_latest_max = scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='hkjc'")
-          db.close()
-          interesting = []
-          for line in os.environ.get('LOG_LINES','').splitlines():
-              if any(token in line for token in ('pinnapi_fixtures_error','pinnacle_detail_error','pinnacle_detail_scan','auto_research_timeline','auto_window_scan','window_scan','crown_research_detail_error','today_crown_backfill')):
-                  interesting.append(re.sub(r'\x1b\[[0-9;]*m', '', line))
           print(json.dumps({
               'read_only_connection': True,
               'production_commit': os.environ['COMMIT'],
@@ -62,7 +56,11 @@ jobs:
               'hkjc_odds_latest_max_fetched_at': hkjc_latest_max,
               'provider_health': [dict(zip(('provider','ok','last_success_at','last_attempt_at','last_error_at','last_error','consecutive_failures','item_count','mode'), row)) for row in provider_health],
               'app_state': states,
-              'interesting_container_log_lines_last_900': interesting[-80:],
           }, ensure_ascii=False, sort_keys=True))
+          db.close()
           PY
+          printf '%s\n' '=== relevant radar logs (last 900) ==='
+          sudo docker compose logs --tail 900 radar 2>&1 \
+            | grep -E 'pinnapi_fixtures_error|pinnacle_detail_error|pinnacle_detail_scan|auto_research_timeline|auto_window_scan|window_scan|crown_research_detail_error|today_crown_backfill' \
+            | tail -80 || true
           REMOTE
