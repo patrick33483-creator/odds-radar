@@ -951,7 +951,11 @@ export function researchDataset(
       const titanId = row.titan_id === null || row.titan_id === undefined ? null : String(row.titan_id);
       return {
         matchId,
-        fixtureKey: titanId ? `titan:${titanId}` : `hkjc:${hkjcId}`,
+        fixtureKey: titanId
+          ? `titan:${titanId}`
+          : fixtureSource === "pinnacle"
+            ? `pinnacle:${matchId.replace(/^pinnacle:/, "")}`
+            : `hkjc:${hkjcId ?? matchId}`,
         fixtureSource,
         hkjcId,
         titanId,
