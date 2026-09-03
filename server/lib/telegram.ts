@@ -1,6 +1,12 @@
 import { rawDb, getState, setState } from "./store";
 import { formatSelectionLine } from "./lines";
-import { markOuPrealertNotified, markOuSignalNotified, ouRuleById } from "./ou-signals";
+import {
+  computeOuRuleHitRate,
+  markOuPrealertNotified,
+  markOuSignalNotified,
+  ouRuleById,
+  type OuHitRateResult,
+} from "./ou-signals";
 import type { OuSignalObservation, OuSignalPrealert, OuSignalRule } from "@shared/types";
 
 interface TelegramApiResponse {
@@ -160,6 +166,38 @@ export async function notifySimulationBets(newBetKeys: string[]): Promise<number
   return sent;
 }
 
+const OU_HIT_RATE_MIN_SAMPLE = 20;
+
+/**
+ * Format a hit-rate line for OU Telegram notifications. Rules:
+ *   - sample >= 20        → 命中率：X.X%（N 場歷史）
+ *   - sample < 20         → 命中率：樣本不足（N 場）
+ *   - computation failed  → 命中率：計算中
+ * The compute step is wrapped in try/catch by the caller so a DB failure never
+ * blocks the message; we log the error and fall back to the neutral phrase.
+ */
+export function formatOuHitRateLine(result: OuHitRateResult | null): string {
+  if (!result) return "命中率：計算中";
+  if (result.hitRate === null || result.sample < OU_HIT_RATE_MIN_SAMPLE) {
+    return `命中率：樣本不足（${result.sample} 場）`;
+  }
+  const pct = (result.hitRate * 100).toFixed(1);
+  return `命中率：${pct}%（${result.sample} 場歷史）`;
+}
+
+function safeHitRateLine(ruleId: string, lineKey: string, context: string): string {
+  try {
+    return formatOuHitRateLine(computeOuRuleHitRate(ruleId, lineKey));
+  } catch (err) {
+    console.error(`[telegram] ${context} hit-rate compute failed`, {
+      ruleId,
+      lineKey,
+      error: (err as Error).message,
+    });
+    return formatOuHitRateLine(null);
+  }
+}
+
 function historicalLine(rule: OuSignalRule): string {
   if (
     rule.historicalSample !== undefined
@@ -188,6 +226,7 @@ function signalLines(signal: OuSignalObservation): string[] {
     `盤路：${signal.directionPath}｜${signal.driftBucket}`,
     `原方向 ${signal.originalSelection === "O" ? "大" : "小"}：初盤 ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${signal.referenceT5Odds.toFixed(3)}（差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}）`,
     rule ? historicalLine(rule) : "歷史：暫無可核實統計",
+    safeHitRateLine(signal.ruleId, signal.lineKey, "observation"),
   ];
 }
 
@@ -241,7 +280,7 @@ export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<n
   return sent;
 }
 
-function buildOuPrealertMessage(signal: OuSignalPrealert): string {
+export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
   const possibleBuy = signal.signalSelection === "O" ? "大球" : "小球";
   const mode = signal.mode === "reverse" ? "反向候選" : "正向候選";
   return [
@@ -252,6 +291,7 @@ function buildOuPrealertMessage(signal: OuSignalPrealert): string {
     `目前兩段方向：${signal.directionPath}｜同線 ${signal.lineKey}`,
     `低水方賠率：初盤 ${signal.initialSelectedOdds.toFixed(3)} → T-30 ${signal.t30SelectedOdds.toFixed(3)}`,
     `如果 T-5 完成條件，可能留意：${possibleBuy} ${signal.lineKey}｜目前 T-30 賠率 ${signal.signalT30Odds.toFixed(3)}`,
+    safeHitRateLine(signal.ruleId, signal.lineKey, "prealert"),
     "呢個只係心理準備預警，未係正式買入訊號；T-5 會重新核對完整方向同收水幅度。",
   ].join("\n");
 }

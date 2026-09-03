@@ -850,7 +850,10 @@ export function researchDataset(
   const matchRows = rawDb
     .prepare(
       `SELECT m.id match_id,m.hkjc_id,m.fixture_source,m.titan_id,
-              m.league,m.home_team,m.away_team,m.kickoff_utc,
+              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+              m.kickoff_utc,
               COUNT(q.id) snapshot_count,MIN(q.captured_at) first_snapshot_at,
               MAX(q.captured_at) last_snapshot_at,
               COALESCE(rr.home_score,r.home_score) home_score,
@@ -859,6 +862,8 @@ export function researchDataset(
               COALESCE(rr.source,r.source) result_source,
               COALESCE(rr.fetched_at,r.fetched_at) result_fetched_at
          FROM matches m
+         LEFT JOIN pinnacle_translations pt
+           ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
          LEFT JOIN research_timeline_snapshots q ON q.match_id=m.id
          LEFT JOIN research_results rr ON rr.match_id=m.id
          LEFT JOIN results r ON r.match_id=m.id
@@ -1060,7 +1065,10 @@ export function researchCsv(
       .prepare(
         `SELECT DISTINCT m.id,m.hkjc_id,m.fixture_source,m.titan_id,
                 CASE WHEN m.titan_id IS NOT NULL THEN 'titan:'||m.titan_id ELSE 'hkjc:'||m.hkjc_id END fixture_key,
-                m.league,m.home_team,m.away_team,m.kickoff_utc,
+                CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+                CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+                CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+                m.kickoff_utc,
                 COALESCE(rr.home_score,r.home_score) home_score,
                 COALESCE(rr.away_score,r.away_score) away_score,
                 COALESCE(rr.corners_total,r.corners_total) corners_total,
@@ -1069,6 +1077,8 @@ export function researchCsv(
                 rr.source_match_id,
                 COALESCE(rr.fetched_at,r.fetched_at) fetched_at
            FROM matches m
+           LEFT JOIN pinnacle_translations pt
+             ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
            LEFT JOIN research_timeline_snapshots q ON q.match_id=m.id
            LEFT JOIN research_results rr ON rr.match_id=m.id
            LEFT JOIN results r ON r.match_id=m.id
@@ -1104,13 +1114,18 @@ export function researchCsv(
     .prepare(
       `SELECT q.id,q.match_id,m.hkjc_id,m.fixture_source,m.titan_id,
               CASE WHEN m.titan_id IS NOT NULL THEN 'titan:'||m.titan_id ELSE 'hkjc:'||m.hkjc_id END fixture_key,
-              m.league,m.home_team,m.away_team,m.kickoff_utc,
+              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+              m.kickoff_utc,
               q.provider,q.market,q.stage,q.target_at,q.line_key,q.selection,q.decimal_odds,
               q.is_main,q.source_updated_at,q.captured_at,p.first_captured_at,p.last_retry_at,
               q.status,q.origin,q.source_name,
               q.source_match_id,q.source_url
          FROM research_timeline_snapshots q
          JOIN matches m ON m.id=q.match_id
+         LEFT JOIN pinnacle_translations pt
+           ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
          LEFT JOIN research_timeline_points p ON p.match_id=q.match_id AND p.stage=q.stage
         WHERE ${clause}
         ORDER BY m.kickoff_utc DESC,q.stage,q.provider,q.market,q.line_key,q.selection

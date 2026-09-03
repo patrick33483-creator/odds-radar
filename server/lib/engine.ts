@@ -44,6 +44,7 @@ import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
 import { captureResearchTimelinePrices } from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
+import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
   isSimulationPurchaseWindow,
   isPrewarmWindow,
@@ -91,6 +92,9 @@ import {
   simulationBets,
   simulationLegs,
   teamAliases,
+  getPinnacleTranslation,
+  upsertPinnacleTranslation,
+  markPinnacleTranslationAttempt,
 } from "./store";
 import { DEMO_FIXTURE } from "./demo-data";
 import type {
@@ -770,7 +774,14 @@ export class RadarEngine {
          WHERE matches.fixture_source='pinnacle'`,
     );
 
-    const targets: Array<{ matchId: string; eventId: string; kickoffUtc: number }> = [];
+    const targets: Array<{
+      matchId: string;
+      eventId: string;
+      kickoffUtc: number;
+      league: string;
+      homeTeam: string;
+      awayTeam: string;
+    }> = [];
     const upsertTx = rawDb.transaction(() => {
       for (const fixture of pinnapi) {
         if (fixture.parentId) continue; // prefer parent events only
@@ -790,10 +801,46 @@ export class RadarEngine {
           fixture.inplay ? 1 : 0,
           now,
         );
-        targets.push({ matchId, eventId: fixture.providerMatchId, kickoffUtc: fixture.kickoffUtc });
+        targets.push({
+          matchId,
+          eventId: fixture.providerMatchId,
+          kickoffUtc: fixture.kickoffUtc,
+          league: fixture.league,
+          homeTeam: fixture.homeTeam,
+          awayTeam: fixture.awayTeam,
+        });
       }
     });
     upsertTx();
+
+    // Translate the Pinnacle-only fixtures into Chinese as a side effect. The
+    // translation table is joined into the UI at read time; a failure here must
+    // never block price collection below.
+    for (const target of targets) {
+      const existing = getPinnacleTranslation(target.eventId);
+      if (!shouldFetchTranslation(existing, now)) continue;
+      try {
+        const t = await translatePinnacleFixture(
+          {
+            pinnapiId: target.eventId,
+            homeTeam: target.homeTeam,
+            awayTeam: target.awayTeam,
+            league: target.league,
+            kickoffUtc: target.kickoffUtc,
+          },
+          { pinnacle: this.pinnacle, optic: this.optic },
+        );
+        if (t) {
+          upsertPinnacleTranslation(t, Date.now());
+        } else {
+          markPinnacleTranslationAttempt(target.eventId, null, Date.now());
+        }
+      } catch (err) {
+        markPinnacleTranslationAttempt(target.eventId, (err as Error).message, Date.now());
+        log("pinnacle_translation_error", { pinnapiId: target.eventId, error: (err as Error).message });
+      }
+      if (Date.now() > now + MAX_LOOP_MS) break;
+    }
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
