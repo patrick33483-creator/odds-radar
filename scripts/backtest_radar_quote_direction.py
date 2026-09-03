@@ -524,7 +524,8 @@ def evaluate(fixtures: list[dict[str, Any]], bets: list[dict[str, Any]], family:
         x.pop("_holdout_rows", None)
         scanned_public.append(x)
     holm(chosen)
-    return {"family": family, "predefined_policy_tests": len(scanned_public), "selection_rule": "按 discovery ROI 排名，最多三條；holdout 從未參與挑選。",
+    return {"family": family, "planned_policy_templates": POLICY_TEMPLATES[family],
+            "predefined_policy_tests": len(scanned_public), "selection_rule": "按 discovery ROI 排名，最多三條；holdout 從未參與挑選。",
             "scanned": scanned_public, "selected_holdout": chosen}
 
 
@@ -579,7 +580,7 @@ def markdown(report: dict[str, Any]) -> str:
         "", "## 各家族掃描與限制", "",
     ]
     for family in report["families"]:
-        lines += [f"### {family['family']}", f"- 預設政策數：{family['predefined_policy_tests']}；{family['selection_rule']}"]
+        lines += [f"### {family['family']}", f"- 預定模板：{family['planned_policy_templates']}；可執行政策：{family['predefined_policy_tests']}；{family['selection_rule']}"]
         for x in family["scanned"]:
             d, h = x["discovery"], x["holdout"]
             lines.append(f"- `{x['policy']}`：discovery n={d['n']} ROI={'—' if d['roi'] is None else f'{d['roi']*100:+.1f}%'}；holdout n={h['n']} ROI={'—' if h['roi'] is None else f'{h['roi']*100:+.1f}%'}。")
