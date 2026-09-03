@@ -54,6 +54,14 @@ jobs:
           pinnacle_only_kickoff_window = scalar("SELECT COUNT(*) FROM matches WHERE fixture_source='pinnacle' AND kickoff_utc > strftime('%s','now')*1000")
           pinnapi_source_map_total = scalar("SELECT COUNT(*) FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL")
           matches_create_sql = scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='matches'")
+          translation_table_exists = scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pinnacle_translations'")
+          translation_rows = scalar("SELECT COUNT(*) FROM pinnacle_translations") if translation_table_exists else 0
+          translation_zh_home_rows = scalar("SELECT COUNT(*) FROM pinnacle_translations WHERE zh_home IS NOT NULL AND trim(zh_home)<>''") if translation_table_exists else 0
+          translation_samples = db.execute(
+              "SELECT m.home_team,m.away_team,m.league,pt.zh_home,pt.zh_away,pt.zh_league,pt.source "
+              "FROM pinnacle_translations pt JOIN matches m ON m.id='pinnacle:'||pt.pinnapi_id "
+              "WHERE pt.zh_home IS NOT NULL AND trim(pt.zh_home)<>'' ORDER BY random() LIMIT 3"
+          ).fetchall() if translation_table_exists else []
           pinnacle_only_snapshots = db.execute(
               "SELECT stage, COUNT(*) FROM research_timeline_snapshots s JOIN matches m ON m.id=s.match_id "
               "WHERE m.fixture_source='pinnacle' AND s.provider='pinnacle' GROUP BY stage ORDER BY stage"
@@ -101,6 +109,10 @@ jobs:
               'pinnacle_only_snapshots_by_stage': [dict(zip(('stage','rows'), row)) for row in pinnacle_only_snapshots],
               'pinnacle_only_log_tail': pinnacle_only_logs[-5:],
               'matches_create_sql': matches_create_sql,
+              'pinnacle_translation_table_exists': bool(translation_table_exists),
+              'pinnacle_translation_rows': translation_rows,
+              'pinnacle_translation_zh_home_rows': translation_zh_home_rows,
+              'pinnacle_translation_samples': [dict(zip(('en_home','en_away','en_league','zh_home','zh_away','zh_league','source'), row)) for row in translation_samples],
               'simulation_bets_included': simulation_bets,
               'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
           }, ensure_ascii=False, sort_keys=False))
