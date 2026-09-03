@@ -18,6 +18,7 @@ import {
   researchDataset,
 } from "./lib/research";
 import { ouSignalDataset } from "./lib/ou-signals";
+import { syncQuoteDirectionWatchObservations } from "./lib/quote-direction-watch";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
 const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth_arb", "all"]) });
@@ -33,6 +34,9 @@ let researchResultsInFlight: Promise<{ candidates: number; collected: number }> 
 let researchOpeningsTimer: NodeJS.Timeout | null = null;
 let researchOpeningsStartupTimer: NodeJS.Timeout | null = null;
 let researchOpeningsInFlight: Promise<Awaited<ReturnType<typeof collectResearchInitialSnapshots>>> | null = null;
+let quoteDirectionWatchTimer: NodeJS.Timeout | null = null;
+let quoteDirectionWatchStartupTimer: NodeJS.Timeout | null = null;
+let quoteDirectionWatchInFlight: Promise<ReturnType<typeof syncQuoteDirectionWatchObservations>> | null = null;
 let crownBackfillTimer: NodeJS.Timeout | null = null;
 let crownBackfillStartupTimer: NodeJS.Timeout | null = null;
 let crownBackfillInFlight: Promise<Awaited<ReturnType<typeof collectTodayCrownBackfill>>> | null = null;
@@ -138,6 +142,42 @@ function installResearchOpeningCollection(): void {
   researchOpeningsStartupTimer.unref();
   researchOpeningsTimer = setInterval(() => void run(), intervalMs);
   researchOpeningsTimer.unref();
+}
+
+/**
+ * Silent and bounded forward-watch collector. It reads research snapshots and
+ * writes only quote_direction_watch_observations; it has no Telegram path.
+ */
+function installQuoteDirectionWatchCollection(): void {
+  if (process.env.RADAR_QUOTE_DIRECTION_WATCHES === "0" || quoteDirectionWatchTimer) return;
+  const configuredSeconds = Number(process.env.RADAR_QUOTE_DIRECTION_WATCH_INTERVAL_SECONDS ?? 60);
+  const intervalMs = Math.max(30, Math.min(15 * 60, Number.isFinite(configuredSeconds) ? configuredSeconds : 60)) * 1_000;
+  const run = async () => {
+    if (quoteDirectionWatchInFlight) return;
+    quoteDirectionWatchInFlight = Promise.resolve().then(() => syncQuoteDirectionWatchObservations());
+    try {
+      const outcome = await quoteDirectionWatchInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "quote_direction_watch",
+        ...outcome,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "quote_direction_watch_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      quoteDirectionWatchInFlight = null;
+    }
+  };
+  quoteDirectionWatchStartupTimer = setTimeout(() => void run(), 120_000);
+  quoteDirectionWatchStartupTimer.unref();
+  quoteDirectionWatchTimer = setInterval(() => void run(), intervalMs);
+  quoteDirectionWatchTimer.unref();
 }
 
 function installAutoWindowScan(): void {
@@ -325,6 +365,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   installAutoWindowScan();
   installHourlyPrewarm();
   installResearchOpeningCollection();
+  installQuoteDirectionWatchCollection();
   installResearchResultCollection();
   installTodayCrownBackfill();
 

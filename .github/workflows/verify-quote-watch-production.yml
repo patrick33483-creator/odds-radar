@@ -1,0 +1,82 @@
+name: Verify quote-direction watch production (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+      - name: Allow the first bounded watch tick to run
+        run: sleep 130
+      - name: Read production state without modifying it
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          commit="$(git rev-parse HEAD)"
+          container_id="$(sudo docker compose ps -aq radar)"
+          health="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id")"
+          logs="$(sudo docker compose logs --tail 400 radar || true)"
+          errors="$(printf '%s\n' "$logs" | grep -c 'quote_direction_watch_error' || true)"
+          COMMIT="$commit" HEALTH="$health" ERRORS="$errors" python3 - <<'PY'
+          import json
+          import os
+          import sqlite3
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.execute("PRAGMA query_only=ON")
+          db.execute("PRAGMA busy_timeout=1000")
+          required = [
+              "odds_latest", "odds_snapshots", "market_lines", "opportunities",
+              "simulation_bets", "ou_signal_prealerts", "ou_signal_observations",
+          ]
+          table_exists = db.execute(
+              "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quote_direction_watch_observations'"
+          ).fetchone()[0] == 1
+          activation = db.execute(
+              "SELECT value FROM app_state WHERE key='quote_direction_watch_activated_at'"
+          ).fetchone()
+          observations = db.execute(
+              "SELECT COUNT(*) FROM quote_direction_watch_observations"
+          ).fetchone()[0] if table_exists else None
+          notified = db.execute(
+              "SELECT COUNT(*) FROM quote_direction_watch_observations WHERE notified_at IS NOT NULL"
+          ).fetchone()[0] if table_exists else None
+          statuses = dict(db.execute(
+              "SELECT status,COUNT(*) FROM quote_direction_watch_observations GROUP BY status"
+          ).fetchall()) if table_exists else {}
+          execution_counts = {
+              table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+              for table in required
+          }
+          db.close()
+          print(json.dumps({
+              "production_commit": os.environ["COMMIT"],
+              "radar_health": os.environ["HEALTH"],
+              "watch_table_exists": table_exists,
+              "watch_activated_at": activation[0] if activation else None,
+              "watch_observations": observations,
+              "watch_non_null_notified_at": notified,
+              "watch_status_counts": statuses,
+              "quote_direction_watch_error_lines_last_400": int(os.environ["ERRORS"]),
+              "execution_table_counts_read_only": execution_counts,
+              "read_only_connection": True,
+          }, ensure_ascii=False, sort_keys=True))
+          PY
+          REMOTE

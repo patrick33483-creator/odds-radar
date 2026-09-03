@@ -209,6 +209,30 @@ function initialPairCount(matchId: string): number {
   ).get(matchId) as { count: number }).count;
 }
 
+function existingCompleteInitialLines(matchId: string, provider: string, market: string): string[] {
+  return (rawDb.prepare(
+    `SELECT line_key
+       FROM research_timeline_snapshots
+      WHERE match_id=? AND provider=? AND market=? AND stage='initial'
+      GROUP BY line_key
+     HAVING COUNT(DISTINCT selection)>=2
+      ORDER BY line_key`,
+  ).all(matchId, provider, market) as Array<{ line_key: string }>).map((row) => row.line_key);
+}
+
+function initialLineAmbiguities(matchId: string): string[] {
+  return (rawDb.prepare(
+    `SELECT provider,market,COUNT(DISTINCT line_key) AS line_count
+       FROM research_timeline_snapshots
+      WHERE match_id=? AND stage='initial'
+      GROUP BY provider,market
+     HAVING COUNT(DISTINCT selection)>=2
+        AND COUNT(DISTINCT line_key)>1
+      ORDER BY provider,market`,
+  ).all(matchId) as Array<{ provider: string; market: string; line_count: number }>)
+    .map((row) => `${row.provider}/${row.market}=${row.line_count} lines`);
+}
+
 function fixtureIdentity(matchId: string): {
   fixture_source: "hkjc" | "crown";
   titan_id: string | null;
@@ -260,13 +284,26 @@ export function saveResearchInitialSnapshots(
   let inserted = 0;
   rawDb.transaction(() => {
     ensurePoint.run(matchId, capturedAt, capturedAt);
+    // Never choose an alternative opening line after a complete pair is
+    // already present. Legacy/multi-line source responses are retained and
+    // labelled as ambiguous rather than silently selecting a "main" line.
+    const frozenLines = new Map<string, Set<string>>();
     for (const quote of opening.quotes) {
+      const key = `${quote.provider}|${quote.market}`;
+      if (frozenLines.has(key)) continue;
+      const complete = existingCompleteInitialLines(matchId, quote.provider, quote.market);
+      if (complete.length) frozenLines.set(key, new Set(complete));
+    }
+    for (const quote of opening.quotes) {
+      const lineKey = lineKeyOf(quote.market, quote.lineValue);
+      const allowedLines = frozenLines.get(`${quote.provider}|${quote.market}`);
+      if (allowedLines && !allowedLines.has(lineKey)) continue;
       inserted += insert.run(
         matchId,
         quote.provider,
         quote.market,
         "initial",
-        lineKeyOf(quote.market, quote.lineValue),
+        lineKey,
         quote.selection,
         quote.decimalOdds,
         quote.isMain ? 1 : 0,
@@ -291,8 +328,12 @@ export function saveResearchInitialSnapshots(
     const retryAt = hasCapturedQuotes && current?.first_captured_at !== null && current?.first_captured_at !== undefined
       ? capturedAt
       : null;
-    const note = opening.missing.find((item) => item.provider === "pinnacle" && item.market === "COU")?.note
+    const baseNote = opening.missing.find((item) => item.provider === "pinnacle" && item.market === "COU")?.note
       ?? PINNACLE_COU_NOTE;
+    const ambiguities = initialLineAmbiguities(matchId);
+    const note = ambiguities.length
+      ? `${baseNote} Ambiguous initial lines retained; no main inferred: ${ambiguities.join(", ")}.`
+      : baseNote;
     const expected = expectedPairCount(matchId, "initial");
     updatePoint.run(
       firstCapturedAt,

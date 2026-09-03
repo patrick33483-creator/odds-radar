@@ -169,6 +169,24 @@ CREATE INDEX IF NOT EXISTS ou_signal_prealert_match_idx
 CREATE INDEX IF NOT EXISTS ou_signal_prealert_rule_idx
   ON ou_signal_prealerts(rule_id,detected_at);
 
+CREATE TABLE IF NOT EXISTS quote_direction_watch_observations (
+  unique_key TEXT PRIMARY KEY, rule_id TEXT NOT NULL, match_id TEXT NOT NULL,
+  league TEXT NOT NULL, market TEXT NOT NULL CHECK(market IN ('AH','OU')),
+  line_key TEXT NOT NULL, selection TEXT NOT NULL CHECK(selection IN ('H','A','O','U')),
+  decision_stage TEXT NOT NULL CHECK(decision_stage='T30'),
+  decision_odds REAL NOT NULL, reference_odds REAL, odds_gap REAL,
+  percentile_low REAL, percentile_high REAL, baseline_count INTEGER,
+  baseline_version TEXT, status TEXT NOT NULL, detected_at INTEGER NOT NULL,
+  t5_checked_at INTEGER, t5_provider TEXT, t5_odds REAL, t5_change REAL,
+  t5_confirmation TEXT, result_status TEXT, realized_return REAL,
+  realized_pnl REAL, final_score TEXT, settled_at INTEGER,
+  settlement_source TEXT, notified_at INTEGER CHECK(notified_at IS NULL)
+);
+CREATE INDEX IF NOT EXISTS quote_direction_watch_match_idx
+  ON quote_direction_watch_observations(match_id,detected_at);
+CREATE INDEX IF NOT EXISTS quote_direction_watch_rule_idx
+  ON quote_direction_watch_observations(rule_id,status,detected_at);
+
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,
@@ -196,6 +214,9 @@ CREATE TABLE IF NOT EXISTS app_state (
     .run(String(activatedAt), activatedAt);
   sqlite
     .prepare("INSERT OR IGNORE INTO app_state(key,value,updated_at) VALUES('ou_signal_prealert_activated_at',?,?)")
+    .run(String(activatedAt), activatedAt);
+  sqlite
+    .prepare("INSERT OR IGNORE INTO app_state(key,value,updated_at) VALUES('quote_direction_watch_activated_at',?,?)")
     .run(String(activatedAt), activatedAt);
   const ouSignalColumns = sqlite
     .prepare("PRAGMA table_info(ou_signal_observations)")
@@ -301,6 +322,29 @@ CREATE TABLE IF NOT EXISTS app_state (
        SET origin=COALESCE(origin, 'legacy_live_observation'),
            source_name=COALESCE(source_name, provider)
      WHERE stage<>'initial';
+  `);
+  // Keep pre-existing multi-line openings for audit, but make their ambiguity
+  // explicit. They are never silently promoted to a main line by migration.
+  sqlite.exec(`
+    UPDATE research_timeline_points
+       SET note=CASE
+         WHEN note IS NULL OR note='' THEN 'Ambiguous initial lines retained; no main inferred.'
+         ELSE note || ' Ambiguous initial lines retained; no main inferred.'
+       END
+     WHERE stage='initial'
+       AND INSTR(COALESCE(note,''), 'Ambiguous initial lines retained')=0
+       AND EXISTS (
+         SELECT 1
+           FROM (
+             SELECT provider,market,COUNT(DISTINCT line_key) AS line_count
+               FROM research_timeline_snapshots s
+              WHERE s.match_id=research_timeline_points.match_id
+                AND s.stage='initial'
+              GROUP BY provider,market
+             HAVING COUNT(DISTINCT selection)>=2
+                AND COUNT(DISTINCT line_key)>1
+           )
+       );
   `);
   // Preserve historical direct 1X2 rows for audit while removing them from
   // the active 30-bet validation cohort. An AH/OU target implemented through

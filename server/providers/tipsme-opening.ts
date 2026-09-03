@@ -185,7 +185,9 @@ export function parseTipsmeOpeningQuotes(
     provider: "pinnacle",
     market,
     lineValue,
-    isMain: false,
+    // Tipsme v2 exposes exactly one named opening cap for Pinnacle
+    // (hdpBeginCap/hiloBeginCap), unlike the multi-line HKJC history feed.
+    isMain: true,
     sourceUpdatedAt: null,
     origin: "external_opening",
     sourceName: "tipsme",

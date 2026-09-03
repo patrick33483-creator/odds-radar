@@ -208,11 +208,13 @@ describe("research data collection", () => {
       hiloDetails: [{ companyName: "平*", hiloBeginCap: "2.5/3", hiloBeginBigOdds: "0.81", hiloBeginSmallOdds: "1.00" }],
     });
     expect(parsed.quotes.find((quote) => quote.provider === "hkjc" && quote.market === "AH" && quote.selection === "H"))
-      .toMatchObject({ lineValue: 0.25, decimalOdds: 1.91, sourceUpdatedAt: Date.parse("2026-08-20T10:00:00Z") });
+      .toMatchObject({ lineValue: 0.25, decimalOdds: 1.91, isMain: false, sourceUpdatedAt: Date.parse("2026-08-20T10:00:00Z") });
     expect(parsed.quotes.find((quote) => quote.provider === "pinnacle" && quote.market === "AH" && quote.selection === "H"))
-      .toMatchObject({ lineValue: -0.75, decimalOdds: 1.77, sourceUpdatedAt: null });
+      .toMatchObject({ lineValue: -0.75, decimalOdds: 1.77, isMain: true, sourceUpdatedAt: null });
     expect(parsed.quotes.find((quote) => quote.provider === "pinnacle" && quote.market === "OU" && quote.selection === "O"))
-      .toMatchObject({ lineValue: 2.75, decimalOdds: 1.81 });
+      .toMatchObject({ lineValue: 2.75, decimalOdds: 1.81, isMain: true });
+    expect(parsed.quotes.filter((quote) => quote.provider === "pinnacle").every((quote) => quote.isMain)).toBe(true);
+    expect(parsed.quotes.filter((quote) => quote.provider === "hkjc").every((quote) => !quote.isMain)).toBe(true);
   });
 
   it("keeps external initial rows immutable and records the missing Pinnacle COU source", () => {
@@ -269,6 +271,54 @@ describe("research data collection", () => {
     const timelineCsv = researchCsv("timeline", { days: 7, provider: "all", market: "all" });
     expect(timelineCsv).toContain("first_captured_at,last_retry_at");
     expect(timelineCsv).toContain("source_match_id");
+  });
+
+  it("blocks a later initial line after a complete pair while same-line retries stay idempotent", () => {
+    const now = Date.now();
+    addMatch("initial-line-lock", now + 3 * 60 * 60_000);
+    const quote = (lineValue: number, selection: "H" | "A", decimalOdds: number) => ({
+      provider: "pinnacle" as const, market: "AH" as const, lineValue, isMain: true, selection, decimalOdds,
+      sourceUpdatedAt: null, origin: "external_opening" as const, sourceName: "tipsme" as const,
+      sourceMatchId: "tipsme-line-lock", sourceUrl: "https://tipsme-web.azurewebsites.net/api/Score/odds/v2/tipsme-line-lock",
+    });
+    const missing = [{ provider: "pinnacle" as const, market: "COU" as const, note: "Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source." }];
+    expect(saveResearchInitialSnapshots("initial-line-lock", {
+      quotes: [quote(-0.25, "H", 1.91), quote(-0.25, "A", 1.99)], missing,
+    }, now)).toBe(2);
+    expect(saveResearchInitialSnapshots("initial-line-lock", {
+      quotes: [quote(-0.5, "H", 1.91), quote(-0.5, "A", 1.99)], missing,
+    }, now + 1_000)).toBe(0);
+    expect(saveResearchInitialSnapshots("initial-line-lock", {
+      quotes: [quote(-0.25, "H", 2.2), quote(-0.25, "A", 1.8)], missing,
+    }, now + 2_000)).toBe(0);
+    expect(rawDb.prepare(
+      "SELECT line_key,selection,decimal_odds FROM research_timeline_snapshots WHERE match_id=? AND stage='initial' ORDER BY selection",
+    ).all("initial-line-lock")).toEqual([
+      { line_key: "-0.25", selection: "A", decimal_odds: 1.99 },
+      { line_key: "-0.25", selection: "H", decimal_odds: 1.91 },
+    ]);
+  });
+
+  it("retains and explicitly records pre-existing multi-line initial ambiguity without inferring a main", () => {
+    const now = Date.now();
+    addMatch("initial-ambiguous", now + 3 * 60 * 60_000);
+    const quote = (lineValue: number, selection: "O" | "U") => ({
+      provider: "hkjc" as const, market: "OU" as const, lineValue, isMain: false, selection, decimalOdds: 1.91,
+      sourceUpdatedAt: now, origin: "external_opening" as const, sourceName: "tipsme" as const,
+      sourceMatchId: "tipsme-ambiguous", sourceUrl: "https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/tipsme-ambiguous",
+    });
+    expect(saveResearchInitialSnapshots("initial-ambiguous", {
+      quotes: [quote(2.5, "O"), quote(2.5, "U"), quote(2.75, "O"), quote(2.75, "U")],
+      missing: [{ provider: "pinnacle" as const, market: "COU" as const, note: "Pinnacle COU opening unavailable: Tipsme public v2 has no Pinnacle corner-opening source." }],
+    }, now)).toBe(4);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=? AND is_main=1",
+    ).get("initial-ambiguous")).toEqual({ count: 0 });
+    expect(rawDb.prepare(
+      "SELECT note FROM research_timeline_points WHERE match_id=? AND stage='initial'",
+    ).get("initial-ambiguous")).toEqual(expect.objectContaining({
+      note: expect.stringContaining("Ambiguous initial lines retained; no main inferred: hkjc/OU=2 lines."),
+    }));
   });
 
   it("matches public schedules and cannot write simulation or live snapshot tables", async () => {
