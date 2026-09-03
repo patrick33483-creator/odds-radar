@@ -132,6 +132,8 @@ def aggregate(records: list[dict]) -> list[dict]:
 
 def load_records(path: Path) -> tuple[list[dict], dict]:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["match_id"] = row.get("fixture_key") or row["match_id"]
     grouped: dict[tuple, dict] = defaultdict(lambda: defaultdict(dict))
     matches_with_result = set()
     for row in rows:

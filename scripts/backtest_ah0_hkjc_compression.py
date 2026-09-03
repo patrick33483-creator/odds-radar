@@ -74,6 +74,7 @@ def build_events(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict
     grouped: dict[tuple[str, str, str], dict[tuple[str, str], dict[str, Any]]] = defaultdict(dict)
     diagnostics = defaultdict(int)
     for row in rows:
+        row["match_id"] = row.get("fixture_key") or row.get("match_id")
         line = number(row.get("line_key"))
         if line is None or abs(line) > 1e-9 or row.get("market") != "AH":
             diagnostics["non_zero_or_non_ah"] += 1

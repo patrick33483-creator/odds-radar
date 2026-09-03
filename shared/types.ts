@@ -325,7 +325,8 @@ export interface ResearchResultCollectorStatus {
 
 export type ResearchStage = "initial" | "T30" | "T15" | "T5";
 export type ResearchMarket = "AH" | "OU" | "COU";
-export type ResearchProvider = "hkjc" | "pinnacle";
+export type ResearchProvider = "hkjc" | "pinnacle" | "crown";
+export type FixtureSource = "hkjc" | "crown";
 export type ResearchCellStatus =
   | "captured"
   | "partial"
@@ -373,6 +374,10 @@ export interface ResearchStageSnapshot {
 
 export interface ResearchMatchRow {
   matchId: string;
+  fixtureKey: string;
+  fixtureSource: FixtureSource;
+  hkjcId: string | null;
+  titanId: string | null;
   league: string;
   homeTeam: string;
   awayTeam: string;

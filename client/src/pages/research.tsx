@@ -35,10 +35,10 @@ import {
   type Selection,
 } from "@shared/types";
 
-const PROVIDERS: ResearchProvider[] = ["hkjc", "pinnacle"];
+const PROVIDERS: ResearchProvider[] = ["hkjc", "pinnacle", "crown"];
 const MARKETS: ResearchMarket[] = ["AH", "OU", "COU"];
 const STAGES: ResearchStage[] = ["initial", "T30", "T15", "T5"];
-const PROVIDER_LABEL: Record<ResearchProvider, string> = { hkjc: "馬會", pinnacle: "Pinnacle" };
+const PROVIDER_LABEL: Record<ResearchProvider, string> = { hkjc: "馬會", pinnacle: "Pinnacle", crown: "Crown" };
 const STAGE_LABEL: Record<ResearchStage, string> = {
   initial: "初盤",
   T30: "T-30",
@@ -223,6 +223,11 @@ function MatchTimeline({
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="font-semibold">{row.homeTeam} vs {row.awayTeam}</span>
             <span className="text-[10px] text-muted-foreground">{row.league}</span>
+            {row.fixtureSource === "crown" ? (
+              <span className="rounded border border-pinnacle/30 bg-pinnacle/10 px-1 py-0.5 text-[10px] text-pinnacle">
+                Crown 研究賽事
+              </span>
+            ) : null}
           </div>
           <div className="mt-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
             <Clock3 className="h-3 w-3" />
@@ -405,7 +410,7 @@ export default function Research() {
           <RadarLogo className="h-7 w-7 text-pinnacle" />
           <div className="min-w-0">
             <h1 className="truncate text-sm font-semibold" data-testid="text-page-title">研究時間線</h1>
-            <p className="truncate text-[10px] text-muted-foreground">馬會 × Pinnacle · 莊家真初盤 / T-30 / T-15 / T-5 / 賽果</p>
+            <p className="truncate text-[10px] text-muted-foreground">馬會 × Pinnacle × Crown · 莊家真初盤 / T-30 / T-15 / T-5 / 賽果</p>
           </div>
           <div className="ml-auto flex items-center gap-1">
             <Link href="/" className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover-elevate" data-testid="link-tab-dashboard">
@@ -435,7 +440,7 @@ export default function Research() {
           </Select>
           <Select value={provider} onValueChange={(value) => setProvider(value as ResearchProvider | "all")}>
             <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-provider"><SelectValue /></SelectTrigger>
-            <SelectContent><SelectItem value="all">兩個來源</SelectItem><SelectItem value="hkjc">馬會</SelectItem><SelectItem value="pinnacle">Pinnacle</SelectItem></SelectContent>
+            <SelectContent><SelectItem value="all">三個來源</SelectItem><SelectItem value="hkjc">馬會</SelectItem><SelectItem value="pinnacle">Pinnacle</SelectItem><SelectItem value="crown">Crown</SelectItem></SelectContent>
           </Select>
           <Select value={market} onValueChange={(value) => setMarket(value as ResearchMarket | "all")}>
             <SelectTrigger className="h-8 w-[120px] text-xs" data-testid="select-research-market"><SelectValue /></SelectTrigger>

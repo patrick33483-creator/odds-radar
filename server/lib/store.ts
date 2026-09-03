@@ -32,7 +32,8 @@ export const SNAPSHOT_RETENTION_MS = 120 * 24 * 60 * 60 * 1000;
 export function migrate(): void {
   sqlite.exec(`
 CREATE TABLE IF NOT EXISTS matches (
-  id TEXT PRIMARY KEY, hkjc_id TEXT NOT NULL, pinnacle_match_id TEXT,
+  id TEXT PRIMARY KEY, hkjc_id TEXT, fixture_source TEXT NOT NULL DEFAULT 'hkjc'
+    CHECK(fixture_source IN ('hkjc','crown')), titan_id TEXT, pinnacle_match_id TEXT,
   league TEXT NOT NULL, league_en TEXT, home_team TEXT NOT NULL, away_team TEXT NOT NULL,
   home_team_en TEXT, away_team_en TEXT, kickoff_utc INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'PREEVENT', inplay INTEGER NOT NULL DEFAULT 0,
@@ -111,9 +112,10 @@ CREATE TABLE IF NOT EXISTS results (
   source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
 
 CREATE TABLE IF NOT EXISTS research_results (
-  match_id TEXT PRIMARY KEY, hkjc_id TEXT NOT NULL, home_score INTEGER NOT NULL,
+  match_id TEXT PRIMARY KEY, hkjc_id TEXT, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, corners_total INTEGER,
-  source TEXT NOT NULL, fetched_at INTEGER NOT NULL);
+  source TEXT NOT NULL, result_source TEXT NOT NULL DEFAULT 'hkjc',
+  source_match_id TEXT, fetched_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS research_results_fetched_idx ON research_results(fetched_at);
 
 CREATE TABLE IF NOT EXISTS research_timeline_points (
@@ -180,6 +182,7 @@ CREATE TABLE IF NOT EXISTS provider_health (
 CREATE TABLE IF NOT EXISTS app_state (
   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
 `);
+  migrateCrownResearchFixtures();
   // The activation watermark prevents a new deployment from sending Telegram
   // alerts for historical rows that are backfilled into the signal page.
   const activatedAt = Date.now();
@@ -309,6 +312,95 @@ CREATE TABLE IF NOT EXISTS app_state (
       ON simulation_bets(excluded_from_stats, category, placed_at);
   `);
   sqlite.exec("CREATE INDEX IF NOT EXISTS pinnacle_source_map_pinnapi_idx ON pinnacle_source_map(pinnapi_id)");
+}
+
+/**
+ * SQLite cannot relax NOT NULL in place. Rebuild the two small identity/result
+ * tables once, then backfill Titan identity before enforcing its DB invariant.
+ */
+function migrateCrownResearchFixtures(): void {
+  const matchInfo = sqlite.prepare("PRAGMA table_info(matches)").all() as Array<{
+    name: string;
+    notnull: number;
+  }>;
+  const matchNames = new Set(matchInfo.map((column) => column.name));
+  const hkjcColumn = matchInfo.find((column) => column.name === "hkjc_id");
+  if (!matchNames.has("fixture_source") || !matchNames.has("titan_id") || hkjcColumn?.notnull === 1) {
+    sqlite.transaction(() => {
+      sqlite.exec(`
+        DROP INDEX IF EXISTS matches_kickoff_idx;
+        DROP INDEX IF EXISTS matches_pinnacle_idx;
+        ALTER TABLE matches RENAME TO matches_pre_crown;
+        CREATE TABLE matches (
+          id TEXT PRIMARY KEY, hkjc_id TEXT,
+          fixture_source TEXT NOT NULL DEFAULT 'hkjc'
+            CHECK(fixture_source IN ('hkjc','crown')),
+          titan_id TEXT, pinnacle_match_id TEXT,
+          league TEXT NOT NULL, league_en TEXT, home_team TEXT NOT NULL, away_team TEXT NOT NULL,
+          home_team_en TEXT, away_team_en TEXT, kickoff_utc INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'PREEVENT', inplay INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL);
+        INSERT INTO matches(
+          id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
+          home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+        )
+        SELECT id,hkjc_id,'hkjc',NULL,pinnacle_match_id,league,league_en,
+               home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+          FROM matches_pre_crown;
+        DROP TABLE matches_pre_crown;
+        CREATE INDEX matches_kickoff_idx ON matches(kickoff_utc);
+        CREATE INDEX matches_pinnacle_idx ON matches(pinnacle_match_id);
+      `);
+    })();
+  }
+
+  const resultInfo = sqlite.prepare("PRAGMA table_info(research_results)").all() as Array<{
+    name: string;
+    notnull: number;
+  }>;
+  const resultNames = new Set(resultInfo.map((column) => column.name));
+  const resultHkjc = resultInfo.find((column) => column.name === "hkjc_id");
+  if (!resultNames.has("result_source") || !resultNames.has("source_match_id") || resultHkjc?.notnull === 1) {
+    sqlite.transaction(() => {
+      sqlite.exec(`
+        DROP INDEX IF EXISTS research_results_fetched_idx;
+        ALTER TABLE research_results RENAME TO research_results_pre_crown;
+        CREATE TABLE research_results (
+          match_id TEXT PRIMARY KEY, hkjc_id TEXT, home_score INTEGER NOT NULL,
+          away_score INTEGER NOT NULL, corners_total INTEGER, source TEXT NOT NULL,
+          result_source TEXT NOT NULL DEFAULT 'hkjc', source_match_id TEXT,
+          fetched_at INTEGER NOT NULL);
+        INSERT INTO research_results(
+          match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at
+        )
+        SELECT match_id,hkjc_id,home_score,away_score,corners_total,source,'hkjc',hkjc_id,fetched_at
+          FROM research_results_pre_crown;
+        DROP TABLE research_results_pre_crown;
+        CREATE INDEX research_results_fetched_idx ON research_results(fetched_at);
+      `);
+    })();
+  }
+
+  sqlite.exec(`
+    UPDATE matches
+       SET titan_id=(
+         SELECT p.titan_id FROM pinnacle_source_map p
+          WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
+       )
+     WHERE titan_id IS NULL
+       AND EXISTS (
+         SELECT 1 FROM pinnacle_source_map p
+          WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
+       );
+  `);
+  const duplicate = sqlite.prepare(
+    `SELECT titan_id,COUNT(*) count FROM matches
+      WHERE titan_id IS NOT NULL GROUP BY titan_id HAVING COUNT(*)>1 LIMIT 1`,
+  ).get() as { titan_id: string; count: number } | undefined;
+  if (duplicate) {
+    throw new Error(`Duplicate Titan fixture identity ${duplicate.titan_id} (${duplicate.count} rows)`);
+  }
+  sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS matches_titan_uniq ON matches(titan_id) WHERE titan_id IS NOT NULL");
 }
 
 migrate();

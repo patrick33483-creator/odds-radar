@@ -190,6 +190,31 @@ function rowTriple(rowHtml: string): { home: number; goals: number; away: number
 }
 
 /**
+ * Titan places the explicit bookmaker opening triple immediately before its
+ * oddstype=current cells. Untyped values are required; malformed/missing
+ * opening cells return null and must never fall back to the current quote.
+ */
+function openingRowTriple(rowHtml: string): { home: number; goals: number; away: number } | null {
+  const currentAt = rowHtml.search(/<td[^>]*oddstype=["']whole(?:Last)?Odds["']/i);
+  if (currentAt < 0) return null;
+  const prefix = rowHtml.slice(0, currentAt);
+  const triples = Array.from(prefix.matchAll(
+    /<td(?![^>]*oddstype)[^>]*>([\s\S]*?)<\/td>\s*<td(?![^>]*oddstype)([^>]*)>([\s\S]*?)<\/td>\s*<td(?![^>]*oddstype)[^>]*>([\s\S]*?)<\/td>/gi,
+  ));
+  for (let index = triples.length - 1; index >= 0; index--) {
+    const match = triples[index];
+    const goalsText = match[2].match(/goals=["'](-?[\d.]+)["']/i)?.[1];
+    const home = Number(stripTags(match[1]));
+    const goals = Number(goalsText);
+    const away = Number(stripTags(match[4]));
+    if ([home, goals, away].every(Number.isFinite) && home > -1 && away > -1) {
+      return { home, goals, away };
+    }
+  }
+  return null;
+}
+
+/**
  * Extract Pinnacle's current full-time triple from an AsianOdds_n / OverDown_n
  * page, identified by bookmaker NAME (with an optional numeric hint). Returns
  * null when no Pinnacle row exists — the caller must then degrade, not guess.
@@ -215,6 +240,22 @@ export function parseCrownAsianTriple(
   if (!row) return null;
   const triple = rowTriple(row.html);
   return triple ? { ...triple, companyId: row.companyId } : null;
+}
+
+/** Crown's explicit opening Asian-odds triple; never a first-seen current quote. */
+export function parseCrownOpeningAsianTriple(
+  html: string,
+): { home: number; goals: number; away: number; companyId: string } | null {
+  const row = listBookmakerRows(html).find((candidate) => candidate.companyId === "3" || isCrownName(candidate.rawName));
+  if (!row) return null;
+  const triple = openingRowTriple(row.html);
+  return triple ? { ...triple, companyId: row.companyId } : null;
+}
+
+export interface CrownResearchPrices {
+  opening: ProviderPrice[];
+  current: ProviderPrice[];
+  sourceUrls: { AH: string; OU: string };
 }
 
 /**
@@ -355,6 +396,11 @@ export class PinnacleProvider {
     return out.filter((f) => (seen.has(f.providerMatchId) ? false : (seen.add(f.providerMatchId), true)));
   }
 
+  /** Titan schedule is the authoritative fixture universe for Crown research. */
+  async fetchTitanResearchFixtures(dayOffsets: number[] = [0, 1]): Promise<PinnacleFixture[]> {
+    return this.fetchTitanFixtures(dayOffsets);
+  }
+
   /** Pinnacle prices for one provider match id. Missing markets are simply absent. */
   async fetchMatchPrices(providerMatchId: string): Promise<ProviderPrice[]> {
     if (this.strategy === "official-api" && providerMatchId.startsWith("api:")) {
@@ -406,6 +452,62 @@ export class PinnacleProvider {
       throw new Error(`Crown detail unavailable for ${sId}: ${(ah.reason as Error)?.message ?? "unknown"}`);
     }
     return prices;
+  }
+
+  /** Research-only Crown AH/OU with explicit opening and current values. */
+  async fetchCrownResearchPrices(sId: string): Promise<CrownResearchPrices> {
+    const now = Date.now();
+    const sourceUrls = {
+      AH: `${VIP}/AsianOdds_n.aspx?id=${sId}`,
+      OU: `${VIP}/OverDown_n.aspx?id=${sId}`,
+    };
+    const [ah, ou] = await Promise.allSettled([
+      fetchText(sourceUrls.AH, { timeoutMs: 30_000, retries: 1 }),
+      fetchText(sourceUrls.OU, { timeoutMs: 30_000, retries: 1 }),
+    ]);
+    if (ah.status === "rejected" && ou.status === "rejected") {
+      throw new Error(`Crown research detail unavailable for ${sId}: ${(ah.reason as Error)?.message ?? "unknown"}`);
+    }
+    const opening: ProviderPrice[] = [];
+    const current: ProviderPrice[] = [];
+    const append = (
+      target: ProviderPrice[],
+      market: "AH" | "OU",
+      row: { home: number; goals: number; away: number } | null,
+      sourceUpdatedAt: number | null,
+    ) => {
+      const lineValue = row
+        ? market === "AH"
+          ? parsePinnacleHandicap(row.goals)
+          : parsePinnacleTotal(Math.abs(row.goals))
+        : null;
+      if (!row || lineValue === null) return;
+      target.push({
+        market,
+        lineValue,
+        isMain: true,
+        selection: market === "AH" ? "H" : "O",
+        decimalOdds: hkToDecimal(row.home),
+        sourceUpdatedAt,
+      });
+      target.push({
+        market,
+        lineValue,
+        isMain: true,
+        selection: market === "AH" ? "A" : "U",
+        decimalOdds: hkToDecimal(row.away),
+        sourceUpdatedAt,
+      });
+    };
+    if (ah.status === "fulfilled") {
+      append(opening, "AH", parseCrownOpeningAsianTriple(ah.value), null);
+      append(current, "AH", parseCrownAsianTriple(ah.value), now);
+    }
+    if (ou.status === "fulfilled") {
+      append(opening, "OU", parseCrownOpeningAsianTriple(ou.value), null);
+      append(current, "OU", parseCrownAsianTriple(ou.value), now);
+    }
+    return { opening, current, sourceUrls };
   }
 
   private async fetchTitanPrices(sId: string): Promise<ProviderPrice[]> {

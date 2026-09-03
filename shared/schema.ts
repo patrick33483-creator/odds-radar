@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import type * as z from "zod/mini";
 
@@ -9,12 +10,16 @@ import type * as z from "zod/mini";
  * below are sized for that order of magnitude).
  * ------------------------------------------------------------------ */
 
-/** Canonical pre-match event. One row per HKJC match. */
+export type FixtureSource = "hkjc" | "crown";
+
+/** Canonical pre-match event. One row per actual fixture across research sources. */
 export const matches = sqliteTable(
   "matches",
   {
-    id: text("id").primaryKey(), // canonical id = "hkjc:<hkjcId>"
-    hkjcId: text("hkjc_id").notNull(),
+    id: text("id").primaryKey(), // hkjc:<id>, or crown:<titan sid> until reconciled
+    hkjcId: text("hkjc_id"),
+    fixtureSource: text("fixture_source").notNull().default("hkjc"),
+    titanId: text("titan_id"),
     pinnacleMatchId: text("pinnacle_match_id"), // active source id, normally pinnapi:<event_id>
     league: text("league").notNull(),
     leagueEn: text("league_en"),
@@ -30,6 +35,7 @@ export const matches = sqliteTable(
   (t) => ({
     koIdx: index("matches_kickoff_idx").on(t.kickoffUtc),
     pinnacleIdx: index("matches_pinnacle_idx").on(t.pinnacleMatchId),
+    titanUniq: uniqueIndex("matches_titan_uniq").on(t.titanId).where(sql`${t.titanId} IS NOT NULL`),
   }),
 );
 

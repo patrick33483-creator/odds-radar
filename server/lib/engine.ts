@@ -23,7 +23,7 @@
  * bookmaker for Pinnacle.
  */
 
-import { PinnacleProvider } from "../providers/pinnacle";
+import { PinnacleProvider, type PinnacleFixture } from "../providers/pinnacle";
 import { OpticOddsProvider } from "../providers/opticodds";
 import { PinnapiProvider, type PinnapiFixture } from "../providers/pinnapi";
 import { HkjcProvider } from "../providers/hkjc";
@@ -42,7 +42,10 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
-import { captureResearchTimelinePrices } from "./research";
+import {
+  captureResearchTimelinePrices,
+  saveCrownResearchInitialSnapshots,
+} from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import {
   isSimulationPurchaseWindow,
@@ -114,6 +117,153 @@ export const FIXTURE_CACHE_MS = 10 * 60_000;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
 
+/** Idempotently add every unclaimed Titan fixture to the research universe. */
+export function upsertCrownResearchFixtures(fixtures: PinnacleFixture[], now = Date.now()): number {
+  return rawDb.transaction(() => {
+    const claimed = new Set(
+      (rawDb.prepare("SELECT titan_id FROM matches WHERE titan_id IS NOT NULL").all() as Array<{ titan_id: string }>)
+        .map((row) => row.titan_id),
+    );
+    const upsert = rawDb.prepare(
+      `INSERT INTO matches(
+        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
+        home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
+      ) VALUES(?,NULL,'crown',?,NULL,?,NULL,?,?,NULL,NULL,?,?,0,?)
+      ON CONFLICT(id) DO UPDATE SET league=excluded.league,home_team=excluded.home_team,
+        away_team=excluded.away_team,kickoff_utc=excluded.kickoff_utc,
+        status=excluded.status,inplay=0,updated_at=excluded.updated_at`,
+    );
+    let added = 0;
+    for (const fixture of fixtures) {
+      if (claimed.has(fixture.providerMatchId)) continue;
+      const existed = rawDb.prepare("SELECT 1 FROM matches WHERE id=?").get(`crown:${fixture.providerMatchId}`);
+      upsert.run(
+        `crown:${fixture.providerMatchId}`,
+        fixture.providerMatchId,
+        fixture.league,
+        fixture.homeTeam,
+        fixture.awayTeam,
+        fixture.kickoffUtc,
+        fixture.statusText || "scheduled",
+        now,
+      );
+      if (!existed) added++;
+      claimed.add(fixture.providerMatchId);
+    }
+    return added;
+  })();
+}
+
+/** Merge a Crown-first alias into the later HKJC canonical fixture atomically. */
+export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): boolean {
+  return rawDb.transaction(() => {
+    const crown = rawDb.prepare(
+      "SELECT id FROM matches WHERE titan_id=? AND fixture_source='crown' AND id<>?",
+    ).get(titanId, hkjcId) as { id: string } | undefined;
+    if (!crown) {
+      rawDb.prepare("UPDATE matches SET titan_id=? WHERE id=? AND fixture_source='hkjc'").run(titanId, hkjcId);
+      return false;
+    }
+    const sourceRows = rawDb.prepare(
+      `SELECT provider,market,stage,line_key,selection,decimal_odds,is_main,source_updated_at,
+              captured_at,target_at,status,origin,source_name,source_match_id,source_url
+         FROM research_timeline_snapshots WHERE match_id=?`,
+    ).all(crown.id) as Array<Record<string, unknown>>;
+    const mergeSnapshot = rawDb.prepare(
+      `INSERT INTO research_timeline_snapshots(
+        match_id,provider,market,stage,line_key,selection,decimal_odds,is_main,
+        source_updated_at,captured_at,target_at,status,origin,source_name,source_match_id,source_url
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(match_id,provider,market,stage,line_key,selection) DO UPDATE SET
+        decimal_odds=CASE WHEN excluded.captured_at<captured_at THEN excluded.decimal_odds ELSE decimal_odds END,
+        is_main=CASE WHEN excluded.captured_at<captured_at THEN excluded.is_main ELSE is_main END,
+        source_updated_at=CASE WHEN excluded.captured_at<captured_at THEN excluded.source_updated_at ELSE source_updated_at END,
+        target_at=CASE WHEN excluded.captured_at<captured_at THEN excluded.target_at ELSE target_at END,
+        status=CASE WHEN excluded.captured_at<captured_at THEN excluded.status ELSE status END,
+        origin=CASE WHEN excluded.captured_at<captured_at THEN excluded.origin ELSE origin END,
+        source_name=CASE WHEN excluded.captured_at<captured_at THEN excluded.source_name ELSE source_name END,
+        source_match_id=CASE WHEN excluded.captured_at<captured_at THEN excluded.source_match_id ELSE source_match_id END,
+        source_url=CASE WHEN excluded.captured_at<captured_at THEN excluded.source_url ELSE source_url END,
+        captured_at=MIN(captured_at,excluded.captured_at)`,
+    );
+    for (const row of sourceRows) {
+      mergeSnapshot.run(
+        hkjcId, row.provider, row.market, row.stage, row.line_key, row.selection,
+        row.decimal_odds, row.is_main, row.source_updated_at, row.captured_at,
+        row.target_at, row.status, row.origin, row.source_name, row.source_match_id, row.source_url,
+      );
+    }
+    const sourcePoints = rawDb.prepare(
+      "SELECT * FROM research_timeline_points WHERE match_id=?",
+    ).all(crown.id) as Array<Record<string, unknown>>;
+    const mergePoint = rawDb.prepare(
+      `INSERT INTO research_timeline_points(
+        match_id,stage,target_at,first_captured_at,last_retry_at,captured_at,status,note,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(match_id,stage) DO UPDATE SET
+        target_at=COALESCE(target_at,excluded.target_at),
+        first_captured_at=CASE
+          WHEN first_captured_at IS NULL THEN excluded.first_captured_at
+          WHEN excluded.first_captured_at IS NULL THEN first_captured_at
+          ELSE MIN(first_captured_at,excluded.first_captured_at) END,
+        captured_at=CASE
+          WHEN captured_at IS NULL THEN excluded.captured_at
+          WHEN excluded.captured_at IS NULL THEN captured_at
+          ELSE MIN(captured_at,excluded.captured_at) END,
+        last_retry_at=CASE
+          WHEN last_retry_at IS NULL THEN excluded.last_retry_at
+          WHEN excluded.last_retry_at IS NULL THEN last_retry_at
+          ELSE MAX(last_retry_at,excluded.last_retry_at) END,
+        status=CASE WHEN status='captured' OR excluded.status='captured' THEN 'captured'
+                    WHEN status='partial' OR excluded.status='partial' THEN 'partial' ELSE status END,
+        note=COALESCE(note,excluded.note),created_at=MIN(created_at,excluded.created_at),
+        updated_at=MAX(updated_at,excluded.updated_at)`,
+    );
+    for (const point of sourcePoints) {
+      mergePoint.run(
+        hkjcId, point.stage, point.target_at, point.first_captured_at, point.last_retry_at,
+        point.captured_at, point.status, point.note, point.created_at, point.updated_at,
+      );
+    }
+    rawDb.prepare(
+      `INSERT OR IGNORE INTO research_results(
+        match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at
+      )
+      SELECT ?,NULL,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at
+        FROM research_results WHERE match_id=?`,
+    ).run(hkjcId, crown.id);
+    rawDb.prepare("DELETE FROM research_timeline_snapshots WHERE match_id=?").run(crown.id);
+    rawDb.prepare("DELETE FROM research_timeline_points WHERE match_id=?").run(crown.id);
+    rawDb.prepare("DELETE FROM research_results WHERE match_id=?").run(crown.id);
+    rawDb.prepare("DELETE FROM pinnacle_source_map WHERE match_id=?").run(crown.id);
+    rawDb.prepare("DELETE FROM match_mapping WHERE match_id=?").run(crown.id);
+    rawDb.prepare("DELETE FROM matches WHERE id=?").run(crown.id);
+    rawDb.prepare("UPDATE matches SET titan_id=? WHERE id=? AND fixture_source='hkjc'").run(titanId, hkjcId);
+    const points = rawDb.prepare(
+      "SELECT stage FROM research_timeline_points WHERE match_id=?",
+    ).all(hkjcId) as Array<{ stage: string }>;
+    for (const point of points) {
+      const complete = (rawDb.prepare(
+        `SELECT COUNT(*) count FROM (
+          SELECT provider,market FROM research_timeline_snapshots
+           WHERE match_id=? AND stage=?
+           GROUP BY provider,market HAVING COUNT(DISTINCT selection)>=2
+        )`,
+      ).get(hkjcId, point.stage) as { count: number }).count;
+      const expected = point.stage === "initial" ? 7 : 8;
+      rawDb.prepare(
+        "UPDATE research_timeline_points SET status=?,note=? WHERE match_id=? AND stage=?",
+      ).run(
+        complete >= expected ? "captured" : "partial",
+        complete >= expected ? null : `${complete}/${expected} provider-market pairs complete`,
+        hkjcId,
+        point.stage,
+      );
+    }
+    return true;
+  })();
+}
+
 export function executionVerificationNote(verifiedAt: number): string {
   return [
     "execution_recheck=two_pass",
@@ -176,6 +326,7 @@ export class RadarEngine {
   } | null = null;
   private pinnacleDetail = new Map<string, PinnacleDetailCacheEntry>();
   private crownDetail = new Map<string, PinnacleDetailCacheEntry>();
+  private crownResearchAttempt = new Map<string, number>();
   private pinnacleRowsSeen = 0;
   private lastScan: ScanOutcome | null = null;
   private scanning = false;
@@ -265,6 +416,7 @@ export class RadarEngine {
     const startedAt = Date.now();
     const initial = db.select().from(matches).where(eq(matches.id, matchId)).get();
     if (!initial) throw new Error("MATCH_NOT_FOUND");
+    if (initial.fixtureSource !== "hkjc") throw new Error("MATCH_NOT_FOUND");
     if (!initial.pinnacleMatchId) throw new Error("MATCH_NOT_MAPPED");
     if (initial.kickoffUtc <= startedAt) throw new Error("MATCH_ALREADY_STARTED");
 
@@ -462,7 +614,7 @@ export class RadarEngine {
         }
         let titan: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>> = [];
         try {
-          titan = await this.pinnacle.fetchFixtures([0, 1, 2, 3, 4]);
+          titan = await this.pinnacle.fetchTitanResearchFixtures([0, 1, 2, 3, 4]);
         } catch (err) {
           // Crown/titan007 is deliberately non-primary. Its fixture endpoint
           // must not prevent PinnAPI EV mapping or Optic's unmapped fallback.
@@ -487,7 +639,9 @@ export class RadarEngine {
     const opticCandidates = toCandidates(opticFixtures);
     const titanCandidates = toCandidates(titanFixtures);
 
-    const pending = db.select().from(matches).all().filter((m) => m.kickoffUtc > now - 5 * 60_000);
+    const pending = db.select().from(matches).all().filter(
+      (m) => m.fixtureSource === "hkjc" && m.kickoffUtc > now - 5 * 60_000,
+    );
     let mapped = 0;
     const matchWithVerifiedTimeFallback = (
       target: CandidateEvent,
@@ -528,6 +682,9 @@ export class RadarEngine {
           ? null
           : matchWithVerifiedTimeFallback(englishTarget, opticCandidates);
         const titanDecision = matchWithVerifiedTimeFallback(target, titanCandidates, aliases);
+        if (titanDecision.pinnacleMatchId) {
+          reconcileCrownFixtureIntoHkjc(m.id, titanDecision.pinnacleMatchId);
+        }
         const decision = pinnapiDecision.pinnacleMatchId
           ? pinnapiDecision
           : opticDecision?.pinnacleMatchId
@@ -590,7 +747,8 @@ export class RadarEngine {
             activeSource,
             now,
           );
-        rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?").run(activeId, m.id);
+        rawDb.prepare("UPDATE matches SET pinnacle_match_id=?,titan_id=COALESCE(?,titan_id) WHERE id=?")
+          .run(activeId, titanDecision.pinnacleMatchId, m.id);
         for (const a of [...pinnapiDecision.learnedAliases, ...(opticDecision?.learnedAliases ?? []), ...titanDecision.learnedAliases]) {
           if (!a.alias) continue;
           rawDb
@@ -600,6 +758,7 @@ export class RadarEngine {
             .run(a.canonical, a.alias, a.provider, now);
         }
       }
+      upsertCrownResearchFixtures(titanFixtures, now);
     });
     mapTx();
     log("pinnacle_fixtures", {
@@ -864,7 +1023,7 @@ export class RadarEngine {
       .select()
       .from(matches)
       .all()
-      .filter((m) => m.pinnacleMatchId && m.kickoffUtc > now)
+      .filter((m) => m.fixtureSource === "hkjc" && m.pinnacleMatchId && m.kickoffUtc > now)
       .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
     if (mode === "full") return all;
     if (mode === "prewarm24h") return all.filter((m) => isPrewarmWindow(m.kickoffUtc, now));
@@ -967,6 +1126,7 @@ export class RadarEngine {
       .select()
       .from(matches)
       .all()
+      .filter((m) => m.fixtureSource === "hkjc")
       .map((m) => ({
         matchId: m.id,
         matchLabel: `${m.homeTeam} vs ${m.awayTeam}`,
@@ -1163,21 +1323,106 @@ export class RadarEngine {
     return selectWindowEvents(this.scanCandidates(), Date.now(), cfg);
   }
 
-  /** Read-only research pass used after the simulation target has been reached. */
+  private researchCandidates(now = Date.now()): Array<{
+    id: string;
+    titanId: string;
+    kickoffUtc: number;
+    reversed: boolean;
+  }> {
+    const rows = rawDb.prepare(
+      `SELECT m.id,m.titan_id,m.kickoff_utc,COALESCE(p.titan_reversed,0) titan_reversed
+         FROM matches m
+         LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+        WHERE m.titan_id IS NOT NULL AND m.kickoff_utc>?
+          AND (
+            m.kickoff_utc<=?
+            OR NOT EXISTS (
+              SELECT 1 FROM research_timeline_snapshots s
+               WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial'
+               GROUP BY s.match_id HAVING COUNT(DISTINCT s.market)>=2
+            )
+          )
+        ORDER BY m.kickoff_utc
+        LIMIT 100`,
+    ).all(now, now + 30 * 60_000) as Array<{
+      id: string;
+      titan_id: string;
+      kickoff_utc: number;
+      titan_reversed: number;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      titanId: row.titan_id,
+      kickoffUtc: row.kickoff_utc,
+      reversed: !!row.titan_reversed,
+    }));
+  }
+
+  /** Research-only Crown path: it cannot write execution odds or invoke signals. */
+  private async pollCrownResearchDetail(
+    targets: ReturnType<RadarEngine["researchCandidates"]>,
+    deadline: number,
+  ): Promise<{ fetched: number; failed: number }> {
+    let fetched = 0;
+    let failed = 0;
+    const queue = [...targets];
+    const workers = Array.from({ length: 4 }, async () => {
+      while (queue.length && Date.now() <= deadline) {
+        const target = queue.shift();
+        if (!target) continue;
+        const attemptAt = Date.now();
+        const previousAttempt = this.crownResearchAttempt.get(target.titanId);
+        if (
+          target.kickoffUtc - attemptAt > 30 * 60_000
+          && previousAttempt !== undefined
+          && attemptAt - previousAttempt < FIXTURE_CACHE_MS
+        ) {
+          continue;
+        }
+        this.crownResearchAttempt.set(target.titanId, attemptAt);
+        try {
+          const research = await this.pinnacle.fetchCrownResearchPrices(target.titanId);
+          const orient = (prices: ProviderPrice[]) => target.reversed
+            ? this.reversePinnaclePrices(prices)
+            : prices;
+          const observedAt = Date.now();
+          saveCrownResearchInitialSnapshots(
+            target.id,
+            target.titanId,
+            orient(research.opening),
+            research.sourceUrls,
+            observedAt,
+          );
+          captureResearchTimelinePrices(
+            target.id,
+            "crown",
+            orient(research.current),
+            target.kickoffUtc,
+            observedAt,
+          );
+          fetched++;
+        } catch (error) {
+          failed++;
+          log("crown_research_detail_error", {
+            matchId: target.id,
+            titanId: target.titanId,
+            error: (error as Error).message,
+          });
+        }
+      }
+    });
+    await Promise.all(workers);
+    return { fetched, failed };
+  }
+
+  /** Read-only research pass independent of simulation capacity. */
   async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
-    const candidates = await this.loadScanCandidates();
-    const events = selectWindowEvents(candidates, Date.now(), scanConfig());
-    if (!events.length) return { selected: 0, detailCalls: 0 };
-    const result = await this.pollPinnacleDetail(
-      events.map((event) => ({
-        id: event.matchId,
-        pinnacleMatchId: event.pinnacleMatchId,
-        kickoffUtc: event.kickoffUtc,
-      })),
-      Date.now() + MAX_LOOP_MS,
-      true,
-    );
-    return { selected: events.length, detailCalls: result.fetched };
+    await this.refreshHkjc();
+    await this.refreshPinnacleFixtures();
+    const candidates = this.researchCandidates();
+    if (!candidates.length) return { selected: 0, detailCalls: 0 };
+    const result = await this.pollCrownResearchDetail(candidates, Date.now() + MAX_LOOP_MS);
+    return { selected: candidates.length, detailCalls: result.fetched };
   }
 
   private persistPrices(
@@ -1234,7 +1479,7 @@ export class RadarEngine {
       .select()
       .from(matches)
       .all()
-      .filter((m) => m.kickoffUtc > now - 30 * 60_000)
+      .filter((m) => m.fixtureSource === "hkjc" && m.kickoffUtc > now - 30 * 60_000)
       .sort((a, b) => a.kickoffUtc - b.kickoffUtc);
     // Only active dashboard fixtures need prices/lines.  Reading the complete
     // retained history on every 20-second frontend poll caused avoidable work

@@ -39,6 +39,8 @@ def median(values: list[float]) -> float | None:
 
 def load(path: Path):
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["match_id"] = row.get("fixture_key") or row["match_id"]
     match_info = {}
     # all rows, keyed by (match_id, provider, stage, line_key) -> {"O":row,"U":row}
     all_by_line: dict[tuple, dict[str, dict]] = defaultdict(dict)
@@ -79,7 +81,7 @@ def line_and_mid_odds(pair: dict) -> tuple[float, float, float] | None:
 
 def trend_section(by_stage: dict) -> list[str]:
     lines = ["## 主線盤口同賠率隨階段變化（中位數）", "", "| 供應商 | 階段 | 場數 | 主線中位數 | 大賠率中位數 | 小賠率中位數 |", "|---|---|---:|---:|---:|---:|"]
-    for provider in ("hkjc", "pinnacle"):
+    for provider in ("hkjc", "pinnacle", "crown"):
         for stage in STAGES:
             group = [
                 line_and_mid_odds(pair)
@@ -92,7 +94,7 @@ def trend_section(by_stage: dict) -> list[str]:
             lines_v = [g[0] for g in group]
             over_v = [g[1] for g in group]
             under_v = [g[2] for g in group]
-            label = "馬會" if provider == "hkjc" else "皇冠"
+            label = {"hkjc": "馬會", "pinnacle": "Pinnacle", "crown": "Crown"}[provider]
             lines.append(
                 f"| {label} | {stage} | {len(group)} | {median(lines_v):.2f} | "
                 f"{median(over_v):.3f} | {median(under_v):.3f} |"
@@ -102,7 +104,7 @@ def trend_section(by_stage: dict) -> list[str]:
 
 
 def paired_diff_section(by_stage: dict) -> tuple[list[str], list[dict]]:
-    lines = ["## 馬會 vs 皇冠：同場同階段主線差異", "", "| 階段 | 配對場數 | 主線差中位數(馬會-皇冠) | 大賠率差中位數 | 小賠率差中位數 |", "|---|---:|---:|---:|---:|"]
+    lines = ["## 馬會 vs Pinnacle：同場同階段主線差異", "", "| 階段 | 配對場數 | 主線差中位數(馬會-Pinnacle) | 大賠率差中位數 | 小賠率差中位數 |", "|---|---:|---:|---:|---:|"]
     records = []
     for stage in STAGES:
         line_diffs = []
@@ -186,7 +188,7 @@ def insight_section(records: list[dict], match_info: dict) -> list[str]:
     if not t5:
         return ["## 主線差異與賽果關係", "", "T5 沒有足夠配對樣本。", ""]
     lines = [
-        "## 主線差異與賽果關係（T5，以皇冠主線同賽果結算）",
+        "## 主線差異與賽果關係（T5，以 Pinnacle 主線同賽果結算）",
         "",
         "| 主線差異區間 | 場數 | 大 | 小 | 走盤 | 大命中率 | 95% Wilson CI |",
         "|---|---:|---:|---:|---:|---:|---:|",
@@ -246,10 +248,10 @@ def insight_section(records: list[dict], match_info: dict) -> list[str]:
 def odds_gap_insight(records: list[dict], match_info: dict) -> list[str]:
     t5 = [r for r in records if r["stage"] == "T5"]
     lines = [
-        "## 賠率差異與賽果關係（T5，皇冠大賠率 − 馬會大賠率）",
+        "## 賠率差異與賽果關係（T5，Pinnacle 大賠率 − 馬會大賠率）",
         "",
-        "- 正數：皇冠大球賠率比馬會高（皇冠對大球開價更保守／馬會更看好大球）。",
-        "- 負數：皇冠大球賠率比馬會低。",
+        "- 正數：Pinnacle 大球賠率比馬會高（Pinnacle 對大球開價更保守／馬會更看好大球）。",
+        "- 負數：Pinnacle 大球賠率比馬會低。",
         "",
         "| 賠率差區間 | 場數 | 大 | 小 | 走盤 | 大命中率 | 95% Wilson CI |",
         "|---|---:|---:|---:|---:|---:|---:|",
@@ -257,14 +259,14 @@ def odds_gap_insight(records: list[dict], match_info: dict) -> list[str]:
 
     def bucket_odds(diff: float) -> str:
         if diff >= 0.05:
-            return "皇冠大賠率高≥0.05"
+            return "Pinnacle大賠率高≥0.05"
         if diff > 0:
-            return "皇冠大賠率略高(0,0.05)"
+            return "Pinnacle大賠率略高(0,0.05)"
         if diff == 0:
             return "賠率相同"
         if diff > -0.05:
-            return "皇冠大賠率略低(-0.05,0)"
-        return "皇冠大賠率低≥0.05"
+            return "Pinnacle大賠率略低(-0.05,0)"
+        return "Pinnacle大賠率低≥0.05"
 
     buckets = defaultdict(list)
     for r in t5:
@@ -277,11 +279,11 @@ def odds_gap_insight(records: list[dict], match_info: dict) -> list[str]:
         odds_diff = r["pinnacle_over"] - r["hkjc_over"]
         buckets[bucket_odds(odds_diff)].append(outcome)
     order = [
-        "皇冠大賠率高≥0.05",
-        "皇冠大賠率略高(0,0.05)",
+        "Pinnacle大賠率高≥0.05",
+        "Pinnacle大賠率略高(0,0.05)",
         "賠率相同",
-        "皇冠大賠率略低(-0.05,0)",
-        "皇冠大賠率低≥0.05",
+        "Pinnacle大賠率略低(-0.05,0)",
+        "Pinnacle大賠率低≥0.05",
     ]
     for key in order:
         outcomes = buckets.get(key, [])
@@ -310,7 +312,7 @@ def main():
     args = parser.parse_args()
 
     rows, by_stage, match_info = load(args.input)
-    report = ["# 入球大細主線：馬會 vs 皇冠 分析", ""]
+    report = ["# 入球大細主線：馬會 vs Pinnacle 分析", ""]
     report.append(f"- 原始快照：{len(rows):,} 行，{len({r['match_id'] for r in rows}):,} 場")
     report.append("")
     report += trend_section(by_stage)

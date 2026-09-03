@@ -39,6 +39,7 @@ import {
   listBookmakerRows,
   parseCrown1X2,
   parseCrownAsianTriple,
+  parseCrownOpeningAsianTriple,
   parsePinnacle1X2,
   parsePinnacleAsianTriple,
 } from "../server/providers/pinnacle";
@@ -398,6 +399,25 @@ describe("Pinnacle bookmaker-row identification", () => {
       away: 0.92,
       companyId: "3",
     });
+  });
+
+  it("keeps Crown explicit opening separate from the current Asian triple", () => {
+    expect(parseCrownOpeningAsianTriple(ASIAN_PAGE)).toEqual({
+      home: 0.83,
+      goals: 0.5,
+      away: 0.99,
+      companyId: "3",
+    });
+    expect(parseCrownAsianTriple(ASIAN_PAGE)?.goals).toBe(1);
+  });
+
+  it("does not invent a Crown opening from current-only fields", () => {
+    const currentOnly = ASIAN_PAGE.replace(
+      "<td>0.83</td><td goals=\"0.5\">半球</td><td>0.99</td>",
+      "",
+    );
+    expect(parseCrownOpeningAsianTriple(currentOnly)).toBeNull();
+    expect(parseCrownAsianTriple(currentOnly)).not.toBeNull();
   });
 
   it("selects Crown by name in the 1X2 feed", () => {

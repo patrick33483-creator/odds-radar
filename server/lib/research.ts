@@ -1,5 +1,6 @@
 import type { HkjcProvider } from "../providers/hkjc";
 import { hkjcHktDate } from "../providers/hkjc";
+import { PinnacleProvider } from "../providers/pinnacle";
 import {
   TipsmeOpeningProvider,
   type TipsmeOpeningResult,
@@ -26,12 +27,12 @@ const MAX_LOOKBACK_DAYS = 120;
 const MAX_RESULT_LOOKBACK_DAYS = 30;
 const MAX_EXPORT_ROWS = 100_000;
 const RESEARCH_MARKETS = ["AH", "OU", "COU"] as const;
-const RESEARCH_PROVIDERS = ["hkjc", "pinnacle"] as const;
+const RESEARCH_PROVIDERS = ["hkjc", "pinnacle", "crown"] as const;
 export const RESEARCH_STAGES: ResearchStage[] = ["initial", "T30", "T15", "T5"];
 
 export interface ResearchFilters {
   days: number;
-  provider: "hkjc" | "pinnacle" | "all";
+  provider: ResearchProvider | "all";
   market: "AH" | "OU" | "COU" | "all";
 }
 
@@ -44,7 +45,7 @@ function boundedDays(value: unknown, fallback = DEFAULT_LOOKBACK_DAYS): number {
 
 export function parseResearchFilters(query: Record<string, unknown>): ResearchFilters {
   const provider = RESEARCH_PROVIDERS.includes(String(query.provider) as (typeof RESEARCH_PROVIDERS)[number])
-    ? (String(query.provider) as "hkjc" | "pinnacle")
+    ? (String(query.provider) as ResearchProvider)
     : "all";
   const market = RESEARCH_MARKETS.includes(String(query.market) as (typeof RESEARCH_MARKETS)[number])
     ? (String(query.market) as "AH" | "OU" | "COU")
@@ -75,9 +76,9 @@ export function captureResearchTimelinePrices(
   kickoffUtc: number,
   observedAt: number,
 ): number {
-  if (provider === "crown") return 0;
   const accepted = prices.filter((price) =>
-    RESEARCH_MARKETS.includes(price.market as (typeof RESEARCH_MARKETS)[number]),
+    RESEARCH_MARKETS.includes(price.market as (typeof RESEARCH_MARKETS)[number])
+    && (provider !== "crown" || price.market === "AH" || price.market === "OU"),
   );
   if (!accepted.length) return 0;
 
@@ -148,8 +149,9 @@ export function captureResearchTimelinePrices(
         ).changes;
       }
       const complete = (completeGroups.get(matchId, stage) as { count: number }).count;
-      const status = complete >= RESEARCH_MARKETS.length * RESEARCH_PROVIDERS.length ? "captured" : "partial";
-      const note = status === "captured" ? null : `${complete}/6 provider-market pairs complete`;
+      const expected = expectedPairCount(matchId, stage);
+      const status = complete >= expected ? "captured" : "partial";
+      const note = status === "captured" ? null : `${complete}/${expected} provider-market pairs complete`;
       const retryAt = current?.first_captured_at === null || current?.first_captured_at === undefined
         ? null
         : observedAt;
@@ -205,6 +207,24 @@ function initialPairCount(matchId: string): number {
        HAVING COUNT(DISTINCT selection)>=2
      )`,
   ).get(matchId) as { count: number }).count;
+}
+
+function fixtureIdentity(matchId: string): {
+  fixture_source: "hkjc" | "crown";
+  titan_id: string | null;
+} {
+  return (rawDb.prepare(
+    "SELECT fixture_source,titan_id FROM matches WHERE id=?",
+  ).get(matchId) as { fixture_source: "hkjc" | "crown"; titan_id: string | null } | undefined)
+    ?? { fixture_source: "hkjc", titan_id: null };
+}
+
+/** Number of genuinely supported provider/market pairs for this fixture. */
+export function expectedPairCount(matchId: string, stage: ResearchStage): number {
+  const fixture = fixtureIdentity(matchId);
+  if (fixture.fixture_source === "crown") return 2; // Crown AH + OU only.
+  const base = stage === "initial" ? INITIAL_AVAILABLE_PAIRS : 6;
+  return base + (fixture.titan_id ? 2 : 0);
 }
 
 /** Insert genuine opening rows only; each opening key remains immutable. */
@@ -273,12 +293,77 @@ export function saveResearchInitialSnapshots(
       : null;
     const note = opening.missing.find((item) => item.provider === "pinnacle" && item.market === "COU")?.note
       ?? PINNACLE_COU_NOTE;
+    const expected = expectedPairCount(matchId, "initial");
     updatePoint.run(
       firstCapturedAt,
       retryAt,
       firstCapturedAt,
-      complete >= INITIAL_AVAILABLE_PAIRS ? "captured" : opening.quotes.length ? "partial" : "pending",
+      complete >= expected ? "captured" : opening.quotes.length ? "partial" : "pending",
       note,
+      capturedAt,
+      matchId,
+    );
+  })();
+  return inserted;
+}
+
+/** Immutable explicit Crown opening; current observations are never accepted here. */
+export function saveCrownResearchInitialSnapshots(
+  matchId: string,
+  titanId: string,
+  prices: ProviderPrice[],
+  sourceUrls: { AH: string; OU: string },
+  capturedAt = Date.now(),
+): number {
+  const accepted = prices.filter((price) => price.market === "AH" || price.market === "OU");
+  if (!accepted.length) return 0;
+  const insert = rawDb.prepare(
+    `INSERT OR IGNORE INTO research_timeline_snapshots(
+      match_id,provider,market,stage,line_key,selection,decimal_odds,is_main,
+      source_updated_at,captured_at,target_at,status,origin,source_name,source_match_id,source_url
+    ) VALUES(?,'crown',?,'initial',?,?,?,?,?, ?,NULL,'captured','external_opening','titan007-crown',?,?)`,
+  );
+  const ensurePoint = rawDb.prepare(
+    `INSERT INTO research_timeline_points(
+      match_id,stage,target_at,first_captured_at,last_retry_at,captured_at,status,note,created_at,updated_at
+    ) VALUES(?,'initial',NULL,NULL,NULL,NULL,'pending',NULL,?,?)
+    ON CONFLICT(match_id,stage) DO NOTHING`,
+  );
+  let inserted = 0;
+  rawDb.transaction(() => {
+    ensurePoint.run(matchId, capturedAt, capturedAt);
+    for (const price of accepted) {
+      inserted += insert.run(
+        matchId,
+        price.market,
+        lineKeyOf(price.market, price.lineValue),
+        price.selection,
+        price.decimalOdds,
+        price.isMain ? 1 : 0,
+        price.sourceUpdatedAt ?? null,
+        capturedAt,
+        titanId,
+        sourceUrls[price.market as "AH" | "OU"],
+      ).changes;
+    }
+    const complete = initialPairCount(matchId);
+    const expected = expectedPairCount(matchId, "initial");
+    const point = rawDb.prepare(
+      "SELECT first_captured_at FROM research_timeline_points WHERE match_id=? AND stage='initial'",
+    ).get(matchId) as { first_captured_at: number | null };
+    rawDb.prepare(
+      `UPDATE research_timeline_points
+          SET first_captured_at=COALESCE(first_captured_at,?),
+              captured_at=COALESCE(captured_at,?),
+              last_retry_at=CASE WHEN first_captured_at IS NULL THEN last_retry_at ELSE ? END,
+              status=?,note=?,updated_at=?
+        WHERE match_id=? AND stage='initial'`,
+    ).run(
+      capturedAt,
+      capturedAt,
+      point.first_captured_at === null ? null : capturedAt,
+      complete >= expected ? "captured" : "partial",
+      complete >= expected ? null : `${complete}/${expected} provider-market pairs complete`,
       capturedAt,
       matchId,
     );
@@ -304,6 +389,7 @@ export async function collectResearchInitialSnapshots(
        LEFT JOIN research_timeline_points p
          ON p.match_id=m.id AND p.stage='initial'
       WHERE m.kickoff_utc BETWEEN ? AND ?
+        AND m.fixture_source='hkjc'
         AND COALESCE(p.status,'pending')<>'captured'
       ORDER BY m.kickoff_utc
       LIMIT 500`,
@@ -373,12 +459,13 @@ function collectorStatus(): ResearchResultCollectorStatus {
 export async function collectResearchResults(
   hkjc: HkjcProvider,
   now = Date.now(),
+  titan: Pick<PinnacleProvider, "fetchResults"> = new PinnacleProvider(),
 ): Promise<{ candidates: number; collected: number }> {
   const configuredLookback = Number(process.env.RADAR_RESEARCH_RESULT_LOOKBACK_DAYS ?? 7);
   const lookbackDays = Number.isFinite(configuredLookback)
     ? Math.max(1, Math.min(MAX_RESULT_LOOKBACK_DAYS, Math.floor(configuredLookback)))
     : 7;
-  const candidates = rawDb
+  const hkjcCandidates = rawDb
     .prepare(
       `SELECT m.id, m.hkjc_id, m.kickoff_utc
          FROM matches m
@@ -386,6 +473,8 @@ export async function collectResearchResults(
         WHERE rr.match_id IS NULL
           AND m.kickoff_utc<=?
           AND m.kickoff_utc>=?
+          AND m.fixture_source='hkjc'
+          AND m.hkjc_id IS NOT NULL
         ORDER BY m.kickoff_utc DESC
         LIMIT 500`,
     )
@@ -395,16 +484,29 @@ export async function collectResearchResults(
     kickoff_utc: number;
   }>;
 
+  const crownCandidates = rawDb.prepare(
+    `SELECT m.id,m.titan_id,m.kickoff_utc
+       FROM matches m LEFT JOIN research_results rr ON rr.match_id=m.id
+      WHERE rr.match_id IS NULL AND m.fixture_source='crown' AND m.titan_id IS NOT NULL
+        AND m.kickoff_utc<=? AND m.kickoff_utc>=?
+      ORDER BY m.kickoff_utc DESC LIMIT 500`,
+  ).all(now - RESULT_DELAY_MS, now - lookbackDays * 24 * 60 * 60_000) as Array<{
+    id: string;
+    titan_id: string;
+    kickoff_utc: number;
+  }>;
+  const candidateCount = hkjcCandidates.length + crownCandidates.length;
+
   setState("researchResultsLastRunAt", String(now));
-  if (!candidates.length) {
+  if (!candidateCount) {
     setState("researchResultsLastSuccessAt", String(now));
     setState("researchResultsLastCollected", "0");
     setState("researchResultsLastError", "");
     return { candidates: 0, collected: 0 };
   }
 
-  const byDate = new Map<string, typeof candidates>();
-  for (const candidate of candidates) {
+  const byDate = new Map<string, typeof hkjcCandidates>();
+  for (const candidate of hkjcCandidates) {
     const date = hkjcHktDate(candidate.kickoff_utc);
     if (!date) continue;
     const rows = byDate.get(date) ?? [];
@@ -420,11 +522,12 @@ export async function collectResearchResults(
       );
       const canonicalByHkjc = new Map(rows.map((row) => [row.hkjc_id, row.id]));
       const upsert = rawDb.prepare(
-        `INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,fetched_at)
-         VALUES(?,?,?,?,?,?,?)
+        `INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+         VALUES(?,?,?,?,?,?,?,?,?)
          ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
            away_score=excluded.away_score,corners_total=excluded.corners_total,
-           source=excluded.source,fetched_at=excluded.fetched_at`,
+           source=excluded.source,result_source=excluded.result_source,
+           source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at`,
       );
       const tx = rawDb.transaction(() => {
         for (const result of official) {
@@ -437,6 +540,8 @@ export async function collectResearchResults(
             result.awayScore,
             result.cornersTotal,
             result.source,
+            "hkjc",
+            result.matchId,
             now,
           );
           collected++;
@@ -444,10 +549,39 @@ export async function collectResearchResults(
       });
       tx();
     }
+    if (crownCandidates.length) {
+      const results = await titan.fetchResults(
+        Array.from({ length: lookbackDays + 1 }, (_, index) => -index),
+      );
+      const byTitan = new Map(results.map((result) => [result.providerMatchId, result]));
+      const insertCrown = rawDb.prepare(
+        `INSERT INTO research_results(
+          match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at
+        ) VALUES(?,NULL,?,?,NULL,?,'titan007',?,?)
+        ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+          away_score=excluded.away_score,source=excluded.source,result_source='titan007',
+          source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at`,
+      );
+      rawDb.transaction(() => {
+        for (const candidate of crownCandidates) {
+          const result = byTitan.get(candidate.titan_id);
+          if (!result) continue;
+          insertCrown.run(
+            candidate.id,
+            result.homeScore,
+            result.awayScore,
+            result.source,
+            candidate.titan_id,
+            now,
+          );
+          collected++;
+        }
+      })();
+    }
     setState("researchResultsLastSuccessAt", String(now));
     setState("researchResultsLastCollected", String(collected));
     setState("researchResultsLastError", "");
-    return { candidates: candidates.length, collected };
+    return { candidates: candidateCount, collected };
   } catch (error) {
     setState("researchResultsLastError", (error as Error).message);
     throw error;
@@ -511,10 +645,14 @@ function researchCellStatus(
   targetAt: number | null,
   firstCapturedAt: number | null,
   collectionStartedAt: number | null,
+  fixtureSource: "hkjc" | "crown",
+  titanId: string | null,
 ): ResearchStageSnapshot["cells"][ResearchProvider][ResearchMarket] {
   const pairQuotes = stageQuotes.filter((quote) => quote.provider === provider && quote.market === market);
   if (pairQuotes.length >= 2) return "captured";
   if (pairQuotes.length > 0) return "partial";
+  if (fixtureSource === "crown" && provider !== "crown") return "source_unavailable";
+  if (provider === "crown" && (market === "COU" || titanId === null)) return "source_unavailable";
   if (stage === "initial" && provider === "pinnacle" && market === "COU") return "source_unavailable";
   if (snapshotStatus === "pending") return "pending";
   if (stage === "initial") return firstCapturedAt ? "market_unavailable" : "match_unmatched";
@@ -556,7 +694,7 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
          FROM research_timeline_snapshots q JOIN matches m ON m.id=q.match_id
         WHERE ${clause} GROUP BY q.provider`,
     )
-    .all(...params) as Array<{ name: "hkjc" | "pinnacle"; count: number }>;
+    .all(...params) as Array<{ name: ResearchProvider; count: number }>;
   const marketCounts = rawDb
     .prepare(
       `SELECT q.market name,COUNT(*) count
@@ -603,7 +741,8 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
   };
   const matchRows = rawDb
     .prepare(
-      `SELECT m.id match_id,m.league,m.home_team,m.away_team,m.kickoff_utc,
+      `SELECT m.id match_id,m.hkjc_id,m.fixture_source,m.titan_id,
+              m.league,m.home_team,m.away_team,m.kickoff_utc,
               COUNT(q.id) snapshot_count,MIN(q.captured_at) first_snapshot_at,
               MAX(q.captured_at) last_snapshot_at,
               COALESCE(rr.home_score,r.home_score) home_score,
@@ -646,7 +785,7 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
     const matchId = String(row.match_id);
     const quotes = quotesByMatch.get(matchId) ?? [];
     quotes.push({
-      provider: String(row.provider) as "hkjc" | "pinnacle",
+      provider: String(row.provider) as ResearchProvider,
       market: String(row.market) as "AH" | "OU" | "COU",
       stage: String(row.stage) as ResearchStage,
       lineKey: String(row.line_key),
@@ -698,8 +837,15 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
       const matchId = String(row.match_id);
       const kickoffUtc = Number(row.kickoff_utc);
       const quotes = quotesByMatch.get(matchId) ?? [];
+      const fixtureSource = String(row.fixture_source) as "hkjc" | "crown";
+      const hkjcId = row.hkjc_id === null || row.hkjc_id === undefined ? null : String(row.hkjc_id);
+      const titanId = row.titan_id === null || row.titan_id === undefined ? null : String(row.titan_id);
       return {
         matchId,
+        fixtureKey: titanId ? `titan:${titanId}` : `hkjc:${hkjcId}`,
+        fixtureSource,
+        hkjcId,
+        titanId,
         league: String(row.league),
         homeTeam: String(row.home_team),
         awayTeam: String(row.away_team),
@@ -740,6 +886,8 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
                       targetAt,
                       firstCapturedAt,
                       collectionStartedAt,
+                      fixtureSource,
+                      titanId,
                     ),
                   ]),
                 ),
@@ -792,11 +940,15 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
     const { clause: matchClause, params: matchParams } = matchFilterSql(filters, now);
     const rows = rawDb
       .prepare(
-        `SELECT DISTINCT m.id,m.hkjc_id,m.league,m.home_team,m.away_team,m.kickoff_utc,
+        `SELECT DISTINCT m.id,m.hkjc_id,m.fixture_source,m.titan_id,
+                CASE WHEN m.titan_id IS NOT NULL THEN 'titan:'||m.titan_id ELSE 'hkjc:'||m.hkjc_id END fixture_key,
+                m.league,m.home_team,m.away_team,m.kickoff_utc,
                 COALESCE(rr.home_score,r.home_score) home_score,
                 COALESCE(rr.away_score,r.away_score) away_score,
                 COALESCE(rr.corners_total,r.corners_total) corners_total,
                 COALESCE(rr.source,r.source) source,
+                COALESCE(rr.result_source,rr.source,r.source) result_source,
+                rr.source_match_id,
                 COALESCE(rr.fetched_at,r.fetched_at) fetched_at
            FROM matches m
            LEFT JOIN research_timeline_snapshots q ON q.match_id=m.id
@@ -808,9 +960,12 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
       )
       .all(...matchParams, MAX_EXPORT_ROWS) as Array<Record<string, unknown>>;
     return toCsv(
-      ["match_id", "hkjc_id", "league", "home_team", "away_team", "kickoff_utc", "home_score", "away_score", "corners_total", "source", "fetched_at"],
+      ["fixture_key", "match_id", "fixture_source", "titan_id", "hkjc_id", "league", "home_team", "away_team", "kickoff_utc", "home_score", "away_score", "corners_total", "source", "result_source", "source_match_id", "fetched_at"],
       rows.map((row) => [
+        row.fixture_key,
         row.id,
+        row.fixture_source,
+        row.titan_id,
         row.hkjc_id,
         row.league,
         row.home_team,
@@ -820,6 +975,8 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
         row.away_score,
         row.corners_total,
         row.source,
+        row.result_source,
+        row.source_match_id,
         row.fetched_at,
       ]),
     );
@@ -827,7 +984,9 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
 
   const rows = rawDb
     .prepare(
-      `SELECT q.id,q.match_id,m.hkjc_id,m.league,m.home_team,m.away_team,m.kickoff_utc,
+      `SELECT q.id,q.match_id,m.hkjc_id,m.fixture_source,m.titan_id,
+              CASE WHEN m.titan_id IS NOT NULL THEN 'titan:'||m.titan_id ELSE 'hkjc:'||m.hkjc_id END fixture_key,
+              m.league,m.home_team,m.away_team,m.kickoff_utc,
               q.provider,q.market,q.stage,q.target_at,q.line_key,q.selection,q.decimal_odds,
               q.is_main,q.source_updated_at,q.captured_at,p.first_captured_at,p.last_retry_at,
               q.status,q.origin,q.source_name,
@@ -841,10 +1000,13 @@ export function researchCsv(kind: "timeline" | "results", filters: ResearchFilte
     )
     .all(...params, MAX_EXPORT_ROWS) as Array<Record<string, unknown>>;
   return toCsv(
-    ["id", "match_id", "hkjc_id", "league", "home_team", "away_team", "kickoff_utc", "provider", "market", "stage", "target_at", "line_key", "selection", "decimal_odds", "is_main", "source_updated_at", "captured_at", "first_captured_at", "last_retry_at", "status", "origin", "source_name", "source_match_id", "source_url"],
+    ["id", "fixture_key", "match_id", "fixture_source", "titan_id", "hkjc_id", "league", "home_team", "away_team", "kickoff_utc", "provider", "market", "stage", "target_at", "line_key", "selection", "decimal_odds", "is_main", "source_updated_at", "captured_at", "first_captured_at", "last_retry_at", "status", "origin", "source_name", "source_match_id", "source_url"],
     rows.map((row) => [
       row.id,
+      row.fixture_key,
       row.match_id,
+      row.fixture_source,
+      row.titan_id,
       row.hkjc_id,
       row.league,
       row.home_team,

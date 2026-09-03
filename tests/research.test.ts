@@ -137,7 +137,7 @@ describe("research data collection", () => {
       lastSnapshotAt: null,
     });
     expect(researchCsv("results", { days: 7, provider: "all", market: "all" })).toContain(
-      "research-only,123,研究聯賽,主隊,客隊",
+      "hkjc:123,research-only,hkjc,,123,研究聯賽,主隊,客隊",
     );
   });
 

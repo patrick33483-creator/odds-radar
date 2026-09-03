@@ -107,19 +107,17 @@ function installAutoWindowScan(): void {
   const tick = () => {
     void tickGate.run(async () => {
       try {
-        if (engine.scanConfigInfo().simulationTargetReached) {
-          const outcome = await engine.runResearchTimelineTick();
-          console.log(
-            JSON.stringify({
-              ts: new Date().toISOString(),
-              scope: "radar",
-              event: "auto_research_timeline",
-              selected: outcome.selected,
-              detailCalls: outcome.detailCalls,
-            }),
-          );
-          return;
-        }
+        const research = await engine.runResearchTimelineTick();
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            scope: "radar",
+            event: "auto_research_timeline",
+            selected: research.selected,
+            detailCalls: research.detailCalls,
+          }),
+        );
+        if (engine.scanConfigInfo().simulationTargetReached) return;
         const inWindow = engine.windowPreview();
         if (!inWindow.length) return;
         const outcome = await engine.runScan();
