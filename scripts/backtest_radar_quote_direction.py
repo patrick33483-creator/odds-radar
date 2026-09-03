@@ -581,6 +581,12 @@ def markdown(report: dict[str, Any]) -> str:
     lines += ["", "## 排除與前瞻規則", ""]
     for key, value in sorted(cov["exclusions"].items()):
         lines.append(f"- 排除／診斷 `{key}`：{value}")
+    lines += ["", "### 可用完整主線格數（fixture 數）"]
+    for key, value in sorted(cov["main_complete_two_sided_cells"].items()):
+        lines.append(f"- `{key}`：{value}")
+    lines += ["", "### 原始列分布（stage｜origin｜provider｜market）"]
+    for key, value in sorted(cov["raw_rows_by_stage_origin_provider_market"].items()):
+        lines.append(f"- `{key}`：{value}")
     lines += [
         "- 無可靠正式 score、無完整雙邊、不能解讀 line/selection、非真初盤或開賽後報價均已排除。",
         "- 前瞻只應固定本報告已選政策、以 T30 價格下單（本回測沒有下單或通知），累積至少 50 個新 holdout fixtures 才重評；100 場前不可把單聯賽視為獨立候選。",
@@ -600,6 +606,14 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     all_bets = [b for _, bets in family_bets for b in bets]
     periods = [f["kickoff_utc"] for f in fixtures]
+    main_cells = Counter()
+    for fixture in fixtures:
+        for stage, provider, market in fixture["main"]:
+            main_cells[f"{fixture['cohort']}|{stage}|{provider}|{market}"] += 1
+    raw_shape = Counter(
+        f"{str(row.get('stage'))}|{str(row.get('origin'))}|{str(row.get('provider'))}|{str(row.get('market'))}"
+        for row in rows
+    )
     report = {
         "audit": {"read_only": True, "decision_checkpoint": "T30", "t5_use": "confirmation only, never T30 selection",
                   "clv": "unavailable: no independently captured closing quote in export"},
@@ -607,6 +621,8 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "raw_quote_rows": len(rows), "settled_fixtures": len(fixtures),
             "data_period_utc": None if not periods else f"{datetime.fromtimestamp(min(periods)/1000, UTC).isoformat()} 至 {datetime.fromtimestamp(max(periods)/1000, UTC).isoformat()}",
             "fixtures_by_cohort": dict(Counter(f["cohort"] for f in fixtures)), "exclusions": exclusions,
+            "main_complete_two_sided_cells": dict(sorted(main_cells.items())),
+            "raw_rows_by_stage_origin_provider_market": dict(sorted(raw_shape.items())),
         },
         "families": [evaluate(fixtures, bets, family, universe) for family, bets in family_bets],
         "league_summary": league_table(all_bets),
