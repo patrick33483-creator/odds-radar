@@ -1,0 +1,51 @@
+name: Cleanup production droplet disk
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+      - name: Report disk usage then clean caches and old backups
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          df -h /
+          echo "--- /opt/odds-radar/backups ---"
+          sudo ls -lh /opt/odds-radar/backups 2>/dev/null | tail -20 || true
+          echo "--- docker system df ---"
+          sudo docker system df || true
+
+          echo "=== CLEANUP ==="
+          sudo find /opt/odds-radar/backups -maxdepth 1 -name 'pre-deploy-*.sql.gz.partial' -print -delete 2>/dev/null || true
+          # Keep only 3 most recent full backups
+          sudo sh -c "ls -1t /opt/odds-radar/backups/pre-deploy-*.sql.gz 2>/dev/null | tail -n +4 | xargs -r rm -v -f" || true
+          sudo sh -c "ls -1t /opt/odds-radar/backups/pre-deploy-*.db 2>/dev/null | xargs -r rm -v -f" || true
+          sudo docker image prune -af || true
+          sudo docker builder prune -af || true
+          sudo docker container prune -f || true
+          sudo journalctl --vacuum-time=3d || true
+          sudo apt-get clean || true
+
+          echo "=== AFTER ==="
+          df -h /
+          echo "--- /opt/odds-radar/backups ---"
+          sudo ls -lh /opt/odds-radar/backups 2>/dev/null | tail -10 || true
+          REMOTE
