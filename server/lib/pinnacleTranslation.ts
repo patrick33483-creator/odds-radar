@@ -10,6 +10,8 @@
  *   2. OpticOdds `/fixtures/active` (may carry a locale-tagged Chinese label; we
  *      currently only ever return English so this path tolerates full-null
  *      output but still records the attempt).
+ *   3. Wikidata entity search + Traditional-Chinese labels, only when the first
+ *      two sources return no Chinese field.
  *
  * If neither source resolves the fixture, the caller is expected to invoke
  * `markPinnacleTranslationAttempt` so retry backoff can suppress the next
@@ -19,13 +21,17 @@
 
 import type { PinnacleProvider, PinnacleFixture } from "../providers/pinnacle";
 import type { OpticOddsProvider } from "../providers/opticodds";
+import {
+  WikidataLookupBudgetExhaustedError,
+  type WikidataEntityLookup,
+} from "./wikidataTranslation";
 
 export interface TranslationResult {
   pinnapiId: string;
   zhHome: string | null;
   zhAway: string | null;
   zhLeague: string | null;
-  source: "titan" | "optic";
+  source: "titan" | "optic" | "wikidata";
 }
 
 export interface TranslationInput {
@@ -39,6 +45,7 @@ export interface TranslationInput {
 export interface TranslationDeps {
   pinnacle: Pick<PinnacleProvider, "fetchTitanResearchFixtures">;
   optic?: { fetchFixtures: OpticOddsProvider["fetchFixtures"] };
+  wikidata?: WikidataEntityLookup;
 }
 
 const KICKOFF_TOLERANCE_MS = 30 * 60_000;
@@ -129,8 +136,8 @@ export function findFuzzyMatch<T extends FuzzyCandidate>(
 }
 
 /**
- * Try titan007 then OpticOdds. Return null when neither yields at least one
- * non-empty Chinese field. The caller records the attempt separately so a
+ * Try titan007, then OpticOdds, then Wikidata. Return null when none yields at
+ * least one non-empty Chinese field. The caller records the attempt separately so a
  * successful fetch that only carries `zh_league` still short-circuits future
  * retries once the row exists.
  */
@@ -181,6 +188,30 @@ export async function translatePinnacleFixture(
       }
     } catch {
       // optic is also best-effort.
+    }
+  }
+
+  if (deps.wikidata) {
+    // Entity lookups are independent and the resolver enforces a process-wide
+    // three-request semaphore plus a tick-scoped distinct-entity budget.
+    const [home, away, league] = await Promise.all([
+      deps.wikidata.lookup(fixture.homeTeam, "team"),
+      deps.wikidata.lookup(fixture.awayTeam, "team"),
+      deps.wikidata.lookup(fixture.league, "league"),
+    ]);
+    if (deps.wikidata.wasBudgetExhausted?.()) {
+      // Do not turn a deliberate per-tick cap into a fixture-level failed
+      // attempt/backoff. Cached successes remain available on the next tick.
+      throw new WikidataLookupBudgetExhaustedError();
+    }
+    if (home || away || league) {
+      return {
+        pinnapiId: fixture.pinnapiId,
+        zhHome: home?.label ?? null,
+        zhAway: away?.label ?? null,
+        zhLeague: league?.label ?? null,
+        source: "wikidata",
+      };
     }
   }
 

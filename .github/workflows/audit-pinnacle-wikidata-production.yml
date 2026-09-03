@@ -1,0 +1,141 @@
+name: Audit Pinnacle Wikidata production (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Report translation schema, coverage and runtime health
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          AUDIT_COMMIT="$(git rev-parse HEAD)"
+          sudo env AUDIT_COMMIT="$AUDIT_COMMIT" python3 - <<'PY'
+          import json, os, re, sqlite3, subprocess
+
+          def command(*args):
+              return subprocess.run(args, text=True, capture_output=True, check=False)
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True, timeout=2)
+          db.row_factory = sqlite3.Row
+          db.execute("PRAGMA query_only=ON")
+          db.execute("PRAGMA busy_timeout=2000")
+          def rows(sql, params=()):
+              return [dict(row) for row in db.execute(sql, params).fetchall()]
+          def scalar(sql, params=()):
+              row = db.execute(sql, params).fetchone()
+              return row[0] if row else None
+
+          commit = os.environ["AUDIT_COMMIT"]
+          container_id = command("docker", "compose", "ps", "-aq", "radar").stdout.strip()
+          inspect = command("docker", "inspect", "--format",
+                            "{{json .State}}", container_id)
+          try:
+              container_state = json.loads(inspect.stdout)
+          except Exception:
+              container_state = {"inspect_error": inspect.stderr.strip()}
+          logs = command("docker", "compose", "logs", "--since", "24h", "--no-color", "radar")
+          log_lines = logs.stdout.splitlines() + logs.stderr.splitlines()
+
+          translation_sql = scalar(
+              "SELECT sql FROM sqlite_master WHERE type='table' AND name='pinnacle_translations'"
+          )
+          entity_sql = scalar(
+              "SELECT sql FROM sqlite_master WHERE type='table' AND name='pinnacle_translation_entities'"
+          )
+          source_check = None
+          if translation_sql:
+              match = re.search(r"CHECK\s*\(\s*source\s+IN\s*\(([^)]*)\)", translation_sql, re.I)
+              source_check = match.group(1) if match else None
+
+          report = {
+              "production_commit": commit,
+              "container_state": container_state,
+              "pinnacle_translations_source_check": source_check,
+              "pinnacle_translations_schema": translation_sql,
+              "entity_cache_schema": entity_sql,
+              "fixture_translations_total": scalar("SELECT COUNT(*) FROM pinnacle_translations"),
+              "fixture_translations_with_zh_home": scalar(
+                  "SELECT COUNT(*) FROM pinnacle_translations WHERE zh_home IS NOT NULL AND zh_home<>''"
+              ),
+              "fixture_source_breakdown": rows(
+                  """SELECT source,COUNT(*) AS rows,
+                            SUM(CASE WHEN zh_home IS NOT NULL AND zh_home<>'' THEN 1 ELSE 0 END) AS with_zh_home
+                       FROM pinnacle_translations GROUP BY source ORDER BY source"""
+              ),
+              "entity_cache_counts": rows(
+                  """SELECT entity_type,
+                            COUNT(*) AS rows,
+                            SUM(CASE WHEN zh_label IS NOT NULL AND zh_label<>'' THEN 1 ELSE 0 END) AS successes,
+                            SUM(CASE WHEN zh_label IS NULL THEN 1 ELSE 0 END) AS failures
+                       FROM pinnacle_translation_entities GROUP BY entity_type ORDER BY entity_type"""
+              ) if entity_sql else [],
+              "english_chinese_samples": rows(
+                  """SELECT m.home_team AS en_home,pt.zh_home,
+                            m.away_team AS en_away,pt.zh_away,
+                            m.league AS en_league,pt.zh_league,
+                            pt.source,pt.pinnapi_id
+                       FROM pinnacle_translations pt
+                       JOIN matches m
+                         ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
+                      WHERE pt.zh_home IS NOT NULL
+                      ORDER BY pt.updated_at DESC LIMIT 5"""
+              ),
+              "latest_fixture_translation_errors": rows(
+                  """SELECT pinnapi_id,source,attempt_count,attempted_at,last_error
+                       FROM pinnacle_translations
+                      WHERE last_error IS NOT NULL
+                      ORDER BY attempted_at DESC LIMIT 10"""
+              ),
+              "latest_entity_errors": rows(
+                  """SELECT normalized_name,entity_type,attempt_count,attempted_at,last_error
+                       FROM pinnacle_translation_entities
+                      WHERE last_error IS NOT NULL
+                      ORDER BY attempted_at DESC LIMIT 10"""
+              ) if entity_sql else [],
+              "simulation": {
+                  "configured_cap": 30,
+                  "active_rows": scalar(
+                      "SELECT COUNT(*) FROM simulation_bets WHERE excluded_from_stats=0"
+                  ),
+                  "over_cap": scalar(
+                      "SELECT COUNT(*)>30 FROM simulation_bets WHERE excluded_from_stats=0"
+                  ),
+              },
+              "crown_runtime_events_last_24h": [
+                  line[-1200:] for line in log_lines
+                  if re.search(r"crown", line, re.I)
+              ][-30:],
+              "ou_errors_last_24h": [
+                  line[-1200:] for line in log_lines
+                  if re.search(r"ou", line, re.I) and re.search(r"error|fail", line, re.I)
+              ][-30:],
+          }
+          print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+          if report["fixture_translations_with_zh_home"] == 0:
+              raise SystemExit("AUDIT FAILURE: zh_home remains zero")
+          if source_check is None or "wikidata" not in source_check.lower():
+              raise SystemExit("AUDIT FAILURE: source CHECK does not include wikidata")
+          if report["simulation"]["over_cap"]:
+              raise SystemExit("AUDIT FAILURE: simulation rows exceed cap 30")
+          PY
+          REMOTE
