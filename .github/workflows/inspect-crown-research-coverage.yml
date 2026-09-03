@@ -1,10 +1,13 @@
-name: Inspect Crown research coverage
+name: Audit Pinnacle production health (read-only)
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  inspect:
+  audit:
     runs-on: ubuntu-24.04
     steps:
       - name: Configure SSH
@@ -16,92 +19,48 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
-
-      - name: Read future Crown research coverage
+      - name: Read Pinnacle and scan state without modifying production
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh -o BatchMode=yes -o ConnectTimeout=20 \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            'sudo python3 -' <<'PY'
-          import datetime
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          commit="$(git rev-parse HEAD)"
+          container_id="$(sudo docker compose ps -aq radar)"
+          health="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id")"
+          log_lines="$(sudo docker compose logs --tail 900 radar 2>&1 || true)"
+          COMMIT="$commit" HEALTH="$health" LOG_LINES="$log_lines" python3 - <<'PY'
           import json
+          import os
+          import re
           import sqlite3
-          import time
 
-          now = int(time.time() * 1000)
-          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
-          db.row_factory = sqlite3.Row
-          row = db.execute(
-              """
-              SELECT
-                COUNT(*) AS future_total,
-                SUM(CASE WHEN fixture_source='crown' THEN 1 ELSE 0 END) AS crown_only,
-                SUM(CASE WHEN titan_id IS NOT NULL THEN 1 ELSE 0 END) AS titan_total,
-                SUM(CASE WHEN titan_id IS NOT NULL AND EXISTS (
-                  SELECT 1
-                    FROM research_timeline_snapshots s
-                   WHERE s.match_id=m.id
-                     AND s.provider='crown'
-                     AND s.stage='initial'
-                     AND s.origin='external_opening'
-                   GROUP BY s.match_id
-                  HAVING COUNT(DISTINCT s.market)>=2
-                ) THEN 1 ELSE 0 END) AS crown_opening_complete,
-                SUM(CASE WHEN titan_id IS NOT NULL AND NOT EXISTS (
-                  SELECT 1
-                    FROM research_timeline_snapshots s
-                   WHERE s.match_id=m.id
-                     AND s.provider='crown'
-                     AND s.stage='initial'
-                     AND s.origin='external_opening'
-                   GROUP BY s.match_id
-                  HAVING COUNT(DISTINCT s.market)>=2
-                ) THEN 1 ELSE 0 END) AS crown_opening_missing
-              FROM matches m
-              WHERE kickoff_utc>?
-              """,
-              (now,),
-          ).fetchone()
-          tables = {
-              item["name"]
-              for item in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-          }
-          attempts = 0
-          if "crown_research_attempts" in tables:
-              attempts = db.execute(
-                  """
-                  SELECT COUNT(*)
-                    FROM crown_research_attempts a
-                    JOIN matches m ON m.titan_id=a.titan_id
-                   WHERE m.kickoff_utc>?
-                  """,
-                  (now,),
-              ).fetchone()[0]
-          contamination = {}
-          for table in (
-              "odds_latest",
-              "odds_snapshots",
-              "market_lines",
-              "opportunities",
-              "simulation_bets",
-              "ou_signal_prealerts",
-              "ou_signal_observations",
-          ):
-              contamination[table] = db.execute(
-                  f"""
-                  SELECT COUNT(*)
-                    FROM {table} x
-                    JOIN matches m ON m.id=x.match_id
-                   WHERE m.fixture_source='crown'
-                  """
-              ).fetchone()[0]
-          print(json.dumps({
-              "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              **dict(row),
-              "future_attempted": attempts,
-              "execution_contamination": contamination,
-          }, sort_keys=True))
+          db = sqlite3.connect('file:/opt/odds-radar/data/data.db?mode=ro', uri=True, timeout=1)
+          db.execute('PRAGMA query_only=ON')
+          db.execute('PRAGMA busy_timeout=1000')
+          scalar = lambda sql, params=(): db.execute(sql, params).fetchone()[0]
+          states = dict(db.execute("SELECT key,value FROM app_state WHERE key IN ('lastScan','researchResultsLastRunAt','researchOpeningsLastRunAt','crownBackfillLastRunAt','crownBackfillLastSuccessAt','crownBackfillLastError')").fetchall())
+          provider_health = db.execute("SELECT provider,ok,last_success_at,last_attempt_at,last_error_at,last_error,consecutive_failures,item_count,mode FROM provider_health WHERE provider IN ('hkjc','pinnacle') ORDER BY provider").fetchall()
+          quote_latest = db.execute("SELECT provider,COUNT(*) rows,MAX(fetched_at) max_fetched_at,MIN(fetched_at) min_fetched_at FROM odds_latest WHERE provider IN ('hkjc','pinnacle','crown') GROUP BY provider ORDER BY provider").fetchall()
+          snapshot_latest = db.execute("SELECT provider,COUNT(*) rows,MAX(fetched_at) max_fetched_at FROM odds_snapshots WHERE provider IN ('hkjc','pinnacle','crown') GROUP BY provider ORDER BY provider").fetchall()
           db.close()
+          interesting = []
+          for line in os.environ.get('LOG_LINES','').splitlines():
+              if any(token in line for token in ('pinnapi_fixtures_error','pinnacle_detail_error','pinnacle_detail_scan','auto_research_timeline','auto_window_scan','window_scan','crown_research_detail_error','today_crown_backfill')):
+                  interesting.append(re.sub(r'\x1b\[[0-9;]*m', '', line))
+          print(json.dumps({
+              'read_only_connection': True,
+              'production_commit': os.environ['COMMIT'],
+              'radar_health': os.environ['HEALTH'],
+              'odds_latest_by_provider': [dict(zip(('provider','rows','max_fetched_at','min_fetched_at'), row)) for row in quote_latest],
+              'odds_snapshots_by_provider': [dict(zip(('provider','rows','max_fetched_at'), row)) for row in snapshot_latest],
+              'pinnacle_odds_latest_max_fetched_at': scalar("SELECT MAX(fetched_at) FROM odds_latest WHERE provider='pinnacle'"),
+              'pinnacle_odds_snapshots_max_fetched_at': scalar("SELECT MAX(fetched_at) FROM odds_snapshots WHERE provider='pinnacle'"),
+              'provider_health': [dict(zip(('provider','ok','last_success_at','last_attempt_at','last_error_at','last_error','consecutive_failures','item_count','mode'), row)) for row in provider_health],
+              'app_state': states,
+              'interesting_container_log_lines_last_900': interesting[-80:],
+          }, ensure_ascii=False, sort_keys=True))
           PY
+          REMOTE
