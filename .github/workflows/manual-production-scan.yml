@@ -1,4 +1,4 @@
-name: 皇冠研究時間線覆蓋（只讀）
+name: 皇冠賽事日期分佈（只讀）
 
 on:
   workflow_dispatch:
@@ -17,63 +17,35 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 統計皇冠各階段覆蓋
+      - name: 統計每日皇冠賽事及初盤覆蓋
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
           import sqlite3, time
-
           db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
-          now = int(time.time() * 1000)
-          for days in (1, 3, 7):
-              cutoff = now + days * 86400000
-              count = db.execute(
-                  "SELECT COUNT(*) FROM matches WHERE fixture_source='crown' "
-                  "AND kickoff_utc BETWEEN ? AND ?",
-                  (now, cutoff),
-              ).fetchone()[0]
-              print(f"CROWN_NEXT_{days}D={count}")
-          print("SNAPSHOTS_BY_STAGE=")
-          for row in db.execute(
-              "SELECT stage,COUNT(*),COUNT(DISTINCT match_id) "
-              "FROM research_timeline_snapshots WHERE provider='crown' "
-              "GROUP BY stage ORDER BY stage"
-          ):
-              print("|".join(map(str, row)))
-          next7 = now + 7 * 86400000
-          coverage = db.execute(
-              "SELECT COUNT(*),"
-              "SUM(EXISTS(SELECT 1 FROM research_timeline_snapshots s "
-              "WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial')),"
-              "SUM(EXISTS(SELECT 1 FROM research_timeline_snapshots s "
-              "WHERE s.match_id=m.id AND s.provider='crown')) "
-              "FROM matches m WHERE m.fixture_source='crown' "
-              "AND m.kickoff_utc BETWEEN ? AND ?",
-              (now, next7),
+          rows = db.execute(
+              """
+              SELECT strftime('%Y-%m-%d', datetime(kickoff_utc/1000, 'unixepoch', '+8 hours')) day,
+                     fixture_source,
+                     COUNT(*) total,
+                     SUM(CASE WHEN EXISTS(
+                       SELECT 1 FROM research_timeline_snapshots s
+                        WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial'
+                        GROUP BY s.match_id HAVING COUNT(DISTINCT s.market)>=2
+                     ) THEN 1 ELSE 0 END) opening_ok
+                FROM matches m
+               WHERE kickoff_utc>=?
+               GROUP BY day, fixture_source
+               ORDER BY day, fixture_source
+              """,
+              (int(time.time() * 1000),),
+          ).fetchall()
+          for row in rows:
+              print("DAY|" + "|".join(str(x) for x in row))
+          span = db.execute(
+              "SELECT MIN(kickoff_utc), MAX(kickoff_utc) FROM matches WHERE fixture_source='crown'"
           ).fetchone()
-          print("NEXT7_TOTAL_INITIAL_ANY=" + "|".join(map(str, coverage)))
-          print("POINT_STATUS=")
-          for row in db.execute(
-              "SELECT p.stage,p.status,COUNT(*) FROM research_timeline_points p "
-              "JOIN matches m ON m.id=p.match_id "
-              "WHERE m.fixture_source='crown' AND m.kickoff_utc BETWEEN ? AND ? "
-              "GROUP BY p.stage,p.status ORDER BY p.stage,p.status",
-              (now, next7),
-          ):
-              print("|".join(map(str, row)))
-          print("MISSING_INITIAL_SAMPLE=")
-          for row in db.execute(
-              "SELECT m.id,m.league,m.home_team,m.away_team,m.kickoff_utc,"
-              "(SELECT COUNT(*) FROM research_timeline_snapshots s "
-              " WHERE s.match_id=m.id AND s.provider='crown') "
-              "FROM matches m WHERE m.fixture_source='crown' "
-              "AND m.kickoff_utc BETWEEN ? AND ? "
-              "AND NOT EXISTS(SELECT 1 FROM research_timeline_snapshots s "
-              " WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial') "
-              "ORDER BY m.kickoff_utc LIMIT 20",
-              (now, next7),
-          ):
-              print("|".join(map(str, row)))
+          print(f"CROWN_MIN={span[0]}\nCROWN_MAX={span[1]}")
           PY
