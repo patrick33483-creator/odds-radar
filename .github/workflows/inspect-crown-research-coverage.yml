@@ -24,8 +24,7 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          set -o pipefail
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE' | tee "$RUNNER_TEMP/phase1-production-audit.txt"
+          result="$(ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/odds-radar
           commit="$(git rev-parse HEAD)"
@@ -84,8 +83,10 @@ jobs:
           }, ensure_ascii=False, sort_keys=True))
           PY
           REMOTE
+          )"
+          printf '%s\n' "$result"
           {
             printf '%s\n\n```text\n' '## Phase 1 read-only production audit'
-            cat "$RUNNER_TEMP/phase1-production-audit.txt"
+            printf '%s\n' "$result"
             printf '\n```\n'
           } >> "$GITHUB_STEP_SUMMARY"
