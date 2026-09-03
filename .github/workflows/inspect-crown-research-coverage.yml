@@ -62,6 +62,24 @@ jobs:
               "FROM pinnacle_translations pt JOIN matches m ON m.id='pinnacle:'||pt.pinnapi_id "
               "WHERE pt.zh_home IS NOT NULL AND trim(pt.zh_home)<>'' ORDER BY random() LIMIT 3"
           ).fetchall() if translation_table_exists else []
+          # Estimate how much of the live Pinnacle-only card can be translated
+          # through the already-learned HKJC↔Pinnacle alias graph.
+          import unicodedata
+          def norm_name(v):
+              return ''.join(ch.lower() for ch in unicodedata.normalize('NFKC', v or '') if ch.isalnum())
+          alias_rows = db.execute("SELECT canonical,alias,provider FROM team_aliases").fetchall()
+          pinnacle_to_canonical = {norm_name(alias): canonical for canonical,alias,provider in alias_rows if provider == 'pinnacle'}
+          canonical_to_zh = {}
+          for canonical,alias,provider in alias_rows:
+              if provider == 'hkjc' and re.search(r'[\u3400-\u9fff]', alias or ''):
+                  canonical_to_zh.setdefault(canonical, alias)
+          po_rows = db.execute("SELECT id,home_team,away_team,league FROM matches WHERE fixture_source='pinnacle'").fetchall()
+          alias_translatable = []
+          for mid,home,away,league in po_rows:
+              zh_home = canonical_to_zh.get(pinnacle_to_canonical.get(norm_name(home), ''))
+              zh_away = canonical_to_zh.get(pinnacle_to_canonical.get(norm_name(away), ''))
+              if zh_home or zh_away:
+                  alias_translatable.append((mid,home,away,league,zh_home,zh_away))
           pinnacle_only_snapshots = db.execute(
               "SELECT stage, COUNT(*) FROM research_timeline_snapshots s JOIN matches m ON m.id=s.match_id "
               "WHERE m.fixture_source='pinnacle' AND s.provider='pinnacle' GROUP BY stage ORDER BY stage"
@@ -113,6 +131,9 @@ jobs:
               'pinnacle_translation_rows': translation_rows,
               'pinnacle_translation_zh_home_rows': translation_zh_home_rows,
               'pinnacle_translation_samples': [dict(zip(('en_home','en_away','en_league','zh_home','zh_away','zh_league','source'), row)) for row in translation_samples],
+              'pinnacle_alias_translatable_rows': len(alias_translatable),
+              'pinnacle_alias_translatable_both_teams': sum(1 for row in alias_translatable if row[4] and row[5]),
+              'pinnacle_alias_translation_samples': [dict(zip(('match_id','en_home','en_away','league','zh_home','zh_away'), row)) for row in alias_translatable[:5]],
               'simulation_bets_included': simulation_bets,
               'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
           }, ensure_ascii=False, sort_keys=False))
