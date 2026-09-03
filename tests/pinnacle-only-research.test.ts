@@ -57,6 +57,7 @@ afterEach(() => {
   rawDb.prepare("DELETE FROM opportunities").run();
   rawDb.prepare("DELETE FROM simulation_bets").run();
   rawDb.prepare("DELETE FROM matches").run();
+  rawDb.prepare("DELETE FROM pinnacle_translations").run();
 });
 
 type Side = "O" | "U";
@@ -395,5 +396,61 @@ describe("Pinnacle-only fixtures appear in the research dataset + CSV", () => {
       line.includes(",pinnacle,") && line.includes("pinnacle:evt-csv"),
     );
     expect(hasPinnacleOnly).toBe(true);
+  });
+});
+
+describe("pinnacle_translations join into research dataset", () => {
+  function insertTranslation(pinnapiId: string, zhHome: string | null, zhAway: string | null, zhLeague: string | null): void {
+    rawDb.prepare(
+      `INSERT OR REPLACE INTO pinnacle_translations(pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error)
+       VALUES(?,?,?,?,?,?,?,?,NULL)`,
+    ).run(pinnapiId, zhHome, zhAway, zhLeague, "titan", Date.now(), Date.now(), 1);
+  }
+
+  it("returns Chinese team + league from pinnacle_translations when present", () => {
+    const kickoff = NOW + 60 * 60_000;
+    addPinnacleOnlyFixture("pinnacle:evt-trans-a", kickoff);
+    addStage("pinnacle:evt-trans-a", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
+    insertTranslation("evt-trans-a", "阿仙奴", "利物浦", "英超");
+
+    const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
+    const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-a");
+    expect(row).toBeDefined();
+    expect(row!.homeTeam).toBe("阿仙奴");
+    expect(row!.awayTeam).toBe("利物浦");
+    expect(row!.league).toBe("英超");
+  });
+
+  it("falls back to English fields on the matches row when no translation exists", () => {
+    const kickoff = NOW + 60 * 60_000;
+    addPinnacleOnlyFixture("pinnacle:evt-trans-b", kickoff);
+    addStage("pinnacle:evt-trans-b", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
+    // no insertTranslation call
+
+    const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
+    const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-b");
+    expect(row).toBeDefined();
+    // addPinnacleOnlyFixture writes "<id>主" / "<id>客" as English placeholders and
+    // "Pinn聯" as league; these must survive when no translation row exists.
+    expect(row!.homeTeam).toBe("pinnacle:evt-trans-b主");
+    expect(row!.awayTeam).toBe("pinnacle:evt-trans-b客");
+    expect(row!.league).toBe("Pinn聯");
+  });
+
+  it("does not touch HKJC-linked fixture display fields even when a stray translation row exists", () => {
+    const kickoff = NOW + 60 * 60_000;
+    addHkjcFixture("hkjc:evt-trans-c", kickoff);
+    addStage("hkjc:evt-trans-c", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
+    // Intentionally seed a pinnapi_id that would collide with the numeric-only
+    // trailing digits of the HKJC id to prove the join is scoped to
+    // fixture_source='pinnacle'.
+    insertTranslation("evt-trans-c", "不應該覆蓋", "不應該覆蓋", "不應該覆蓋");
+
+    const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
+    const row = ds.matches.find((m) => m.matchId === "hkjc:evt-trans-c");
+    expect(row).toBeDefined();
+    expect(row!.homeTeam).toBe("hkjc:evt-trans-c主");
+    expect(row!.awayTeam).toBe("hkjc:evt-trans-c客");
+    expect(row!.league).toBe("HK聯");
   });
 });
