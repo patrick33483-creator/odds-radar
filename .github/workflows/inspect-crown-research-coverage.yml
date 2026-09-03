@@ -36,6 +36,7 @@ jobs:
           import os
           import re
           import sqlite3
+          import subprocess
 
           db = sqlite3.connect('file:/opt/odds-radar/data/data.db?mode=ro', uri=True, timeout=1)
           db.execute('PRAGMA query_only=ON')
@@ -53,6 +54,17 @@ jobs:
               "SELECT provider,stage,COUNT(*),MAX(captured_at) FROM research_timeline_snapshots "
               "WHERE provider IN ('hkjc','pinnacle') GROUP BY provider,stage ORDER BY provider,stage"
           ).fetchall()
+          ou_counts = db.execute(
+              "SELECT 'prealerts' kind,COUNT(*) total,MAX(detected_at) latest_detected_at FROM ou_signal_prealerts "
+              "UNION ALL SELECT 'observations',COUNT(*),MAX(detected_at) FROM ou_signal_observations"
+          ).fetchall()
+          logs = subprocess.run(
+              ['sudo','docker','compose','logs','--tail','900','radar'], capture_output=True, text=True, check=False,
+          ).stdout
+          clean_logs = [re.sub(r'\x1b\[[0-9;]*m', '', line) for line in logs.splitlines()]
+          crown_events = [line for line in clean_logs if 'today_crown_backfill' in line or 'crown_research_detail' in line]
+          auto_research = [line for line in clean_logs if 'auto_research_timeline' in line]
+          ou_errors = [line for line in clean_logs if 'ou_signal' in line.lower() and 'error' in line.lower()]
           print("::notice title=Phase1 read-only production audit::" + json.dumps({
               'read_only_connection': True,
               'production_commit': os.environ['COMMIT'],
@@ -67,6 +79,10 @@ jobs:
               'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
               'provider_health': [dict(zip(('provider','ok','last_success_at','last_attempt_at','last_error_at','last_error','consecutive_failures','item_count','mode'), row)) for row in provider_health],
               'app_state': states,
+              'ou_counts': [dict(zip(('kind','total','latest_detected_at'), row)) for row in ou_counts],
+              'crown_events_current_container': crown_events[-20:],
+              'auto_research_timeline_current_container': auto_research[-20:],
+              'ou_errors_current_container': ou_errors[-20:],
           }, ensure_ascii=False, sort_keys=True))
           db.close()
           PY
