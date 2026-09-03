@@ -204,6 +204,19 @@ CREATE TABLE IF NOT EXISTS provider_health (
 
 CREATE TABLE IF NOT EXISTS app_state (
   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS pinnacle_translations (
+  pinnapi_id TEXT PRIMARY KEY,
+  zh_home TEXT,
+  zh_away TEXT,
+  zh_league TEXT,
+  source TEXT NOT NULL CHECK(source IN ('titan','optic')),
+  updated_at INTEGER NOT NULL,
+  attempted_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT);
+CREATE INDEX IF NOT EXISTS pinnacle_translations_updated_idx
+  ON pinnacle_translations(updated_at);
 `);
   migrateFixtureSources();
   // The activation watermark prevents a new deployment from sending Telegram
@@ -578,6 +591,61 @@ export function pruneSnapshots(now = Date.now()): number {
     .prepare("DELETE FROM research_timeline_points WHERE match_id NOT IN (SELECT DISTINCT match_id FROM research_timeline_snapshots)")
     .run();
   return res.changes + timeline.changes;
+}
+
+export interface PinnacleTranslationRow {
+  pinnapi_id: string;
+  zh_home: string | null;
+  zh_away: string | null;
+  zh_league: string | null;
+  source: "titan" | "optic";
+  updated_at: number;
+  attempted_at: number | null;
+  attempt_count: number;
+  last_error: string | null;
+}
+
+export function getPinnacleTranslation(pinnapiId: string): PinnacleTranslationRow | null {
+  const row = rawDb
+    .prepare("SELECT * FROM pinnacle_translations WHERE pinnapi_id=?")
+    .get(pinnapiId) as PinnacleTranslationRow | undefined;
+  return row ?? null;
+}
+
+export function upsertPinnacleTranslation(t: {
+  pinnapiId: string;
+  zhHome: string | null;
+  zhAway: string | null;
+  zhLeague: string | null;
+  source: "titan" | "optic";
+}, now = Date.now()): void {
+  rawDb
+    .prepare(
+      `INSERT INTO pinnacle_translations(pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error)
+       VALUES(?,?,?,?,?,?,?,0,NULL)
+       ON CONFLICT(pinnapi_id) DO UPDATE SET zh_home=excluded.zh_home,zh_away=excluded.zh_away,
+         zh_league=excluded.zh_league,source=excluded.source,updated_at=excluded.updated_at,
+         attempted_at=excluded.attempted_at,attempt_count=0,last_error=NULL`,
+    )
+    .run(t.pinnapiId, t.zhHome, t.zhAway, t.zhLeague, t.source, now, now);
+}
+
+export function markPinnacleTranslationAttempt(
+  pinnapiId: string,
+  lastError: string | null,
+  now = Date.now(),
+): void {
+  // Preserve any existing partial translation columns; only bump the attempt
+  // counter and record the failure timestamp for backoff.
+  rawDb
+    .prepare(
+      `INSERT INTO pinnacle_translations(pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error)
+       VALUES(?,NULL,NULL,NULL,'titan',?,?,1,?)
+       ON CONFLICT(pinnapi_id) DO UPDATE SET attempted_at=excluded.attempted_at,
+         attempt_count=pinnacle_translations.attempt_count+1,
+         last_error=excluded.last_error,updated_at=excluded.updated_at`,
+    )
+    .run(pinnapiId, now, now, lastError);
 }
 
 export function countSnapshots(): number {
