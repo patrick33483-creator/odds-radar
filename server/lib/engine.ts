@@ -42,7 +42,7 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
-import { captureResearchTimelinePrices } from "./research";
+import { captureResearchTimelinePrices, researchStageFor } from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
@@ -121,6 +121,42 @@ export const REFRESH_THROTTLE_MS = 30_000;
 export const FIXTURE_CACHE_MS = 10 * 60_000;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
+
+export type PinnacleResearchTarget = {
+  matchId: string;
+  eventId: string;
+  kickoffUtc: number;
+  league: string;
+  homeTeam: string;
+  awayTeam: string;
+};
+
+type PendingPinnacleResearchTarget = PinnacleResearchTarget & {
+  stage: "initial" | "T30" | "T15" | "T5";
+};
+
+/**
+ * Only return fixtures whose current OU checkpoint is still missing.
+ * Milestones nearest kickoff are processed first so a large fixture slate
+ * cannot starve T5/T15 behind opening-price work.
+ */
+export function prioritizePendingPinnacleResearchTargets(
+  targets: PinnacleResearchTarget[],
+  capturedOuStages: ReadonlySet<string>,
+  now: number,
+): PendingPinnacleResearchTarget[] {
+  const priority = { T5: 0, T15: 1, T30: 2, initial: 3 } as const;
+  return targets
+    .flatMap((target): PendingPinnacleResearchTarget[] => {
+      const untilKickoff = target.kickoffUtc - now;
+      if (untilKickoff <= 0 || untilKickoff > 24 * 60 * 60_000) return [];
+      const stage = researchStageFor(target.kickoffUtc, now)
+        ?? (untilKickoff > 30 * 60_000 ? "initial" : null);
+      if (!stage || capturedOuStages.has(`${target.matchId}:${stage}`)) return [];
+      return [{ ...target, stage }];
+    })
+    .sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc);
+}
 
 /** Merge a Crown-first alias into the later HKJC canonical fixture atomically. */
 export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): boolean {
@@ -779,14 +815,7 @@ export class RadarEngine {
          WHERE matches.fixture_source='pinnacle'`,
     );
 
-    const targets: Array<{
-      matchId: string;
-      eventId: string;
-      kickoffUtc: number;
-      league: string;
-      homeTeam: string;
-      awayTeam: string;
-    }> = [];
+    const targets: PinnacleResearchTarget[] = [];
     const upsertTx = rawDb.transaction(() => {
       for (const fixture of pinnapi) {
         if (fixture.parentId) continue; // prefer parent events only
@@ -828,49 +857,74 @@ export class RadarEngine {
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
-    // Only poll fixtures inside the research capture horizon: any point where
-    // a snapshot could still be assigned to initial/T30/T15/T5.  For
-    // Pinnacle-only, `initial` requires observedAt < kickoff - 30 min.
-    const eligible = targets.filter((t) => t.kickoffUtc - now > 0 && t.kickoffUtc - now <= 24 * 60 * 60_000);
+    // Do not spend provider calls on an OU checkpoint already frozen in the
+    // timeline. A single query avoids one DB lookup per fixture.
+    const capturedOuStages = new Set(
+      (rawDb.prepare(
+        `SELECT DISTINCT match_id,stage
+           FROM research_timeline_snapshots
+          WHERE provider='pinnacle' AND market='OU' AND match_id LIKE 'pinnacle:%'`,
+      ).all() as Array<{ match_id: string; stage: "initial" | "T30" | "T15" | "T5" }>)
+        .map((row) => `${row.match_id}:${row.stage}`),
+    );
+    const eligible = prioritizePendingPinnacleResearchTargets(targets, capturedOuStages, now);
     let fetched = 0;
     let failed = 0;
     let rows = 0;
+    const normalCaptured: PendingPinnacleResearchTarget[] = [];
+
+    // First pass: capture normal markets for every pending milestone. Never
+    // wait for a slower corner request before writing the main OU snapshot.
     for (const target of eligible) {
       if (Date.now() > now + MAX_LOOP_MS) break;
-      let prices: ProviderPrice[] = [];
       try {
+        let normalPrices: ProviderPrice[] = [];
         if (DEMO) {
-          prices = DEMO_FIXTURE.pinnaclePrices[`pinnapi:${target.eventId}`] ?? [];
+          normalPrices = DEMO_FIXTURE.pinnaclePrices[`pinnapi:${target.eventId}`] ?? [];
         } else if (this.pinnapi.status().configured) {
-          const normalPrices = await this.pinnapi.fetchMatchPrices(target.eventId);
-          let cornerPrices: ProviderPrice[] = [];
-          try {
-            cornerPrices = (await this.pinnapi.fetchEventCornerLines(target.eventId)).prices;
-          } catch (cornerError) {
-            log("pinnacle_only_corner_unavailable", {
-              eventId: target.eventId,
-              error: (cornerError as Error).message,
-            });
-          }
-          prices = [...normalPrices, ...cornerPrices];
+          normalPrices = await this.pinnapi.fetchMatchPrices(target.eventId);
         }
         fetched++;
+        if (normalPrices.length) {
+          const inserted = captureResearchTimelinePrices(
+            target.matchId,
+            "pinnacle",
+            normalPrices,
+            target.kickoffUtc,
+            Date.now(),
+          );
+          if (inserted) rows++;
+          normalCaptured.push(target);
+        }
       } catch (err) {
         failed++;
         log("pinnacle_only_detail_error", { eventId: target.eventId, error: (err as Error).message });
       }
-      if (prices.length) {
-        // captureResearchTimelinePrices persists T30/T15/T5 windows and, for
-        // Pinnacle-only fixtures observed >30 min before kickoff, freezes the
-        // earliest snapshot as `initial`.
-        const inserted = captureResearchTimelinePrices(
+    }
+
+    // Second pass: corners are useful research data but must never delay the
+    // normal OU milestone. Only attempt them after the priority queue's normal
+    // prices have been persisted.
+    if (!DEMO && this.pinnapi.status().configured) {
+      for (const target of normalCaptured) {
+        if (Date.now() > now + MAX_LOOP_MS) break;
+        try {
+          const cornerPrices = (await this.pinnapi.fetchEventCornerLines(target.eventId)).prices;
+          if (!cornerPrices.length) continue;
+          const inserted = captureResearchTimelinePrices(
           target.matchId,
           "pinnacle",
-          prices,
+          cornerPrices,
           target.kickoffUtc,
           Date.now(),
         );
-        if (inserted) rows++;
+          if (inserted) rows++;
+        } catch (cornerError) {
+          log("pinnacle_only_corner_unavailable", {
+            eventId: target.eventId,
+            error: (cornerError as Error).message,
+          });
+        }
       }
     }
 
@@ -891,7 +945,13 @@ export class RadarEngine {
       log("telegram_ou_signal_pinnacle_only_error", { error: (err as Error).message });
     }
 
-    log("pinnacle_only_research", { fixtures: targets.length, fetched, failed, rows });
+    log("pinnacle_only_research", {
+      fixtures: targets.length,
+      pendingMilestones: eligible.length,
+      fetched,
+      failed,
+      rows,
+    });
     return { fixtures: targets.length, fetched, failed, rows };
   }
 
