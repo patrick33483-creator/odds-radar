@@ -53,6 +53,7 @@ jobs:
           pinnacle_only_matches = scalar("SELECT COUNT(*) FROM matches WHERE fixture_source='pinnacle'")
           pinnacle_only_kickoff_window = scalar("SELECT COUNT(*) FROM matches WHERE fixture_source='pinnacle' AND kickoff_utc > strftime('%s','now')*1000")
           pinnapi_source_map_total = scalar("SELECT COUNT(*) FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL")
+          matches_create_sql = scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='matches'")
           pinnacle_only_snapshots = db.execute(
               "SELECT stage, COUNT(*) FROM research_timeline_snapshots s JOIN matches m ON m.id=s.match_id "
               "WHERE m.fixture_source='pinnacle' AND s.provider='pinnacle' GROUP BY stage ORDER BY stage"
@@ -99,6 +100,7 @@ jobs:
               'pinnapi_source_map_total': pinnapi_source_map_total,
               'pinnacle_only_snapshots_by_stage': [dict(zip(('stage','rows'), row)) for row in pinnacle_only_snapshots],
               'pinnacle_only_log_tail': pinnacle_only_logs[-5:],
+              'matches_create_sql': matches_create_sql,
               'simulation_bets_included': simulation_bets,
               'radar_settings': os.environ.get('RADAR_SETTINGS', '').splitlines(),
           }, ensure_ascii=False, sort_keys=False))
