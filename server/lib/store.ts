@@ -142,6 +142,11 @@ CREATE INDEX IF NOT EXISTS research_timeline_match_idx
 CREATE INDEX IF NOT EXISTS research_timeline_captured_idx
   ON research_timeline_snapshots(captured_at);
 
+CREATE TABLE IF NOT EXISTS crown_research_attempts (
+  titan_id TEXT PRIMARY KEY, last_attempt_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS crown_research_attempts_due_idx
+  ON crown_research_attempts(last_attempt_at);
+
 CREATE TABLE IF NOT EXISTS ou_signal_observations (
   unique_key TEXT PRIMARY KEY, match_id TEXT NOT NULL, provider TEXT NOT NULL,
   rule_id TEXT NOT NULL, line_key TEXT NOT NULL, direction_path TEXT NOT NULL,

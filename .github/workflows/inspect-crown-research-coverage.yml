@@ -1,0 +1,107 @@
+name: Inspect Crown research coverage
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Read future Crown research coverage
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo python3 -' <<'PY'
+          import datetime
+          import json
+          import sqlite3
+          import time
+
+          now = int(time.time() * 1000)
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+          row = db.execute(
+              """
+              SELECT
+                COUNT(*) AS future_total,
+                SUM(CASE WHEN fixture_source='crown' THEN 1 ELSE 0 END) AS crown_only,
+                SUM(CASE WHEN titan_id IS NOT NULL THEN 1 ELSE 0 END) AS titan_total,
+                SUM(CASE WHEN titan_id IS NOT NULL AND EXISTS (
+                  SELECT 1
+                    FROM research_timeline_snapshots s
+                   WHERE s.match_id=m.id
+                     AND s.provider='crown'
+                     AND s.stage='initial'
+                     AND s.origin='external_opening'
+                   GROUP BY s.match_id
+                  HAVING COUNT(DISTINCT s.market)>=2
+                ) THEN 1 ELSE 0 END) AS crown_opening_complete,
+                SUM(CASE WHEN titan_id IS NOT NULL AND NOT EXISTS (
+                  SELECT 1
+                    FROM research_timeline_snapshots s
+                   WHERE s.match_id=m.id
+                     AND s.provider='crown'
+                     AND s.stage='initial'
+                     AND s.origin='external_opening'
+                   GROUP BY s.match_id
+                  HAVING COUNT(DISTINCT s.market)>=2
+                ) THEN 1 ELSE 0 END) AS crown_opening_missing
+              FROM matches m
+              WHERE kickoff_utc>?
+              """,
+              (now,),
+          ).fetchone()
+          tables = {
+              item["name"]
+              for item in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+          }
+          attempts = 0
+          if "crown_research_attempts" in tables:
+              attempts = db.execute(
+                  """
+                  SELECT COUNT(*)
+                    FROM crown_research_attempts a
+                    JOIN matches m ON m.titan_id=a.titan_id
+                   WHERE m.kickoff_utc>?
+                  """,
+                  (now,),
+              ).fetchone()[0]
+          contamination = {}
+          for table in (
+              "odds_latest",
+              "odds_snapshots",
+              "market_lines",
+              "opportunities",
+              "simulation_bets",
+              "ou_signal_prealerts",
+              "ou_signal_observations",
+          ):
+              contamination[table] = db.execute(
+                  f"""
+                  SELECT COUNT(*)
+                    FROM {table} x
+                    JOIN matches m ON m.id=x.match_id
+                   WHERE m.fixture_source='crown'
+                  """
+              ).fetchone()[0]
+          print(json.dumps({
+              "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              **dict(row),
+              "future_attempted": attempts,
+              "execution_contamination": contamination,
+          }, sort_keys=True))
+          db.close()
+          PY

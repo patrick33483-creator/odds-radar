@@ -69,6 +69,7 @@ function cleanup(): void {
   ]) {
     for (const id of ids) rawDb.prepare(`DELETE FROM ${table} WHERE match_id=?`).run(id);
   }
+  rawDb.prepare("DELETE FROM crown_research_attempts WHERE titan_id LIKE ?").run(`${PREFIX}%`);
   for (const id of ids) rawDb.prepare("DELETE FROM matches WHERE id=?").run(id);
 }
 
@@ -318,5 +319,60 @@ describe("Crown-only research fixtures", () => {
     expect(rawDb.prepare(
       "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=?",
     ).get(matchId)).toEqual({ count: 8 });
+  });
+
+  it("advances past the first 100 missing openings and keeps backoff across restarts", async () => {
+    const fixtures = Array.from(
+      { length: 130 },
+      (_, index) => fixture(`${PREFIX}-fair-${String(index).padStart(3, "0")}`, NOW + 2 * 60 * 60_000 + index),
+    );
+    upsertCrownResearchFixtures(fixtures, NOW);
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const calls: string[] = [];
+    const makeEngine = () => {
+      const engine = new RadarEngine();
+      (engine as any).refreshHkjc = vi.fn(async () => true);
+      (engine as any).refreshPinnacleFixtures = vi.fn(async () => fixtures.length);
+      (engine as any).pinnacle.fetchCrownResearchPrices = vi.fn(async (titanId: string) => {
+        calls.push(titanId);
+        return { opening: [], current: [], sourceUrls: {} };
+      });
+      return engine;
+    };
+
+    expect(await makeEngine().runResearchTimelineTick()).toEqual({ selected: 100, detailCalls: 100 });
+    expect(new Set(calls).size).toBe(100);
+
+    vi.mocked(Date.now).mockReturnValue(NOW + 30_000);
+    expect(await makeEngine().runResearchTimelineTick()).toEqual({ selected: 30, detailCalls: 30 });
+    expect(new Set(calls).size).toBe(130);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM crown_research_attempts WHERE titan_id LIKE ?",
+    ).get(`${PREFIX}-fair-%`)).toEqual({ count: 130 });
+  });
+
+  it("reserves fair capacity when the T30 queue alone fills the request budget", async () => {
+    const urgent = Array.from(
+      { length: 100 },
+      (_, index) => fixture(`${PREFIX}-urgent-${String(index).padStart(3, "0")}`, NOW + 20 * 60_000 + index),
+    );
+    const later = Array.from(
+      { length: 30 },
+      (_, index) => fixture(`${PREFIX}-later-${String(index).padStart(3, "0")}`, NOW + 2 * 60 * 60_000 + index),
+    );
+    upsertCrownResearchFixtures([...urgent, ...later], NOW);
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const calls: string[] = [];
+    const engine = new RadarEngine();
+    (engine as any).refreshHkjc = vi.fn(async () => true);
+    (engine as any).refreshPinnacleFixtures = vi.fn(async () => urgent.length + later.length);
+    (engine as any).pinnacle.fetchCrownResearchPrices = vi.fn(async (titanId: string) => {
+      calls.push(titanId);
+      return { opening: [], current: [], sourceUrls: {} };
+    });
+
+    expect(await engine.runResearchTimelineTick()).toEqual({ selected: 100, detailCalls: 100 });
+    expect(calls.filter((id) => id.includes("-urgent-"))).toHaveLength(75);
+    expect(calls.filter((id) => id.includes("-later-"))).toHaveLength(25);
   });
 });

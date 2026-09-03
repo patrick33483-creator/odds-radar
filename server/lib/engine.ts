@@ -114,6 +114,8 @@ import type {
 
 export const REFRESH_THROTTLE_MS = 30_000;
 export const FIXTURE_CACHE_MS = 10 * 60_000;
+export const CROWN_RESEARCH_BATCH_SIZE = 100;
+export const CROWN_RESEARCH_FAIR_SHARE = 25;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
 
@@ -330,7 +332,6 @@ export class RadarEngine {
   } | null = null;
   private pinnacleDetail = new Map<string, PinnacleDetailCacheEntry>();
   private crownDetail = new Map<string, PinnacleDetailCacheEntry>();
-  private crownResearchAttempt = new Map<string, number>();
   private pinnacleRowsSeen = 0;
   private lastScan: ScanOutcome | null = null;
   private scanning = false;
@@ -1333,28 +1334,58 @@ export class RadarEngine {
     kickoffUtc: number;
     reversed: boolean;
   }> {
-    const rows = rawDb.prepare(
-      `SELECT m.id,m.titan_id,m.kickoff_utc,COALESCE(p.titan_reversed,0) titan_reversed
-         FROM matches m
-         LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
-        WHERE m.titan_id IS NOT NULL AND m.kickoff_utc>?
-          AND (
-            m.kickoff_utc<=?
-            OR NOT EXISTS (
-              SELECT 1 FROM research_timeline_snapshots s
-               WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial'
-               GROUP BY s.match_id HAVING COUNT(DISTINCT s.market)>=2
-            )
-          )
-        ORDER BY m.kickoff_utc
-        LIMIT 100`,
-    ).all(now, now + 30 * 60_000) as Array<{
+    const commonSelect = `
+      SELECT m.id,m.titan_id,m.kickoff_utc,COALESCE(p.titan_reversed,0) titan_reversed
+        FROM matches m
+        LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+        LEFT JOIN crown_research_attempts a ON a.titan_id=m.titan_id`;
+    type CandidateRow = {
       id: string;
       titan_id: string;
       kickoff_utc: number;
       titan_reversed: number;
-    }>;
-    return rows.map((row) => ({
+    };
+    const urgent = rawDb.prepare(
+      `${commonSelect}
+       WHERE m.titan_id IS NOT NULL
+         AND m.kickoff_utc>? AND m.kickoff_utc<=?
+       ORDER BY COALESCE(a.last_attempt_at,0),m.kickoff_utc,m.id
+       LIMIT ?`,
+    ).all(now, now + 30 * 60_000, CROWN_RESEARCH_BATCH_SIZE) as CandidateRow[];
+    const fair = rawDb.prepare(
+      `SELECT m.id,m.titan_id,m.kickoff_utc,COALESCE(p.titan_reversed,0) titan_reversed
+         FROM matches m
+         LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+         LEFT JOIN crown_research_attempts a ON a.titan_id=m.titan_id
+        WHERE m.titan_id IS NOT NULL AND m.kickoff_utc>?
+          AND NOT EXISTS (
+            SELECT 1 FROM research_timeline_snapshots s
+             WHERE s.match_id=m.id AND s.provider='crown' AND s.stage='initial'
+             GROUP BY s.match_id HAVING COUNT(DISTINCT s.market)>=2
+          )
+          AND (a.last_attempt_at IS NULL OR a.last_attempt_at<=?)
+        ORDER BY CASE WHEN a.last_attempt_at IS NULL THEN 0 ELSE 1 END,
+                 a.last_attempt_at,m.kickoff_utc,m.id
+        LIMIT ?`,
+    ).all(
+      now + 30 * 60_000,
+      now - FIXTURE_CACHE_MS,
+      CROWN_RESEARCH_BATCH_SIZE,
+    ) as CandidateRow[];
+
+    // Reserve part of every finite batch for the fair, oldest-attempt-first
+    // opening queue. A permanently busy T30 window therefore cannot starve
+    // later fixtures; unused fair capacity is returned to urgent checkpoints.
+    const urgentReserved = urgent.slice(
+      0,
+      CROWN_RESEARCH_BATCH_SIZE - CROWN_RESEARCH_FAIR_SHARE,
+    );
+    const fairSelected = fair.slice(0, CROWN_RESEARCH_BATCH_SIZE - urgentReserved.length);
+    const urgentOverflow = urgent.slice(
+      urgentReserved.length,
+      urgentReserved.length + CROWN_RESEARCH_BATCH_SIZE - urgentReserved.length - fairSelected.length,
+    );
+    return [...urgentReserved, ...fairSelected, ...urgentOverflow].map((row) => ({
       id: row.id,
       titanId: row.titan_id,
       kickoffUtc: row.kickoff_utc,
@@ -1370,20 +1401,16 @@ export class RadarEngine {
     let fetched = 0;
     let failed = 0;
     const queue = [...targets];
+    const recordAttempt = rawDb.prepare(
+      `INSERT INTO crown_research_attempts(titan_id,last_attempt_at) VALUES(?,?)
+       ON CONFLICT(titan_id) DO UPDATE SET last_attempt_at=excluded.last_attempt_at`,
+    );
     const workers = Array.from({ length: 4 }, async () => {
       while (queue.length && Date.now() <= deadline) {
         const target = queue.shift();
         if (!target) continue;
         const attemptAt = Date.now();
-        const previousAttempt = this.crownResearchAttempt.get(target.titanId);
-        if (
-          target.kickoffUtc - attemptAt > 30 * 60_000
-          && previousAttempt !== undefined
-          && attemptAt - previousAttempt < FIXTURE_CACHE_MS
-        ) {
-          continue;
-        }
-        this.crownResearchAttempt.set(target.titanId, attemptAt);
+        recordAttempt.run(target.titanId, attemptAt);
         try {
           const research = await this.pinnacle.fetchCrownResearchPrices(target.titanId);
           const orient = (prices: ProviderPrice[]) => target.reversed

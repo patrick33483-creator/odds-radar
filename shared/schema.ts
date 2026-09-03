@@ -157,6 +157,21 @@ export const researchTimelineSnapshots = sqliteTable(
   }),
 );
 
+/**
+ * Persistent Crown detail-attempt ledger. It supplies both restart-safe
+ * backoff and an oldest-attempt-first queue for the research-only collector.
+ */
+export const crownResearchAttempts = sqliteTable(
+  "crown_research_attempts",
+  {
+    titanId: text("titan_id").primaryKey(),
+    lastAttemptAt: integer("last_attempt_at").notNull(),
+  },
+  (t) => ({
+    due: index("crown_research_attempts_due_idx").on(t.lastAttemptAt),
+  }),
+);
+
 /** Team name aliases across providers (learned + seeded). */
 export const teamAliases = sqliteTable(
   "team_aliases",
