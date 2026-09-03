@@ -85,6 +85,42 @@ describe("research dataset surfaces tracked fixtures without snapshots", () => {
       .map((match) => match.matchId);
     expect(ids.indexOf("crown:dataset-order-late")).toBeLessThan(ids.indexOf("crown:dataset-order-early"));
   });
+
+  it("rolling upcoming window hides finished fixtures and orders by earliest kickoff", () => {
+    addFixture("crown:rolling-past", "crown", NOW - 2 * 60 * 60_000, "rolling-past");
+    addFixture("crown:rolling-near", "crown", NOW + 1 * 60 * 60_000, "rolling-near");
+    addFixture("crown:rolling-far", "crown", NOW + 4 * 24 * 60 * 60_000, "rolling-far");
+    const dataset = researchDataset({
+      window: "upcoming",
+      days: 7,
+      horizonDays: 14,
+      limit: 300,
+      provider: "all",
+      market: "all",
+    }, NOW);
+    const ids = dataset.matches.map((match) => match.matchId);
+    expect(ids).toContain("crown:rolling-near");
+    expect(ids).toContain("crown:rolling-far");
+    expect(ids).not.toContain("crown:rolling-past");
+    // Upcoming view sorts by earliest kickoff so the imminent fixture surfaces first.
+    expect(ids.indexOf("crown:rolling-near")).toBeLessThan(ids.indexOf("crown:rolling-far"));
+  });
+
+  it("finished window keeps historical fixtures and hides future kickoffs", () => {
+    addFixture("crown:finished-old", "crown", NOW - 3 * 60 * 60_000, "finished-old");
+    addFixture("crown:finished-future", "crown", NOW + 3 * 60 * 60_000, "finished-future");
+    const dataset = researchDataset({
+      window: "finished",
+      days: 7,
+      horizonDays: 14,
+      limit: 300,
+      provider: "all",
+      market: "all",
+    }, NOW);
+    const ids = dataset.matches.map((match) => match.matchId);
+    expect(ids).toContain("crown:finished-old");
+    expect(ids).not.toContain("crown:finished-future");
+  });
 });
 
 describe("today Crown backfill collector", () => {

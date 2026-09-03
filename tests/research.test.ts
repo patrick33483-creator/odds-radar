@@ -75,15 +75,41 @@ describe("research data collection", () => {
 
   it("bounds lookback and accepts only supported provider and market filters", () => {
     expect(parseResearchFilters({ days: "999", provider: "pinnacle", market: "OU" })).toEqual({
+      window: "upcoming",
       days: 120,
+      horizonDays: 14,
+      limit: 300,
       provider: "pinnacle",
       market: "OU",
     });
     expect(parseResearchFilters({ days: "bad", provider: "unknown", market: "HDC" })).toEqual({
+      window: "upcoming",
       days: 7,
+      horizonDays: 14,
+      limit: 300,
       provider: "all",
       market: "all",
     });
+  });
+
+  it("parses rolling-window params and bounds them", () => {
+    expect(parseResearchFilters({ window: "upcoming", horizonDays: "999", limit: "5000", provider: "hkjc", market: "AH" })).toEqual({
+      window: "upcoming",
+      days: 7,
+      horizonDays: 60,
+      limit: 1000,
+      provider: "hkjc",
+      market: "AH",
+    });
+    expect(parseResearchFilters({ window: "finished", days: "30", limit: "5000", provider: "all", market: "all" })).toEqual({
+      window: "finished",
+      days: 30,
+      horizonDays: 14,
+      limit: 2000,
+      provider: "all",
+      market: "all",
+    });
+    expect(parseResearchFilters({ window: "nonsense" })).toMatchObject({ window: "upcoming" });
   });
 
   it("never treats the first live observation as an initial opening", () => {

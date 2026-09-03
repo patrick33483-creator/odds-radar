@@ -24,23 +24,70 @@ import type {
 const RESULT_DELAY_MS = 105 * 60_000;
 const DEFAULT_LOOKBACK_DAYS = 7;
 const MAX_LOOKBACK_DAYS = 120;
+const DEFAULT_HORIZON_DAYS = 14;
+const MAX_HORIZON_DAYS = 60;
+const DEFAULT_UPCOMING_LIMIT = 300;
+const MAX_UPCOMING_LIMIT = 1000;
+const DEFAULT_FINISHED_LIMIT = 300;
+const MAX_FINISHED_LIMIT = 2000;
+const FALLBACK_UPCOMING_HORIZON_MS = 7 * 24 * 60 * 60_000;
 const MAX_RESULT_LOOKBACK_DAYS = 30;
+
+export type ResearchWindow = "upcoming" | "finished" | "all";
 const MAX_EXPORT_ROWS = 100_000;
 const RESEARCH_MARKETS = ["AH", "OU", "COU"] as const;
 const RESEARCH_PROVIDERS = ["hkjc", "pinnacle", "crown"] as const;
 export const RESEARCH_STAGES: ResearchStage[] = ["initial", "T30", "T15", "T5"];
 
 export interface ResearchFilters {
+  window: ResearchWindow;
   days: number;
+  horizonDays: number;
+  limit: number;
   provider: ResearchProvider | "all";
   market: "AH" | "OU" | "COU" | "all";
 }
 
-function boundedDays(value: unknown, fallback = DEFAULT_LOOKBACK_DAYS): number {
+function boundedNumber(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed)
-    ? Math.max(1, Math.min(MAX_LOOKBACK_DAYS, Math.floor(parsed)))
+    ? Math.max(min, Math.min(max, Math.floor(parsed)))
     : fallback;
+}
+
+function boundedDays(value: unknown, fallback = DEFAULT_LOOKBACK_DAYS): number {
+  return boundedNumber(value, fallback, 1, MAX_LOOKBACK_DAYS);
+}
+
+function boundedHorizonDays(value: unknown, fallback = DEFAULT_HORIZON_DAYS): number {
+  return boundedNumber(value, fallback, 1, MAX_HORIZON_DAYS);
+}
+
+function boundedLimit(value: unknown, fallback: number, max: number): number {
+  return boundedNumber(value, fallback, 1, max);
+}
+
+function parseWindow(value: unknown): ResearchWindow {
+  const raw = typeof value === "string" ? value.toLowerCase() : "";
+  if (raw === "upcoming" || raw === "finished" || raw === "all") return raw;
+  // Default preserves the legacy behaviour when no window is supplied.
+  return "upcoming";
+}
+
+/**
+ * Older callers (including a few tests) still pass the legacy
+ * `{ days, provider, market }` shape.  Fill in the rolling-window fields
+ * with backwards-compatible defaults so those call sites keep working.
+ */
+function normalizeFilters(filters: Partial<ResearchFilters> & Pick<ResearchFilters, "days" | "provider" | "market">): ResearchFilters {
+  return {
+    window: filters.window ?? "all",
+    days: filters.days,
+    horizonDays: filters.horizonDays ?? 7,
+    limit: filters.limit ?? DEFAULT_UPCOMING_LIMIT,
+    provider: filters.provider,
+    market: filters.market,
+  };
 }
 
 export function parseResearchFilters(query: Record<string, unknown>): ResearchFilters {
@@ -50,7 +97,13 @@ export function parseResearchFilters(query: Record<string, unknown>): ResearchFi
   const market = RESEARCH_MARKETS.includes(String(query.market) as (typeof RESEARCH_MARKETS)[number])
     ? (String(query.market) as "AH" | "OU" | "COU")
     : "all";
-  return { days: boundedDays(query.days), provider, market };
+  const window = parseWindow(query.window);
+  const days = boundedDays(query.days);
+  const horizonDays = boundedHorizonDays(query.horizonDays);
+  const limit = window === "finished"
+    ? boundedLimit(query.limit, DEFAULT_FINISHED_LIMIT, MAX_FINISHED_LIMIT)
+    : boundedLimit(query.limit, DEFAULT_UPCOMING_LIMIT, MAX_UPCOMING_LIMIT);
+  return { window, days, horizonDays, limit, provider, market };
 }
 
 export function researchStageFor(kickoffUtc: number, observedAt: number): Exclude<ResearchStage, "initial"> | null {
@@ -711,9 +764,30 @@ export async function collectTodayCrownBackfill(
   return outcome;
 }
 
+function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: number } {
+  if (filters.window === "upcoming") {
+    // Rolling window: anchor at "now" and reach forward by horizonDays.  Any
+    // fixture that has already kicked off is excluded from the view but stays
+    // in the database for later research.
+    return { lo: now, hi: now + filters.horizonDays * 24 * 60 * 60_000 };
+  }
+  if (filters.window === "finished") {
+    // Look back by `days` and stop at "now" so the finished view only surfaces
+    // fixtures that have already kicked off.
+    return { lo: now - filters.days * 24 * 60 * 60_000, hi: now };
+  }
+  // Legacy "all" window preserves the pre-rolling behaviour used by callers
+  // that still pass only a `days` parameter.
+  return {
+    lo: now - filters.days * 24 * 60 * 60_000,
+    hi: now + FALLBACK_UPCOMING_HORIZON_MS,
+  };
+}
+
 function filterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
+  const bounds = windowBounds(filters, now);
   const clauses = ["m.kickoff_utc>=?", "m.kickoff_utc<=?"];
-  const params: unknown[] = [now - filters.days * 24 * 60 * 60_000, now + 7 * 24 * 60 * 60_000];
+  const params: unknown[] = [bounds.lo, bounds.hi];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
     params.push(filters.provider);
@@ -731,8 +805,9 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
  * matching quote, but the unfiltered view must not hide result-only matches.
  */
 function matchFilterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
+  const bounds = windowBounds(filters, now);
   const clauses = ["m.kickoff_utc>=?", "m.kickoff_utc<=?"];
-  const params: unknown[] = [now - filters.days * 24 * 60 * 60_000, now + 7 * 24 * 60 * 60_000];
+  const params: unknown[] = [bounds.lo, bounds.hi];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
     params.push(filters.provider);
@@ -794,7 +869,11 @@ function researchCellStatus(
   return firstCapturedAt ? "market_unavailable" : "checkpoint_missed";
 }
 
-export function researchDataset(filters: ResearchFilters, now = Date.now()): ResearchDatasetResponse {
+export function researchDataset(
+  rawFilters: Partial<ResearchFilters> & Pick<ResearchFilters, "days" | "provider" | "market">,
+  now = Date.now(),
+): ResearchDatasetResponse {
+  const filters = normalizeFilters(rawFilters);
   const { clause, params } = filterSql(filters, now);
   const { clause: matchClause, params: matchParams } = matchFilterSql(filters, now);
   const summary = rawDb
@@ -888,8 +967,8 @@ export function researchDataset(filters: ResearchFilters, now = Date.now()): Res
          LEFT JOIN results r ON r.match_id=m.id
         WHERE ${matchClause}
         GROUP BY m.id
-        ORDER BY m.kickoff_utc DESC
-        LIMIT 300`,
+        ORDER BY m.kickoff_utc ${filters.window === "upcoming" ? "ASC" : "DESC"}
+        LIMIT ${filters.limit}`,
     )
     .all(...matchParams) as Array<Record<string, unknown>>;
 
@@ -1066,7 +1145,12 @@ function toCsv(headers: string[], rows: unknown[][]): string {
   return `\ufeff${[headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n")}\r\n`;
 }
 
-export function researchCsv(kind: "timeline" | "results", filters: ResearchFilters, now = Date.now()): string {
+export function researchCsv(
+  kind: "timeline" | "results",
+  rawFilters: Partial<ResearchFilters> & Pick<ResearchFilters, "days" | "provider" | "market">,
+  now = Date.now(),
+): string {
+  const filters = normalizeFilters(rawFilters);
   const { clause, params } = filterSql(filters, now);
   if (kind === "results") {
     const { clause: matchClause, params: matchParams } = matchFilterSql(filters, now);
