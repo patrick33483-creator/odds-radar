@@ -307,7 +307,15 @@ function fixtureIdentity(matchId: string): {
 /** Number of genuinely supported provider/market pairs for this fixture. */
 export function expectedPairCount(matchId: string, stage: ResearchStage): number {
   const fixture = fixtureIdentity(matchId);
-  if (fixture.fixture_source === "crown") return 2; // Crown AH + OU only.
+  if (fixture.fixture_source === "crown") {
+    // Crown-only fixtures capture Crown AH + OU, and from the Crown-driven
+    // ingestion also Pinnacle AH + OU on the same titan id (titan007 exposes no
+    // Pinnacle corner market, so COU is never expected). The opening checkpoint
+    // is the Crown opening alone. Under-counting here would flip the point to
+    // 'captured' after the Crown pair and captureResearchTimelinePrices would
+    // then skip the Pinnacle rows the OU signal rules need.
+    return stage === "initial" ? 2 : 4;
+  }
   if (fixture.fixture_source === "pinnacle") {
     // Pinnacle-only fixtures have no HKJC or Crown counterpart.  Their COU
     // opening never exists in Pinnacle's feed, so the initial checkpoint
@@ -677,9 +685,11 @@ function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: 
 
 function filterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
+  // Show HKJC + Crown fixtures (包括皇冠有開盤而馬會無盤嘅場); 剩走純 Pinnacle-only
+  // fixtures (e.g. Fiji leagues). 賠率仍然收 HKJC + Pinnacle.
   const clauses = [
-    "m.fixture_source IN ('hkjc','pinnacle')",
-    "q.provider IN ('hkjc','pinnacle')",
+    "m.fixture_source IN ('hkjc','crown')",
+    "q.provider IN ('hkjc','pinnacle','crown')",
     "m.kickoff_utc>=?",
     "m.kickoff_utc<=?",
   ];
@@ -702,7 +712,8 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
  */
 function matchFilterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
-  const clauses = ["m.fixture_source IN ('hkjc','pinnacle')", "m.kickoff_utc>=?", "m.kickoff_utc<=?"];
+  // See filterSql — HKJC + Crown for the visible dataset.
+  const clauses = ["m.fixture_source IN ('hkjc','crown')", "m.kickoff_utc>=?", "m.kickoff_utc<=?"];
   const params: unknown[] = [bounds.lo, bounds.hi];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
@@ -715,7 +726,7 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
   // Keep HKJC and Pinnacle-only fixtures pending even before their first
   // snapshot or result so they surface in the research view without waiting.
   clauses.push(
-    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source IN ('hkjc','pinnacle'))",
+    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source IN ('hkjc','crown'))",
   );
   return { clause: clauses.join(" AND "), params };
 }
@@ -752,7 +763,10 @@ function researchCellStatus(
   const pairQuotes = stageQuotes.filter((quote) => quote.provider === provider && quote.market === market);
   if (pairQuotes.length >= 2) return "captured";
   if (pairQuotes.length > 0) return "partial";
-  if (fixtureSource === "crown" && provider !== "crown") return "source_unavailable";
+  // Crown-only fixtures (Crown 有盤、馬會無盤) genuinely have no HKJC counterpart,
+  // but Pinnacle prices ARE collected for them through the same titan id, so a
+  // Pinnacle cell must stay a real checkpoint instead of being written off.
+  if (fixtureSource === "crown" && provider === "hkjc") return "source_unavailable";
   // Pinnacle-only fixtures have no HKJC or Crown counterpart, and their
   // initial checkpoint has no external Tipsme opening.
   if (fixtureSource === "pinnacle" && provider !== "pinnacle") return "source_unavailable";
