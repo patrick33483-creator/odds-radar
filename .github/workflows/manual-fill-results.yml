@@ -47,8 +47,10 @@ jobs:
             "HOME='$HOME' AWAY='$AWAY' HOME_SCORE='$HOME_SCORE' AWAY_SCORE='$AWAY_SCORE' DATE_HKT='$DATE_HKT' sudo -E python3 -" <<'PY'
           import datetime, os, sqlite3, time
           hkt = datetime.timezone(datetime.timedelta(hours=8))
-          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
-          db.execute("PRAGMA busy_timeout=30000")
+          # 用長 timeout + WAL 讀取，寫時多次 retry
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=60, isolation_level=None)
+          db.execute("PRAGMA busy_timeout=60000")
+          db.execute("PRAGMA journal_mode=WAL")
           db.row_factory = sqlite3.Row
           home = os.environ["HOME"]
           away = os.environ["AWAY"]
@@ -79,16 +81,28 @@ jobs:
 
           now_ms = int(time.time() * 1000)
           for r in rows:
-              db.execute(
-                  """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
-                     VALUES(?,?,?,?,?,?,?,?,?)
-                     ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
-                       away_score=excluded.away_score,corners_total=excluded.corners_total,
-                       source=excluded.source,result_source=excluded.result_source,
-                       fetched_at=excluded.fetched_at""",
-                  (r["id"], None, hs, as_, None, "manual", "manual", None, now_ms),
-              )
-          db.commit()
+              for attempt in range(10):
+                  try:
+                      db.execute("BEGIN IMMEDIATE")
+                      db.execute(
+                          """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                             VALUES(?,?,?,?,?,?,?,?,?)
+                             ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+                               away_score=excluded.away_score,corners_total=excluded.corners_total,
+                               source=excluded.source,result_source=excluded.result_source,
+                               fetched_at=excluded.fetched_at""",
+                          (r["id"], None, hs, as_, None, "manual", "manual", None, now_ms),
+                      )
+                      db.execute("COMMIT")
+                      break
+                  except sqlite3.OperationalError as e:
+                      try: db.execute("ROLLBACK")
+                      except Exception: pass
+                      if "locked" in str(e) and attempt < 9:
+                          print(f"  attempt {attempt+1} locked, retrying...")
+                          time.sleep(2)
+                          continue
+                      raise
           print(f"填咗 {len(rows)} 場: {hs}-{as_}")
           db.close()
           PY
