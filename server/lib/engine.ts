@@ -986,9 +986,17 @@ export class RadarEngine {
     let attempts = 0;
     this.pinnacleTranslationRefreshRunning = true;
     try {
+      let titanFixtures: Awaited<ReturnType<PinnacleProvider["fetchTitanResearchFixtures"]>> = [];
+      try {
+        titanFixtures = await this.pinnacle.fetchTitanResearchFixtures([0, 1, 2, 3, 4]);
+      } catch (error) {
+        log("pinnacle_translation_titan_schedule_error", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       const wikidata = process.env.NODE_ENV === "test"
         ? undefined
-        : createWikidataEntityLookup({ maxDistinct: 60 });
+        : createWikidataEntityLookup({ maxDistinct: 300 });
       for (const target of limited) {
         const existing = getPinnacleTranslation(target.eventId);
         if (!shouldFetchTranslation(existing, now)) continue;
@@ -1002,7 +1010,7 @@ export class RadarEngine {
               league: target.league,
               kickoffUtc: target.kickoffUtc,
             },
-            { pinnacle: this.pinnacle, optic: this.optic, wikidata },
+            { pinnacle: this.pinnacle, titanFixtures, optic: this.optic, wikidata },
           );
           if (translation) {
             upsertPinnacleTranslation(translation, Date.now());
@@ -1058,15 +1066,16 @@ export class RadarEngine {
             AND (
               pt.pinnapi_id IS NULL
               OR (
-                (pt.zh_home IS NULL OR pt.zh_league IS NULL)
+                (pt.zh_home IS NULL OR pt.zh_away IS NULL OR pt.zh_league IS NULL)
                 AND (pt.attempt_count IS NULL OR pt.attempt_count < 3)
                 AND (pt.attempted_at IS NULL OR pt.attempted_at < ?)
               )
             )
-          ORDER BY m.kickoff_utc ASC
+          ORDER BY CASE WHEN m.kickoff_utc>=? THEN 0 ELSE 1 END,
+                   ABS(m.kickoff_utc-?) ASC
           LIMIT ?`,
       )
-      .all(kickoffFromMs, kickoffToMs, now - 4 * 60 * 60_000, clampedLimit) as Array<{
+      .all(kickoffFromMs, kickoffToMs, now - 4 * 60 * 60_000, now, now, clampedLimit) as Array<{
         event_id: string;
         kickoff_utc: number;
         league: string;

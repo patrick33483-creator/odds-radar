@@ -202,10 +202,25 @@ describe("pinnacleTranslation.shouldFetchTranslation", () => {
     expect(shouldFetchTranslation(null)).toBe(true);
   });
 
-  it("skips when both critical fields are already present", () => {
+  it("skips only when league and both team labels are present", () => {
     expect(
-      shouldFetchTranslation({ zh_home: "阿仙奴", zh_league: "英超", attempted_at: 0, attempt_count: 1 }),
+      shouldFetchTranslation({
+        zh_home: "阿仙奴",
+        zh_away: "車路士",
+        zh_league: "英超",
+        attempted_at: 0,
+        attempt_count: 1,
+      }),
     ).toBe(false);
+    expect(
+      shouldFetchTranslation({
+        zh_home: "阿仙奴",
+        zh_away: null,
+        zh_league: "英超",
+        attempted_at: 0,
+        attempt_count: 1,
+      }),
+    ).toBe(true);
   });
 
   it("skips after three failed attempts", () => {

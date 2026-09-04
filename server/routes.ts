@@ -199,7 +199,9 @@ function installAutoWindowScan(): void {
  * fixtures in Chinese. It is intentionally decoupled from the research
  * timeline: it never runs on the auto-scan tick and never blocks OU capture.
  * Enabled by default; set RADAR_PINNACLE_TRANSLATION_BACKFILL=0 to disable.
- * Default cadence: every 5 minutes, up to 50 fixtures per run.
+ * Default cadence: every minute, up to 100 fixtures per run. Upcoming fixtures
+ * are prioritised by kickoff time so untranslated old rows cannot starve live
+ * research coverage.
  */
 function installPinnacleTranslationBackfill(): void {
   if (
@@ -207,17 +209,17 @@ function installPinnacleTranslationBackfill(): void {
     pinnacleTranslationBackfillTimer
   ) return;
   const configuredMinutes = Number(
-    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_INTERVAL_MINUTES ?? 5,
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_INTERVAL_MINUTES ?? 1,
   );
   const intervalMs =
-    Math.max(5, Math.min(6 * 60, Number.isFinite(configuredMinutes) ? configuredMinutes : 5)) *
+    Math.max(1, Math.min(6 * 60, Number.isFinite(configuredMinutes) ? configuredMinutes : 1)) *
     60_000;
   const configuredBatch = Number(
-    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_BATCH ?? 50,
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_BATCH ?? 100,
   );
   const batchSize = Math.max(
     1,
-    Math.min(100, Number.isFinite(configuredBatch) ? configuredBatch : 50),
+    Math.min(200, Number.isFinite(configuredBatch) ? configuredBatch : 100),
   );
   const run = async () => {
     if (pinnacleTranslationBackfillInFlight) return;

@@ -44,6 +44,8 @@ export interface TranslationInput {
 
 export interface TranslationDeps {
   pinnacle: Pick<PinnacleProvider, "fetchTitanResearchFixtures">;
+  /** Reuse one schedule fetch for a whole batch instead of five pages per fixture. */
+  titanFixtures?: readonly PinnacleFixture[];
   optic?: { fetchFixtures: OpticOddsProvider["fetchFixtures"] };
   wikidata?: WikidataEntityLookup;
 }
@@ -148,7 +150,8 @@ export async function translatePinnacleFixture(
   // titan007's Next_/Over_ schedule pages are Chinese by default. The provider
   // already re-uses the caller-side rate limiter.
   try {
-    const titan = await deps.pinnacle.fetchTitanResearchFixtures([0, 1, 2, 3, 4]);
+    const titan = deps.titanFixtures
+      ?? await deps.pinnacle.fetchTitanResearchFixtures([0, 1, 2, 3, 4]);
     const candidate = findFuzzyMatch(fixture, titan);
     if (candidate) {
       const zhHome = containsCjk(candidate.homeTeam) ? candidate.homeTeam : null;
@@ -226,6 +229,7 @@ export async function translatePinnacleFixture(
 export function shouldFetchTranslation(
   existing: {
     zh_home: string | null;
+    zh_away?: string | null;
     zh_league: string | null;
     attempted_at: number | null;
     attempt_count: number;
@@ -233,7 +237,7 @@ export function shouldFetchTranslation(
   now = Date.now(),
 ): boolean {
   if (!existing) return true;
-  if (existing.zh_home && existing.zh_league) return false;
+  if (existing.zh_home && existing.zh_away && existing.zh_league) return false;
   if (existing.attempt_count >= 3) return false;
   if (existing.attempted_at === null) return true;
   return now - existing.attempted_at > 4 * 60 * 60_000;
