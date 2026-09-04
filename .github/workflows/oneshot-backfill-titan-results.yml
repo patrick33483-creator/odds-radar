@@ -1,0 +1,143 @@
+name: 一次性 titan007 賽果 backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 回溯幾多日（default 7）
+        required: false
+        default: "7"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 直接 backfill titan007 賽果落 research_results 表
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          LOOKBACK: ${{ github.event.inputs.lookback_days }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "LOOKBACK=$LOOKBACK sudo -E python3 -" <<'PY'
+          import datetime
+          import json
+          import os
+          import re
+          import sqlite3
+          import time
+          import urllib.request
+
+          LOOKBACK = int(os.environ.get("LOOKBACK") or "7")
+          now_ms = int(time.time() * 1000)
+          cutoff = now_ms - 105 * 60 * 1000
+          lo = now_ms - LOOKBACK * 24 * 3600 * 1000
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+
+          cands = db.execute(
+              """SELECT m.id, m.titan_id, m.kickoff_utc
+                   FROM matches m
+                   LEFT JOIN research_results rr ON rr.match_id=m.id
+                  WHERE rr.match_id IS NULL
+                    AND m.kickoff_utc<=?
+                    AND m.kickoff_utc>=?
+                    AND m.fixture_source!='hkjc'
+                    AND m.titan_id IS NOT NULL""",
+              (cutoff, lo),
+          ).fetchall()
+          print(f"candidates: {len(cands)}")
+
+          by_date = {}
+          for r in cands:
+              day = datetime.datetime.fromtimestamp(
+                  r["kickoff_utc"] / 1000, tz=hkt
+              ).strftime("%Y%m%d")
+              by_date.setdefault(day, []).append(r)
+          print(f"date buckets: {sorted(by_date.keys())}")
+
+          def strip_tags(s):
+              return re.sub(r"<[^>]+>", "", s or "").strip()
+
+          def parse_page(html):
+              out = {}
+              row_re = re.compile(r"<tr[^>]*sId='(\d+)'[^>]*>([\s\S]*?)</tr>")
+              for m in row_re.finditer(html):
+                  sid = m.group(1)
+                  row = m.group(2)
+                  raw = re.findall(r"<td[^>]*>[\s\S]*?</td>", row)
+                  if len(raw) < 7:
+                      continue
+                  cells = [strip_tags(c) for c in raw]
+                  score = re.search(r"(\d+)\s*-\s*(\d+)", cells[4])
+                  if not score:
+                      continue
+                  out[sid] = (int(score.group(1)), int(score.group(2)))
+              return out
+
+          total_collected = 0
+          for day, rows in by_date.items():
+              scores = {}
+              for kind in ("Over", "Next"):
+                  url = f"http://bf.titan007.com/football/{kind}_{day}.htm"
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          "User-Agent": "Mozilla/5.0",
+                          "Referer": "http://bf.titan007.com/",
+                      })
+                      raw = urllib.request.urlopen(req, timeout=25).read()
+                      html = raw.decode("gb18030", errors="ignore")
+                      day_scores = parse_page(html)
+                      for sid, sc in day_scores.items():
+                          if sid not in scores:
+                              scores[sid] = sc
+                      print(f"  {kind}_{day}: {len(day_scores)} scored rows")
+                  except Exception as e:
+                      print(f"  {kind}_{day}: ERR {e}")
+
+              collected = 0
+              for row in rows:
+                  sc = scores.get(row["titan_id"])
+                  if not sc:
+                      continue
+                  db.execute(
+                      """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                         VALUES(?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+                           away_score=excluded.away_score,corners_total=excluded.corners_total,
+                           source=excluded.source,result_source=excluded.result_source,
+                           source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at""",
+                      (row["id"], None, sc[0], sc[1], None, "titan007", "titan007", row["titan_id"], now_ms),
+                  )
+                  collected += 1
+              db.commit()
+              total_collected += collected
+              print(f"day {day}: matched={collected}/{len(rows)}")
+
+          print(f"TOTAL COLLECTED: {total_collected}")
+
+          past = db.execute("SELECT COUNT(*) c FROM matches WHERE kickoff_utc<=? AND kickoff_utc>=?", (cutoff, lo)).fetchone()["c"]
+          with_res = db.execute(
+              """SELECT COUNT(*) c FROM matches m
+                 WHERE m.kickoff_utc<=? AND m.kickoff_utc>=?
+                   AND EXISTS(SELECT 1 FROM research_results rr WHERE rr.match_id=m.id)""",
+              (cutoff, lo),
+          ).fetchone()["c"]
+          print(json.dumps({
+              "past_matches": past,
+              "with_result": with_res,
+              "coverage_pct": round(with_res * 100 / max(past, 1), 1),
+          }, indent=2))
+          db.close()
+          PY
