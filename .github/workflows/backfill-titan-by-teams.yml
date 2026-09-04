@@ -1,0 +1,210 @@
+name: 一次性 titan007 賽果 backfill（隊名+開波時間 match）
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 回溯幾多日
+        required: false
+        default: "7"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 用隊名+開波時間 fuzzy match titan007
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          LOOKBACK: ${{ github.event.inputs.lookback_days }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "LOOKBACK=$LOOKBACK sudo -E python3 -" <<'PY'
+          import datetime, json, os, re, sqlite3, time, urllib.request
+
+          LOOKBACK = int(os.environ.get("LOOKBACK") or "7")
+          now_ms = int(time.time() * 1000)
+          cutoff = now_ms - 105 * 60 * 1000
+          lo = now_ms - LOOKBACK * 24 * 3600 * 1000
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+
+          # 1. Candidates：past + 未有 result + 非 hkjc
+          cands = db.execute(
+              """SELECT m.id, m.kickoff_utc, m.home_team, m.away_team, m.fixture_source
+                   FROM matches m
+                   LEFT JOIN research_results rr ON rr.match_id=m.id
+                  WHERE rr.match_id IS NULL AND m.kickoff_utc<=? AND m.kickoff_utc>=?
+                    AND m.fixture_source!='hkjc'""",
+              (cutoff, lo),
+          ).fetchall()
+          print(f"candidates: {len(cands)}")
+
+          # 2. 決定要 fetch 邊啲日
+          days = set()
+          for r in cands:
+              d = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt)
+              days.add(d.strftime("%Y%m%d"))
+              # 亦包上一日（跨日場）
+              days.add((d - datetime.timedelta(days=1)).strftime("%Y%m%d"))
+          days = sorted(days)
+          print(f"days to fetch: {days}")
+
+          # 3. Fetch + parse Over_ + Next_
+          def strip_tags(s): return re.sub(r"<[^>]+>", "", s or "").strip()
+
+          def parse_time(text, day_str):
+              # "3日11:40" or "9-4 11:00"
+              m = re.search(r"(\d+)[-月日:](\d+)\s*(\d+):(\d+)", text)
+              if m:
+                  # 有月日：用當日推 year，跨月要 handle
+                  year = int(day_str[:4])
+                  month = int(m.group(1))
+                  day = int(m.group(2))
+                  hour, mi = int(m.group(3)), int(m.group(4))
+                  try:
+                      dt = datetime.datetime(year, month, day, hour, mi, tzinfo=hkt)
+                      return int(dt.timestamp() * 1000)
+                  except ValueError:
+                      return None
+              m2 = re.search(r"(\d+)日\s*(\d+):(\d+)", text)
+              if m2:
+                  year = int(day_str[:4])
+                  month = int(day_str[4:6])
+                  day = int(m2.group(1))
+                  hour, mi = int(m2.group(2)), int(m2.group(3))
+                  try:
+                      dt = datetime.datetime(year, month, day, hour, mi, tzinfo=hkt)
+                      return int(dt.timestamp() * 1000)
+                  except ValueError:
+                      return None
+              m3 = re.search(r"(\d+):(\d+)", text)
+              if m3:
+                  year = int(day_str[:4])
+                  month = int(day_str[4:6])
+                  day = int(day_str[6:8])
+                  hour, mi = int(m3.group(1)), int(m3.group(2))
+                  try:
+                      dt = datetime.datetime(year, month, day, hour, mi, tzinfo=hkt)
+                      return int(dt.timestamp() * 1000)
+                  except ValueError:
+                      return None
+              return None
+
+          def parse_page(html, day_str):
+              rows = []
+              row_re = re.compile(r"<tr[^>]*sId=['\"]?(\d+)['\"]?[^>]*>([\s\S]*?)</tr>")
+              for m in row_re.finditer(html):
+                  raw_cells = re.findall(r"<td[^>]*>[\s\S]*?</td>", m.group(2))
+                  if len(raw_cells) < 7: continue
+                  cells = [strip_tags(c) for c in raw_cells]
+                  time_txt = cells[1]
+                  home = re.sub(r"\[[^\]]*\]", "", cells[3]).strip()
+                  away = re.sub(r"\[[^\]]*\]", "", cells[5]).strip()
+                  score_txt = cells[4]
+                  sc = re.search(r"(\d+)\s*-\s*(\d+)", score_txt)
+                  score = (int(sc.group(1)), int(sc.group(2))) if sc else None
+                  ko = parse_time(time_txt, day_str)
+                  rows.append({"home": home, "away": away, "kickoff_ms": ko, "score": score})
+              return rows
+
+          all_rows = []
+          for day in days:
+              for kind in ("Over", "Next"):
+                  try:
+                      req = urllib.request.Request(
+                          f"http://bf.titan007.com/football/{kind}_{day}.htm",
+                          headers={"User-Agent":"Mozilla/5.0","Referer":"http://bf.titan007.com/"})
+                      raw = urllib.request.urlopen(req, timeout=25).read()
+                      html = raw.decode("gb18030","ignore")
+                      rows = parse_page(html, day)
+                      scored = sum(1 for r in rows if r["score"])
+                      print(f"  {kind}_{day}: total={len(rows)} scored={scored}")
+                      all_rows.extend(rows)
+                  except Exception as e:
+                      print(f"  {kind}_{day}: ERR {e}")
+
+          # 4. 建 index：(home, away) -> list of rows
+          from collections import defaultdict
+          by_pair = defaultdict(list)
+          for r in all_rows:
+              by_pair[(r["home"], r["away"])].append(r)
+          print(f"\ntitan007 rows: {len(all_rows)}, unique pairs: {len(by_pair)}")
+
+          # 5. Match + upsert
+          TOL_MS = 20 * 60 * 1000  # ±20 min
+          matched_scored = 0
+          matched_no_score = 0
+          no_pair = 0
+          no_time = 0
+          for c in cands:
+              key = (c["home_team"], c["away_team"])
+              opts = by_pair.get(key)
+              if not opts:
+                  no_pair += 1
+                  continue
+              # 揀 kickoff 最近嘅
+              best = None
+              best_diff = None
+              for r in opts:
+                  if r["kickoff_ms"] is None:
+                      continue
+                  diff = abs(r["kickoff_ms"] - c["kickoff_utc"])
+                  if diff <= TOL_MS and (best_diff is None or diff < best_diff):
+                      best = r
+                      best_diff = diff
+              if best is None:
+                  # 冇時間 match，但 pair 存在——如果只有一個 option 而且有分，仍然用
+                  scored_opts = [r for r in opts if r["score"]]
+                  if len(scored_opts) == 1:
+                      best = scored_opts[0]
+                  else:
+                      no_time += 1
+                      continue
+              if not best["score"]:
+                  matched_no_score += 1
+                  continue
+              db.execute(
+                  """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                     VALUES(?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+                       away_score=excluded.away_score,corners_total=excluded.corners_total,
+                       source=excluded.source,result_source=excluded.result_source,
+                       source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at""",
+                  (c["id"], None, best["score"][0], best["score"][1], None, "titan007", "titan007", None, now_ms),
+              )
+              matched_scored += 1
+          db.commit()
+
+          print(f"\n=== 結果 ===")
+          print(f"  matched with score:    {matched_scored}")
+          print(f"  matched, no score yet: {matched_no_score}")
+          print(f"  pair found, no time:   {no_time}")
+          print(f"  pair not found:        {no_pair}")
+
+          # 覆蓋率
+          past = db.execute("SELECT COUNT(*) c FROM matches WHERE kickoff_utc<=? AND kickoff_utc>=?", (cutoff, lo)).fetchone()["c"]
+          with_res = db.execute(
+              """SELECT COUNT(*) c FROM matches m
+                 WHERE m.kickoff_utc<=? AND m.kickoff_utc>=?
+                   AND EXISTS(SELECT 1 FROM research_results rr WHERE rr.match_id=m.id)""",
+              (cutoff, lo),
+          ).fetchone()["c"]
+          print(json.dumps({
+              "past_matches": past,
+              "with_result": with_res,
+              "coverage_pct": round(with_res * 100 / max(past, 1), 1),
+          }, indent=2))
+          db.close()
+          PY
