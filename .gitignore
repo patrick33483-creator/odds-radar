@@ -20,3 +20,6 @@ backups/
 data/
 scratch_*.ts
 tmpprobe/
+
+__pycache__/
+*.pyc

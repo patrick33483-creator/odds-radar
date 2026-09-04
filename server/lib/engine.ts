@@ -854,13 +854,11 @@ export class RadarEngine {
     });
     upsertTx();
 
-    // Translation performs broad third-party metadata fetches and must stay
-    // disabled on the latency-sensitive research timeline unless an operator
-    // explicitly opts in. Existing cached translations remain available to
-    // the UI and OU notifications while capture always gets priority.
-    if (process.env.RADAR_PINNACLE_TRANSLATION_ENABLED === "1") {
-      void this.translatePinnacleOnlyTargets(targets, now);
-    }
+    // Translation is deliberately never invoked from the latency-sensitive
+    // research timeline. Chinese labels are backfilled by the independent
+    // installPinnacleTranslationBackfill worker; cached rows in
+    // `pinnacle_translations` remain available to the UI and OU notifications
+    // while capture always gets priority here.
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
@@ -960,6 +958,128 @@ export class RadarEngine {
       rows,
     });
     return { fixtures: targets.length, fetched, failed, rows };
+  }
+
+  /**
+   * Run one bounded translation backfill batch against the given fixtures.
+   * Intended to be invoked from an independent low-frequency scheduler — NOT
+   * from the research timeline. Respects a per-run `maxFixtures` cap so a
+   * slow provider cannot monopolise the worker loop.
+   */
+  async runPinnacleTranslationBackfillBatch(
+    targets: Array<{
+      eventId: string;
+      kickoffUtc: number;
+      league: string;
+      homeTeam: string;
+      awayTeam: string;
+    }>,
+    now: number = Date.now(),
+    options: { maxFixtures?: number } = {},
+  ): Promise<{ scanned: number; translated: number; attempts: number }> {
+    if (this.pinnacleTranslationRefreshRunning) {
+      return { scanned: 0, translated: 0, attempts: 0 };
+    }
+    const cap = Math.max(1, Math.min(200, options.maxFixtures ?? 25));
+    const limited = targets.slice(0, cap);
+    let translated = 0;
+    let attempts = 0;
+    this.pinnacleTranslationRefreshRunning = true;
+    try {
+      const wikidata = process.env.NODE_ENV === "test"
+        ? undefined
+        : createWikidataEntityLookup({ maxDistinct: 60 });
+      for (const target of limited) {
+        const existing = getPinnacleTranslation(target.eventId);
+        if (!shouldFetchTranslation(existing, now)) continue;
+        attempts++;
+        try {
+          const translation = await translatePinnacleFixture(
+            {
+              pinnapiId: target.eventId,
+              homeTeam: target.homeTeam,
+              awayTeam: target.awayTeam,
+              league: target.league,
+              kickoffUtc: target.kickoffUtc,
+            },
+            { pinnacle: this.pinnacle, optic: this.optic, wikidata },
+          );
+          if (translation) {
+            upsertPinnacleTranslation(translation, Date.now());
+            translated++;
+          } else {
+            markPinnacleTranslationAttempt(target.eventId, null, Date.now());
+          }
+        } catch (error) {
+          if (error instanceof WikidataLookupBudgetExhaustedError) break;
+          const message = error instanceof Error ? error.message : String(error);
+          markPinnacleTranslationAttempt(target.eventId, message, Date.now());
+          log("pinnacle_translation_error", {
+            pinnapiId: target.eventId,
+            error: message,
+          });
+        }
+      }
+    } finally {
+      this.pinnacleTranslationRefreshRunning = false;
+    }
+    return { scanned: limited.length, translated, attempts };
+  }
+
+  /**
+   * Return recent Pinnacle-only fixtures that still need Chinese labels. The
+   * query is bounded so the backfill worker never spans the entire matches
+   * table.
+   */
+  listPinnacleTranslationBackfillTargets(
+    limit: number = 200,
+    now: number = Date.now(),
+  ): Array<{
+    eventId: string;
+    kickoffUtc: number;
+    league: string;
+    homeTeam: string;
+    awayTeam: string;
+  }> {
+    const clampedLimit = Math.max(1, Math.min(500, limit));
+    const kickoffFromMs = now - 24 * 60 * 60_000;
+    const kickoffToMs = now + 7 * 24 * 60 * 60_000;
+    const rows = rawDb
+      .prepare(
+        `SELECT SUBSTR(m.id, 10) AS event_id,
+                m.kickoff_utc AS kickoff_utc,
+                m.league AS league,
+                m.home_team AS home_team,
+                m.away_team AS away_team
+           FROM matches m
+           LEFT JOIN pinnacle_translations pt ON pt.pinnapi_id = SUBSTR(m.id, 10)
+          WHERE m.fixture_source = 'pinnacle'
+            AND m.kickoff_utc BETWEEN ? AND ?
+            AND (
+              pt.pinnapi_id IS NULL
+              OR (
+                (pt.zh_home IS NULL OR pt.zh_league IS NULL)
+                AND (pt.attempt_count IS NULL OR pt.attempt_count < 3)
+                AND (pt.attempted_at IS NULL OR pt.attempted_at < ?)
+              )
+            )
+          ORDER BY m.kickoff_utc ASC
+          LIMIT ?`,
+      )
+      .all(kickoffFromMs, kickoffToMs, now - 4 * 60 * 60_000, clampedLimit) as Array<{
+        event_id: string;
+        kickoff_utc: number;
+        league: string;
+        home_team: string;
+        away_team: string;
+      }>;
+    return rows.map((row) => ({
+      eventId: row.event_id,
+      kickoffUtc: row.kickoff_utc,
+      league: row.league,
+      homeTeam: row.home_team,
+      awayTeam: row.away_team,
+    }));
   }
 
   private async translatePinnacleOnlyTargets(

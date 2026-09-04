@@ -36,6 +36,9 @@ let researchOpeningsInFlight: Promise<Awaited<ReturnType<typeof collectResearchI
 let quoteDirectionWatchTimer: NodeJS.Timeout | null = null;
 let quoteDirectionWatchStartupTimer: NodeJS.Timeout | null = null;
 let quoteDirectionWatchInFlight: Promise<ReturnType<typeof syncQuoteDirectionWatchObservations>> | null = null;
+let pinnacleTranslationBackfillTimer: NodeJS.Timeout | null = null;
+let pinnacleTranslationBackfillStartupTimer: NodeJS.Timeout | null = null;
+let pinnacleTranslationBackfillInFlight: Promise<{ scanned: number; translated: number; attempts: number }> | null = null;
 const researchHkjc = new HkjcProvider();
 
 function installResearchResultCollection(): void {
@@ -190,6 +193,70 @@ function installAutoWindowScan(): void {
   autoScanTimer.unref();
 }
 
+/**
+ * Independent, rate-limited backfill loop that fills Chinese labels in
+ * `pinnacle_translations` so OU Telegram notifications can render Pinnacle-only
+ * fixtures in Chinese. It is intentionally decoupled from the research
+ * timeline: it never runs on the auto-scan tick and never blocks OU capture.
+ * Disabled unless RADAR_PINNACLE_TRANSLATION_BACKFILL=1.
+ */
+function installPinnacleTranslationBackfill(): void {
+  if (
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL !== "1" ||
+    pinnacleTranslationBackfillTimer
+  ) return;
+  const configuredMinutes = Number(
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_INTERVAL_MINUTES ?? 15,
+  );
+  const intervalMs =
+    Math.max(5, Math.min(6 * 60, Number.isFinite(configuredMinutes) ? configuredMinutes : 15)) *
+    60_000;
+  const configuredBatch = Number(
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_BATCH ?? 25,
+  );
+  const batchSize = Math.max(
+    1,
+    Math.min(100, Number.isFinite(configuredBatch) ? configuredBatch : 25),
+  );
+  const run = async () => {
+    if (pinnacleTranslationBackfillInFlight) return;
+    const now = Date.now();
+    const targets = engine.listPinnacleTranslationBackfillTargets(batchSize * 2, now);
+    pinnacleTranslationBackfillInFlight = engine.runPinnacleTranslationBackfillBatch(
+      targets,
+      now,
+      { maxFixtures: batchSize },
+    );
+    try {
+      const outcome = await pinnacleTranslationBackfillInFlight;
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "pinnacle_translation_backfill",
+          ...outcome,
+        }),
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "pinnacle_translation_backfill_error",
+          error: (err as Error).message,
+        }),
+      );
+    } finally {
+      pinnacleTranslationBackfillInFlight = null;
+    }
+  };
+  // Let auto-scan and prewarm land first before touching third-party feeds.
+  pinnacleTranslationBackfillStartupTimer = setTimeout(() => void run(), 3 * 60_000);
+  pinnacleTranslationBackfillStartupTimer.unref();
+  pinnacleTranslationBackfillTimer = setInterval(() => void run(), intervalMs);
+  pinnacleTranslationBackfillTimer.unref();
+}
+
 function installHourlyPrewarm(): void {
   if (process.env.RADAR_HOURLY_PREWARM === "0" || hourlyPrewarmTimer) return;
   let running = false;
@@ -327,6 +394,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   installResearchOpeningCollection();
   installQuoteDirectionWatchCollection();
   installResearchResultCollection();
+  installPinnacleTranslationBackfill();
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.dashboardData();
