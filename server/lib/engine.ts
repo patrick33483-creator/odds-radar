@@ -785,10 +785,10 @@ export class RadarEngine {
   }
 
   /**
-   * Isolated Pinnacle-only research ingestion.  For every PinnAPI fixture that
-   * is NOT already mapped to an HKJC-linked match, we persist a fixture row
-   * (`id='pinnacle:<eventId>'`, `fixture_source='pinnacle'`, `hkjc_id=NULL`)
-   * and capture live prices into `research_timeline_snapshots`.
+   * Isolated Pinnacle-only research ingestion. Titan007's Chinese schedule is
+   * the fixture/name source and its stable sId is used to fetch the Pinnacle
+   * row from Titan's odds pages. PinnAPI is only a coarse availability/time
+   * index here; none of its English labels are persisted.
    *
    * This method NEVER touches `odds_latest`, `market_lines`, `opportunities`,
    * `simulation_bets`, Crown detail, HKJC execution, or the T-30 window
@@ -801,45 +801,54 @@ export class RadarEngine {
     // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
     // mock refreshPinnacleFixtures can still assert exact call counts, and so
     // the runResearchTimelineTick order-of-operations stays deterministic.
+    const titan = this.fixtureCache?.titan ?? [];
     const pinnapi = this.fixtureCache?.pinnapi ?? [];
-    if (!pinnapi.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
+    if (!titan.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
-    // Skip PinnAPI ids already mapped to an HKJC-linked match, so we do not
+    // Skip Titan ids already mapped to an HKJC-linked match, so we do not
     // shadow the HKJC canonical row.
     const mapped = new Set(
       (rawDb.prepare(
-        "SELECT pinnapi_id FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL",
-      ).all() as Array<{ pinnapi_id: string | null }>).map((row) => row.pinnapi_id).filter((v): v is string => !!v),
+        "SELECT titan_id FROM matches WHERE fixture_source='hkjc' AND titan_id IS NOT NULL",
+      ).all() as Array<{ titan_id: string | null }>).map((row) => row.titan_id).filter((v): v is string => !!v),
     );
     const upsertFixture = rawDb.prepare(
       `INSERT INTO matches(
         id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
         home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
-      ) VALUES(?,NULL,'pinnacle',NULL,?,?,NULL,?,?,NULL,NULL,?,?,?,?)
+      ) VALUES(?,NULL,'pinnacle',?,?,?,NULL,?,?,NULL,NULL,?,?,0,?)
        ON CONFLICT(id) DO UPDATE SET league=excluded.league,home_team=excluded.home_team,
          away_team=excluded.away_team,kickoff_utc=excluded.kickoff_utc,
-         status=excluded.status,inplay=excluded.inplay,updated_at=excluded.updated_at
+         status=excluded.status,titan_id=excluded.titan_id,
+         pinnacle_match_id=excluded.pinnacle_match_id,updated_at=excluded.updated_at
          WHERE matches.fixture_source='pinnacle'`,
     );
 
+    // PinnAPI times reduce needless Titan detail calls, but its English names
+    // are intentionally ignored. The Titan detail page remains authoritative
+    // for whether a Pinnacle quote actually exists.
+    const coarseTimes = pinnapi.map((fixture) => fixture.kickoffUtc);
     const targets: PinnacleResearchTarget[] = [];
     const upsertTx = rawDb.transaction(() => {
-      for (const fixture of pinnapi) {
-        if (fixture.parentId) continue; // prefer parent events only
+      for (const fixture of titan) {
         if (mapped.has(fixture.providerMatchId)) continue;
+        if (
+          coarseTimes.length &&
+          !coarseTimes.some((kickoff) => Math.abs(kickoff - fixture.kickoffUtc) <= 35 * 60_000)
+        ) continue;
         // Only fixtures still in the future or just kicked off are useful for
         // research; historical rows may still be settled later by a separate job.
         if (fixture.kickoffUtc < now - 5 * 60_000) continue;
-        const matchId = `pinnacle:${fixture.providerMatchId}`;
+        const matchId = `pinnacle:titan:${fixture.providerMatchId}`;
         upsertFixture.run(
           matchId,
-          `pinnapi:${fixture.providerMatchId}`,
+          fixture.providerMatchId,
+          `titan:${fixture.providerMatchId}`,
           fixture.league,
           fixture.homeTeam,
           fixture.awayTeam,
           fixture.kickoffUtc,
-          fixture.status,
-          fixture.inplay ? 1 : 0,
+          fixture.statusText || "PREEVENT",
           now,
         );
         targets.push({
@@ -853,12 +862,6 @@ export class RadarEngine {
       }
     });
     upsertTx();
-
-    // Translation is deliberately never invoked from the latency-sensitive
-    // research timeline. Chinese labels are backfilled by the independent
-    // installPinnacleTranslationBackfill worker; cached rows in
-    // `pinnacle_translations` remain available to the UI and OU notifications
-    // while capture always gets priority here.
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
@@ -876,19 +879,15 @@ export class RadarEngine {
     let fetched = 0;
     let failed = 0;
     let rows = 0;
-    const normalCaptured: PendingPinnacleResearchTarget[] = [];
-
     // First pass: capture normal markets for every pending milestone. Never
     // wait for a slower corner request before writing the main OU snapshot.
     for (const target of eligible) {
       if (Date.now() > deadline) break;
       try {
         let normalPrices: ProviderPrice[] = [];
-        if (DEMO) {
-          normalPrices = DEMO_FIXTURE.pinnaclePrices[`pinnapi:${target.eventId}`] ?? [];
-        } else if (this.pinnapi.status().configured) {
-          normalPrices = await this.pinnapi.fetchMatchPrices(target.eventId);
-        }
+        normalPrices = DEMO
+          ? DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? []
+          : await this.pinnacle.fetchMatchPrices(target.eventId);
         fetched++;
         if (normalPrices.length) {
           const inserted = captureResearchTimelinePrices(
@@ -899,37 +898,10 @@ export class RadarEngine {
             Date.now(),
           );
           if (inserted) rows++;
-          normalCaptured.push(target);
         }
       } catch (err) {
         failed++;
         log("pinnacle_only_detail_error", { eventId: target.eventId, error: (err as Error).message });
-      }
-    }
-
-    // Second pass: corners are useful research data but must never delay the
-    // normal OU milestone. Only attempt them after the priority queue's normal
-    // prices have been persisted.
-    if (!DEMO && this.pinnapi.status().configured) {
-      for (const target of normalCaptured) {
-        if (Date.now() > deadline) break;
-        try {
-          const cornerPrices = (await this.pinnapi.fetchEventCornerLines(target.eventId)).prices;
-          if (!cornerPrices.length) continue;
-          const inserted = captureResearchTimelinePrices(
-          target.matchId,
-          "pinnacle",
-          cornerPrices,
-          target.kickoffUtc,
-          Date.now(),
-        );
-          if (inserted) rows++;
-        } catch (cornerError) {
-          log("pinnacle_only_corner_unavailable", {
-            eventId: target.eventId,
-            error: (cornerError as Error).message,
-          });
-        }
       }
     }
 

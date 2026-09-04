@@ -397,7 +397,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   installResearchOpeningCollection();
   installQuoteDirectionWatchCollection();
   installResearchResultCollection();
-  installPinnacleTranslationBackfill();
+  // Pinnacle-only fixture labels now come directly from Titan007's Chinese
+  // schedule via stable sId. Do not run an English-to-Chinese backfill worker.
 
   app.get("/api/status", (_req, res) => {
     const dash = engine.dashboardData();

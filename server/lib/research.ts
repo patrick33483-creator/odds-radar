@@ -311,10 +311,9 @@ export function expectedPairCount(matchId: string, stage: ResearchStage): number
   const fixture = fixtureIdentity(matchId);
   if (fixture.fixture_source === "crown") return 2; // Crown AH + OU only.
   if (fixture.fixture_source === "pinnacle") {
-    // Pinnacle-only fixtures have no HKJC or Crown counterpart.  Their COU
-    // opening never exists in Pinnacle's feed, so the initial checkpoint
-    // targets AH + OU (2) while T-30/T-15/T-5 also include Pinnacle COU (3).
-    return stage === "initial" ? 2 : 3;
+    // Titan-driven Pinnacle-only fixtures collect Pinnacle AH + OU. Corners
+    // are not exposed by Titan's standard Pinnacle detail rows.
+    return 2;
   }
   const base = stage === "initial" ? INITIAL_AVAILABLE_PAIRS : 6;
   return base + (fixture.titan_id ? 2 : 0);
@@ -804,8 +803,9 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
     "q.provider IN ('hkjc','pinnacle')",
     "m.kickoff_utc>=?",
     "m.kickoff_utc<=?",
+    "(m.fixture_source='hkjc' OR m.titan_id IS NOT NULL OR m.kickoff_utc<?)",
   ];
-  const params: unknown[] = [bounds.lo, bounds.hi];
+  const params: unknown[] = [bounds.lo, bounds.hi, now];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
     params.push(filters.provider);
@@ -824,8 +824,13 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
  */
 function matchFilterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
-  const clauses = ["m.fixture_source IN ('hkjc','pinnacle')", "m.kickoff_utc>=?", "m.kickoff_utc<=?"];
-  const params: unknown[] = [bounds.lo, bounds.hi];
+  const clauses = [
+    "m.fixture_source IN ('hkjc','pinnacle')",
+    "m.kickoff_utc>=?",
+    "m.kickoff_utc<=?",
+    "(m.fixture_source='hkjc' OR m.titan_id IS NOT NULL OR m.kickoff_utc<?)",
+  ];
+  const params: unknown[] = [bounds.lo, bounds.hi, now];
   if (filters.provider !== "all") {
     clauses.push("q.provider=?");
     params.push(filters.provider);
@@ -834,10 +839,11 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
     clauses.push("q.market=?");
     params.push(filters.market);
   }
-  // Keep HKJC and Pinnacle-only fixtures pending even before their first
-  // snapshot or result so they surface in the research view without waiting.
+  // HKJC remains visible before capture. A Titan fixture only becomes a
+  // Pinnacle-only research row after a genuine Pinnacle quote is captured;
+  // this prevents Titan fixtures with no Pinnacle market from appearing.
   clauses.push(
-    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source IN ('hkjc','pinnacle'))",
+    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source='hkjc')",
   );
   return { clause: clauses.join(" AND "), params };
 }
@@ -972,9 +978,9 @@ export function researchDataset(
   const matchRows = rawDb
     .prepare(
       `SELECT m.id match_id,m.hkjc_id,m.fixture_source,m.titan_id,
-              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
-              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
-              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+              CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+              CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+              CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
               m.kickoff_utc,
               COUNT(q.id) snapshot_count,MIN(q.captured_at) first_snapshot_at,
               MAX(q.captured_at) last_snapshot_at,
@@ -1187,9 +1193,9 @@ export function researchCsv(
       .prepare(
         `SELECT DISTINCT m.id,m.hkjc_id,m.fixture_source,m.titan_id,
                 CASE WHEN m.titan_id IS NOT NULL THEN 'titan:'||m.titan_id ELSE 'hkjc:'||m.hkjc_id END fixture_key,
-                CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
-                CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
-                CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+                CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+                CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+                CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
                 m.kickoff_utc,
                 COALESCE(rr.home_score,r.home_score) home_score,
                 COALESCE(rr.away_score,r.away_score) away_score,
@@ -1236,9 +1242,9 @@ export function researchCsv(
     .prepare(
       `SELECT q.id,q.match_id,m.hkjc_id,m.fixture_source,m.titan_id,
               CASE WHEN m.titan_id IS NOT NULL THEN 'titan:'||m.titan_id ELSE 'hkjc:'||m.hkjc_id END fixture_key,
-              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
-              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
-              CASE WHEN m.fixture_source='pinnacle' AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
+              CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
+              CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
+              CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
               m.kickoff_utc,
               q.provider,q.market,q.stage,q.target_at,q.line_key,q.selection,q.decimal_odds,
               q.is_main,q.source_updated_at,q.captured_at,p.first_captured_at,p.last_retry_at,

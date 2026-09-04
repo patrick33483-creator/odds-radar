@@ -377,11 +377,26 @@ export class PinnacleProvider {
       // in either, so try Next_ first and fall back.
       for (const kind of off >= 0 ? ["Next", "Over"] : ["Over", "Next"]) {
         try {
-          const html = await fetchText(`${BF}/${kind}_${key}.htm`, {
-            charset: "gb18030",
-            timeoutMs: 25_000,
-            retries: 1,
-          });
+          // `/football/big/` is Titan007's Traditional-Chinese schedule and
+          // carries the same stable sId used by the odds detail pages.  Names
+          // from this page are persisted directly; no translation service is
+          // involved.
+          let html: string;
+          try {
+            html = await fetchText(`${BF}/big/${kind}_${key}.htm`, {
+              charset: "gb18030",
+              timeoutMs: 25_000,
+              retries: 1,
+            });
+          } catch {
+            // The Simplified-Chinese schedule is still an acceptable direct
+            // Chinese source if the Traditional page is temporarily absent.
+            html = await fetchText(`${BF}/${kind}_${key}.htm`, {
+              charset: "gb18030",
+              timeoutMs: 25_000,
+              retries: 1,
+            });
+          }
           const rows = parseSchedulePage(html, key);
           if (rows.length) {
             out.push(...rows);

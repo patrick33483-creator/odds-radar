@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { rmSync } from "node:fs";
 
 const dbPath = `/tmp/odds-radar-pinnacle-only-${process.pid}.db`;
@@ -64,13 +64,14 @@ type Side = "O" | "U";
 type Stage = "initial" | "T30" | "T15" | "T5";
 
 function addPinnacleOnlyFixture(id: string, kickoff: number): void {
+  const titanId = id.replace(/^pinnacle:(?:titan:)?/, "");
   rawDb.prepare(
     `INSERT INTO matches(
       id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,
       league,league_en,home_team,away_team,home_team_en,away_team_en,
       kickoff_utc,status,inplay,updated_at
-    ) VALUES(?,NULL,'pinnacle',NULL,?, 'Pinn聯', NULL, ?, ?, NULL, NULL, ?, 'PREEVENT', 0, ?)`,
-  ).run(id, `pinnapi:${id.replace(/^pinnacle:/, "")}`, `${id}主`, `${id}客`, kickoff, Date.now());
+    ) VALUES(?,NULL,'pinnacle',?,?, 'Pinn聯', NULL, ?, ?, NULL, NULL, ?, 'PREEVENT', 0, ?)`,
+  ).run(id, titanId, `titan:${titanId}`, `${id}主`, `${id}客`, kickoff, Date.now());
 }
 
 function addHkjcFixture(id: string, kickoff: number): void {
@@ -111,6 +112,62 @@ function addStage(
 const NOW = Date.now() + 5 * 60_000;
 
 describe("Pinnacle-only fixture identity + snapshots", () => {
+  it("builds the fixture from Titan Chinese labels and fetches Pinnacle by Titan sId", async () => {
+    const { RadarEngine } = await import("../server/lib/engine");
+    const kickoff = NOW + 25 * 60_000;
+    const radar = new RadarEngine();
+    (radar as any).fixtureCache = {
+      at: NOW,
+      pinnapi: [{
+        providerMatchId: "english-index-only",
+        league: "Israel Liga Alef",
+        homeTeam: "Kfar Saba 1928",
+        awayTeam: "MS Jerusalem",
+        kickoffUtc: kickoff,
+        inplay: false,
+        status: "scheduled",
+        parentId: null,
+      }],
+      optic: [],
+      titan: [{
+        providerMatchId: "3085481",
+        league: "以色列甲組聯賽",
+        homeTeam: "卡法沙巴1928",
+        awayTeam: "耶路撒冷體育會",
+        kickoffUtc: kickoff,
+        statusText: "未開賽",
+        homeScore: null,
+        awayScore: null,
+        halfHome: null,
+        halfAway: null,
+        handicapVal: null,
+        totalVal: null,
+      }],
+    };
+    (radar as any).pinnacle.fetchMatchPrices = vi.fn(async (sId: string) => {
+      expect(sId).toBe("3085481");
+      return [
+        { market: "OU", lineValue: 2.5, isMain: true, selection: "O", decimalOdds: 1.91 },
+        { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 1.93 },
+      ];
+    });
+
+    const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
+    expect(outcome.fetched).toBe(1);
+    const row = rawDb.prepare(
+      "SELECT id,titan_id,league,home_team,away_team FROM matches WHERE id=?",
+    ).get("pinnacle:titan:3085481") as Record<string, unknown>;
+    expect(row).toMatchObject({
+      titan_id: "3085481",
+      league: "以色列甲組聯賽",
+      home_team: "卡法沙巴1928",
+      away_team: "耶路撒冷體育會",
+    });
+    expect(
+      rawDb.prepare("SELECT COUNT(*) c FROM pinnacle_translations").get(),
+    ).toEqual({ c: 0 });
+  });
+
   it("creates a Pinnacle-only match row and captures live snapshots into T30/T15/T5 without touching execution tables", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-100", kickoff);
@@ -182,7 +239,7 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
 
     // expectedPairCount uses Pinnacle-only expectations
     expect(expectedPairCount("pinnacle:evt-100", "initial")).toBe(2);
-    expect(expectedPairCount("pinnacle:evt-100", "T30")).toBe(3);
+    expect(expectedPairCount("pinnacle:evt-100", "T30")).toBe(2);
   });
 
   it("freezes the earliest Pinnacle-only live observation as initial exactly once", () => {
@@ -399,7 +456,7 @@ describe("Pinnacle-only fixtures appear in the research dataset + CSV", () => {
   });
 });
 
-describe("pinnacle_translations join into research dataset", () => {
+describe("Titan-direct Chinese names in research dataset", () => {
   function insertTranslation(pinnapiId: string, zhHome: string | null, zhAway: string | null, zhLeague: string | null): void {
     rawDb.prepare(
       `INSERT OR REPLACE INTO pinnacle_translations(pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error)
@@ -407,7 +464,7 @@ describe("pinnacle_translations join into research dataset", () => {
     ).run(pinnapiId, zhHome, zhAway, zhLeague, "titan", Date.now(), Date.now(), 1);
   }
 
-  it("returns Chinese team + league from pinnacle_translations when present", () => {
+  it("never lets a legacy translation overwrite Titan direct names", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-trans-a", kickoff);
     addStage("pinnacle:evt-trans-a", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
@@ -416,12 +473,12 @@ describe("pinnacle_translations join into research dataset", () => {
     const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
     const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-a");
     expect(row).toBeDefined();
-    expect(row!.homeTeam).toBe("阿仙奴");
-    expect(row!.awayTeam).toBe("利物浦");
-    expect(row!.league).toBe("英超");
+    expect(row!.homeTeam).toBe("pinnacle:evt-trans-a主");
+    expect(row!.awayTeam).toBe("pinnacle:evt-trans-a客");
+    expect(row!.league).toBe("Pinn聯");
   });
 
-  it("falls back to English fields on the matches row when no translation exists", () => {
+  it("uses the direct Titan fields when no legacy translation exists", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-trans-b", kickoff);
     addStage("pinnacle:evt-trans-b", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
@@ -430,8 +487,8 @@ describe("pinnacle_translations join into research dataset", () => {
     const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
     const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-b");
     expect(row).toBeDefined();
-    // addPinnacleOnlyFixture writes "<id>主" / "<id>客" as English placeholders and
-    // "Pinn聯" as league; these must survive when no translation row exists.
+    // These fields represent the labels parsed directly from Titan's Chinese
+    // schedule and must survive without any translation row.
     expect(row!.homeTeam).toBe("pinnacle:evt-trans-b主");
     expect(row!.awayTeam).toBe("pinnacle:evt-trans-b客");
     expect(row!.league).toBe("Pinn聯");
