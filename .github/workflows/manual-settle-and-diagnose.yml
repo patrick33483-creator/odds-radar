@@ -17,26 +17,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 手動觸發 settlement job
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-        run: |
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
-            set -e
-            cd /opt/odds-radar
-            CREDS=$(sudo cat .env | grep -E "^RADAR_ACCESS_(USER|PASSWORD)=")
-            eval "$CREDS"
-            test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
-            echo "=== 觸發 settleDue() ==="
-            curl --fail --silent --show-error \
-              --max-time 300 \
-              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/simulations/settle | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in [chr(115)+chr(101)+chr(116)+chr(116)+chr(108)+chr(101)+chr(100), chr(112)+chr(101)+chr(110)+chr(100)+chr(105)+chr(110)+chr(103), chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(115)+chr(70)+chr(101)+chr(116)+chr(99)+chr(104)+chr(101)+chr(100)]}))"
-            echo ""
-          '
-
-      - name: 診斷 results 表覆蓋率
+      - name: 診斷 research_results 表覆蓋率
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -48,96 +29,112 @@ jobs:
           import time
 
           now_ms = int(time.time() * 1000)
-          settle_after_ms = 105 * 60 * 1000
-          eligible_cutoff = now_ms - settle_after_ms
+          cutoff = now_ms - 105 * 60 * 1000
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
 
           db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
           db.row_factory = sqlite3.Row
 
-          out = {
-              "observed_at_hkt": datetime.datetime.now(
-                  datetime.timezone(datetime.timedelta(hours=8))
-              ).strftime("%Y-%m-%d %H:%M:%S"),
-          }
+          def fmt(ms):
+              if not ms:
+                  return None
+              return datetime.datetime.fromtimestamp(ms / 1000, tz=hkt).strftime("%Y-%m-%d %H:%M")
 
-          # 1. 已開賽 matches 覆蓋率
-          past = db.execute(
-              "SELECT COUNT(*) c FROM matches WHERE kickoff_utc <= ?",
-              (eligible_cutoff,),
+          out = {"observed_at_hkt": datetime.datetime.now(hkt).strftime("%Y-%m-%d %H:%M:%S")}
+
+          # research_results 全表狀況
+          out["research_results_total"] = db.execute(
+              "SELECT COUNT(*) c FROM research_results"
           ).fetchone()["c"]
-
-          past_with_results = db.execute(
-              """SELECT COUNT(*) c FROM matches m
-                 WHERE m.kickoff_utc <= ?
-                   AND EXISTS(SELECT 1 FROM results r WHERE r.match_id = m.id)""",
-              (eligible_cutoff,),
-          ).fetchone()["c"]
-
-          out["past_matches_total"] = past
-          out["past_matches_with_results"] = past_with_results
-          out["past_matches_missing_results"] = past - past_with_results
-          out["coverage_pct"] = round(past_with_results * 100 / max(past, 1), 1)
-
-          # 2. results 最新 fetch 時間
-          latest = db.execute("SELECT MAX(fetched_at) f FROM results").fetchone()["f"]
+          latest = db.execute("SELECT MAX(fetched_at) f FROM research_results").fetchone()["f"]
+          out["research_results_latest_fetched_hkt"] = fmt(latest)
           if latest:
-              out["results_latest_fetched_hkt"] = datetime.datetime.fromtimestamp(
-                  latest / 1000, tz=datetime.timezone(datetime.timedelta(hours=8))
-              ).strftime("%Y-%m-%d %H:%M")
-              out["results_lag_hours"] = round((now_ms - latest) / 3600000, 2)
-          out["results_total_rows"] = db.execute(
-              "SELECT COUNT(*) c FROM results"
-          ).fetchone()["c"]
+              out["research_results_lag_hours"] = round((now_ms - latest) / 3600000, 2)
 
-          # 3. results source 分布
-          src = db.execute(
-              "SELECT source, COUNT(*) c FROM results GROUP BY source"
-          ).fetchall()
-          out["results_by_source"] = {r["source"]: r["c"] for r in src}
+          # 過去 7 日 matches 覆蓋率（跌落 research_results 個 rr）
+          for days, label in [(1, "24h"), (3, "3d"), (7, "7d")]:
+              lo = now_ms - days * 24 * 3600 * 1000
+              total = db.execute(
+                  "SELECT COUNT(*) c FROM matches WHERE kickoff_utc BETWEEN ? AND ?",
+                  (lo, cutoff),
+              ).fetchone()["c"]
+              covered = db.execute(
+                  """SELECT COUNT(*) c FROM matches m
+                     WHERE m.kickoff_utc BETWEEN ? AND ?
+                       AND EXISTS(SELECT 1 FROM research_results rr WHERE rr.match_id = m.id)""",
+                  (lo, cutoff),
+              ).fetchone()["c"]
+              out[f"past_{label}"] = {
+                  "matches": total,
+                  "with_research_result": covered,
+                  "coverage_pct": round(covered * 100 / max(total, 1), 1),
+              }
 
-          # 4. simulation_bets 卡場數
-          stuck = db.execute(
-              """SELECT COUNT(*) c FROM simulation_bets
-                 WHERE excluded_from_stats = 0 AND settled_at IS NULL
-                   AND kickoff_utc <= ?""",
-              (eligible_cutoff,),
-          ).fetchone()["c"]
-          out["stuck_simulation_bets"] = stuck
+          # research 相關 state（timer 有無 run、有無 error）
+          try:
+              state_rows = db.execute(
+                  """SELECT k, v FROM states
+                     WHERE k IN (
+                       'researchResultsLastRunAt',
+                       'researchResultsLastSuccessAt',
+                       'researchResultsLastError',
+                       'researchResultsLastCollected'
+                     )"""
+              ).fetchall()
+              state = {r["k"]: r["v"] for r in state_rows}
+              out["research_state"] = {
+                  "last_run_hkt": fmt(int(state.get("researchResultsLastRunAt", "0") or 0)),
+                  "last_success_hkt": fmt(int(state.get("researchResultsLastSuccessAt", "0") or 0)),
+                  "last_error": state.get("researchResultsLastError", ""),
+                  "last_collected": state.get("researchResultsLastCollected", ""),
+              }
+          except Exception as e:
+              out["research_state_error"] = str(e)
 
-          # 5. 過去 24 小時開賽場數 + 有無結果
-          day_ago = now_ms - 24 * 3600 * 1000
-          out["past_24h_matches"] = db.execute(
-              "SELECT COUNT(*) c FROM matches WHERE kickoff_utc BETWEEN ? AND ?",
-              (day_ago, eligible_cutoff),
-          ).fetchone()["c"]
-          out["past_24h_with_results"] = db.execute(
-              """SELECT COUNT(*) c FROM matches m
-                 WHERE m.kickoff_utc BETWEEN ? AND ?
-                   AND EXISTS(SELECT 1 FROM results r WHERE r.match_id = m.id)""",
-              (day_ago, eligible_cutoff),
-          ).fetchone()["c"]
-
-          # 6. 抽 10 場最近開但冇 result 嘅
+          # 樣本：抽 10 場最近開但冇 research_result（睇 hkjc_id 有無）
           missing = db.execute(
               """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc,
-                        m.fixture_source, m.titan_id, m.pinnacle_match_id
+                        m.fixture_source, m.hkjc_id, m.titan_id, m.pinnacle_match_id
                  FROM matches m
                  WHERE m.kickoff_utc <= ?
-                   AND NOT EXISTS(SELECT 1 FROM results r WHERE r.match_id = m.id)
+                   AND m.kickoff_utc >= ?
+                   AND NOT EXISTS(SELECT 1 FROM research_results rr WHERE rr.match_id = m.id)
                  ORDER BY m.kickoff_utc DESC
                  LIMIT 10""",
-              (eligible_cutoff,),
+              (cutoff, now_ms - 7 * 24 * 3600 * 1000),
           ).fetchall()
-          out["sample_missing_results"] = []
+          out["sample_missing"] = []
           for r in missing:
               d = dict(r)
-              d["kickoff_hkt"] = datetime.datetime.fromtimestamp(
-                  d["kickoff_utc"] / 1000, tz=datetime.timezone(datetime.timedelta(hours=8))
-              ).strftime("%Y-%m-%d %H:%M")
+              d["kickoff_hkt"] = fmt(d["kickoff_utc"])
               d["age_hours"] = round((now_ms - d["kickoff_utc"]) / 3600000, 2)
               del d["kickoff_utc"]
-              out["sample_missing_results"].append(d)
+              out["sample_missing"].append(d)
+
+          # 有 hkjc_id 但冇 research_result 嘅場（呢啲應該 collect 到）
+          out["past_7d_with_hkjc_id_no_result"] = db.execute(
+              """SELECT COUNT(*) c FROM matches m
+                 WHERE m.kickoff_utc BETWEEN ? AND ?
+                   AND m.hkjc_id IS NOT NULL AND m.hkjc_id != ''
+                   AND NOT EXISTS(SELECT 1 FROM research_results rr WHERE rr.match_id = m.id)""",
+              (now_ms - 7 * 24 * 3600 * 1000, cutoff),
+          ).fetchone()["c"]
 
           print(json.dumps(out, indent=2, ensure_ascii=False))
           db.close()
           PY
+
+      - name: 檢查 container 有無 restart / research timer log
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /opt/odds-radar
+            echo "=== container status ==="
+            sudo docker compose ps
+            echo ""
+            echo "=== 最近 research_results log（可能 4 日前）==="
+            sudo docker compose logs --since 168h app 2>&1 | grep -E "research_results|research_results_error" | tail -20
+          '
