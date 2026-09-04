@@ -14,57 +14,27 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo -E python3 -" <<'PY'
-import datetime, sqlite3, time
-hkt = datetime.timezone(datetime.timedelta(hours=8))
-db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
-db.row_factory = sqlite3.Row
-now_ms = int(time.time()*1000)
-# 1) dashboard 世界 (ou_signal_observations)
-q1 = db.execute("""
-  SELECT m.fixture_source, 
-         SUM(CASE WHEN r.match_id IS NULL AND m.kickoff_utc<=? THEN 1 ELSE 0 END) awaiting,
-         SUM(CASE WHEN r.match_id IS NOT NULL THEN 1 ELSE 0 END) settled,
-         COUNT(*) total
-    FROM ou_signal_observations o
-    JOIN matches m ON m.id=o.match_id
-    LEFT JOIN research_results r ON r.match_id=o.match_id
-   GROUP BY m.fixture_source
-""",(now_ms,)).fetchall()
-print("=== dashboard (ou_signal_observations) by source ===")
-for r in q1:
-    print(f"  {r['fixture_source']:10s} awaiting={r['awaiting']} settled={r['settled']} total={r['total']}")
-
-# 2) 過去 96h manual 填咗幾多場
-q2 = db.execute("""
-  SELECT COUNT(*) c FROM research_results 
-   WHERE result_source='manual' AND fetched_at>=?
-""",(now_ms - 96*3600*1000,)).fetchone()
-print(f"\n=== manual fills 過去 96h: {q2['c']} 場 ===")
-
-# 3) 我填 manual 嗰啲 match，喺 ou_signal_observations 入面有幾多
-q3 = db.execute("""
-  SELECT m.fixture_source, COUNT(DISTINCT r.match_id) c
-    FROM research_results r
-    JOIN matches m ON m.id=r.match_id
-   WHERE r.result_source='manual' AND r.fetched_at>=?
-   GROUP BY m.fixture_source
-""",(now_ms - 96*3600*1000,)).fetchall()
-print(f"\n=== manual-filled matches by source (past 96h) ===")
-for r in q3:
-    print(f"  {r['fixture_source']}: {r['c']}")
-
-# 4) 但當中有幾多喺 ou_signal_observations 入面
-q4 = db.execute("""
-  SELECT m.fixture_source, COUNT(DISTINCT r.match_id) c
-    FROM research_results r
-    JOIN matches m ON m.id=r.match_id
-    JOIN ou_signal_observations o ON o.match_id=r.match_id
-   WHERE r.result_source='manual' AND r.fetched_at>=?
-   GROUP BY m.fixture_source
-""",(now_ms - 96*3600*1000,)).fetchall()
-print(f"\n=== manual-filled AND in ou_signal_observations ===")
-for r in q4:
-    print(f"  {r['fixture_source']}: {r['c']}")
-
-PY
+          cat > /tmp/diag.py <<'PYEOF'
+          import datetime, sqlite3, time
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          now_ms = int(time.time()*1000)
+          q1 = db.execute("""
+            SELECT m.fixture_source,
+                   SUM(CASE WHEN r.match_id IS NULL AND m.kickoff_utc<=? THEN 1 ELSE 0 END) awaiting,
+                   SUM(CASE WHEN r.match_id IS NOT NULL THEN 1 ELSE 0 END) settled,
+                   COUNT(*) total
+              FROM ou_signal_observations o
+              JOIN matches m ON m.id=o.match_id
+              LEFT JOIN research_results r ON r.match_id=o.match_id
+             GROUP BY m.fixture_source
+          """,(now_ms,)).fetchall()
+          print("== dashboard by source ==")
+          total_awaiting = 0
+          for r in q1:
+              print(f"  {r['fixture_source']:10s} awaiting={r['awaiting']} settled={r['settled']} total={r['total']}")
+              total_awaiting += r['awaiting']
+          print(f"== TOTAL awaiting = {total_awaiting} ==")
+          PYEOF
+          scp /tmp/diag.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/diag.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/diag.py'
