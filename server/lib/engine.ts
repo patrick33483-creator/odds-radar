@@ -131,6 +131,7 @@ export const MAX_LOOP_MS = 290_000;
  * discard every callback during the five-minute T5 window.
  */
 export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
+const PINNACLE_OPENING_RECOVERY_LOOKBACK_MS = 6 * 60 * 60_000;
 
 export type PinnacleResearchTarget = {
   matchId: string;
@@ -159,7 +160,10 @@ export function prioritizePendingPinnacleResearchTargets(
   return targets
     .flatMap((target): PendingPinnacleResearchTarget[] => {
       const untilKickoff = target.kickoffUtc - now;
-      if (untilKickoff <= 0 || untilKickoff > 24 * 60 * 60_000) return [];
+      if (
+        untilKickoff < -PINNACLE_OPENING_RECOVERY_LOOKBACK_MS
+        || untilKickoff > 24 * 60 * 60_000
+      ) return [];
       const milestone = researchStageFor(target.kickoffUtc, now);
       if (milestone && !capturedOuStages.has(`${target.matchId}:${milestone}`)) {
         return [{ ...target, stage: milestone }];
@@ -855,7 +859,7 @@ export class RadarEngine {
         if (mapped.has(fixture.providerMatchId)) continue;
         // Only fixtures still in the future or just kicked off are useful for
         // research; historical rows may still be settled later by a separate job.
-        if (fixture.kickoffUtc < now - 5 * 60_000) continue;
+        if (fixture.kickoffUtc < now - PINNACLE_OPENING_RECOVERY_LOOKBACK_MS) continue;
         const owner = ownerByTitan.get(fixture.providerMatchId);
         if (owner?.fixture_source === "hkjc") continue;
         const matchId = owner?.id ?? `pinnacle:titan:${fixture.providerMatchId}`;

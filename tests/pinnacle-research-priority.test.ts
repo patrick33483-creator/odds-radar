@@ -64,15 +64,17 @@ describe("Pinnacle-only research priority queue", () => {
     ]);
   });
 
-  it("excludes kicked-off fixtures and fixtures outside the 24-hour horizon", () => {
+  it("recovers openings up to six hours after kickoff and excludes older or far fixtures", () => {
     const now = 1_800_000_000_000;
     const result = prioritizePendingPinnacleResearchTargets([
-      target("pinnacle:past", now),
+      target("pinnacle:recent-past", now - 5 * 60 * MINUTE),
+      target("pinnacle:old-past", now - 6 * 60 * MINUTE - 1),
       target("pinnacle:far", now + 24 * 60 * MINUTE + 1),
       target("pinnacle:valid", now + 31 * MINUTE),
     ], new Set(), now);
 
     expect(result.map(({ matchId, stage }) => [matchId, stage])).toEqual([
+      ["pinnacle:recent-past", "initial"],
       ["pinnacle:valid", "initial"],
     ]);
   });
