@@ -15,31 +15,26 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
           cat > /tmp/diag.py <<'PYEOF'
-          import datetime, sqlite3
+          import sqlite3, time
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
           db.row_factory = sqlite3.Row
-          hkt = datetime.timezone(datetime.timedelta(hours=8))
-          import time
           now_ms = int(time.time()*1000)
-          rows = db.execute("""
-            SELECT DISTINCT m.id, m.home_team, m.away_team, m.league, m.kickoff_utc,
-                   pt.zh_home, pt.zh_away, pt.zh_league
+          q1 = db.execute("""
+            SELECT m.fixture_source,
+                   SUM(CASE WHEN r.match_id IS NULL AND m.kickoff_utc<=? THEN 1 ELSE 0 END) awaiting,
+                   SUM(CASE WHEN r.match_id IS NOT NULL THEN 1 ELSE 0 END) settled,
+                   COUNT(*) total
               FROM ou_signal_observations o
               JOIN matches m ON m.id=o.match_id
               LEFT JOIN research_results r ON r.match_id=o.match_id
-              LEFT JOIN pinnacle_translations pt
-                ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
-             WHERE r.match_id IS NULL
-               AND m.kickoff_utc<=?
-               AND m.fixture_source='pinnacle'
-             ORDER BY m.kickoff_utc
+             GROUP BY m.fixture_source
           """,(now_ms,)).fetchall()
-          print(f"== pinnacle awaiting: {len(rows)} 場 ==")
-          for r in rows:
-              t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
-              zh_h = r['zh_home'] or "-"
-              zh_a = r['zh_away'] or "-"
-              print(f"  {t} HKT | EN: {r['home_team']} vs {r['away_team']} | ZH: {zh_h} vs {zh_a} | league: {r['league']} / {r['zh_league']} | id={r['id']}")
+          print("== FINAL VERIFY ==")
+          total = 0
+          for r in q1:
+              print(f"  {r['fixture_source']:10s} awaiting={r['awaiting']} settled={r['settled']} total={r['total']}")
+              total += r['awaiting']
+          print(f"== TOTAL awaiting across all sources = {total} ==")
           PYEOF
           scp /tmp/diag.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/diag.py"
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/diag.py'
