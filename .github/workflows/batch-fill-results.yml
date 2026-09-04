@@ -1,0 +1,126 @@
+name: 批量填賽果
+
+on:
+  workflow_dispatch:
+    inputs:
+      tsv_path:
+        description: repo 內 TSV 路徑 (home\taway\thome_score\taway_score\tdate_hkt)
+        required: false
+        default: "fills/batch.tsv"
+
+jobs:
+  fill:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 裝 zhconv
+        run: pip install zhconv==1.4.3 --quiet
+
+      - name: SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 產生 payload
+        env:
+          TSV: ${{ github.event.inputs.tsv_path }}
+        run: |
+          python3 - <<'PY' > /tmp/payload.json
+          import json, os, zhconv
+          fills = []
+          with open(os.environ["TSV"], encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"): continue
+                  parts = line.split("\t")
+                  if len(parts) != 5: continue
+                  h,a,hs,as_,d = parts
+                  fills.append({
+                      "home": h, "away": a,
+                      "home_simp": zhconv.convert(h, "zh-hans"),
+                      "away_simp": zhconv.convert(a, "zh-hans"),
+                      "home_trad": zhconv.convert(h, "zh-hant"),
+                      "away_trad": zhconv.convert(a, "zh-hant"),
+                      "hs": int(hs), "as": int(as_), "date": d,
+                  })
+          json.dump(fills, open("/tmp/payload.json","w"), ensure_ascii=False)
+          print(f"payload: {len(fills)} entries", file=__import__('sys').stderr)
+          PY
+          wc -c /tmp/payload.json
+
+      - name: 傳去 server + 填
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          scp /tmp/payload.json "$DEPLOY_USER@$DEPLOY_HOST:/tmp/payload.json"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo -E python3 -" <<'PY'
+          import datetime, json, sqlite3, time
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=60, isolation_level=None)
+          db.execute("PRAGMA busy_timeout=60000")
+          db.execute("PRAGMA journal_mode=WAL")
+          db.row_factory = sqlite3.Row
+          fills = json.load(open("/tmp/payload.json", encoding="utf-8"))
+          def vs(orig, simp, trad):
+              o = {orig, simp, trad}
+              o.update({s[:3] for s in list(o) if len(s)>=3})
+              return list(o)
+          filled = 0; missed = []; multi = []
+          for e in fills:
+              y,m,d = [int(x) for x in e["date"].split("-")]
+              lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
+              hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
+              hvars = vs(e["home"], e["home_simp"], e["home_trad"])
+              avars = vs(e["away"], e["away_simp"], e["away_trad"])
+              rows = []; seen = set()
+              for h in hvars:
+                  for a in avars:
+                      for r in db.execute(
+                          """SELECT id, home_team, away_team FROM matches
+                              WHERE home_team LIKE ? AND away_team LIKE ?
+                                AND kickoff_utc>=? AND kickoff_utc<=?""",
+                          (f"%{h}%", f"%{a}%", lo, hi),
+                      ).fetchall():
+                          if r["id"] not in seen: seen.add(r["id"]); rows.append(r)
+              tag = f"{e['home']} vs {e['away']} @ {e['date']}"
+              if len(rows) == 0:
+                  missed.append(tag); continue
+              if len(rows) > 1:
+                  multi.append(f"{tag} -> {len(rows)} matches")
+              now_ms = int(time.time()*1000)
+              for r in rows:
+                  for attempt in range(10):
+                      try:
+                          db.execute("BEGIN IMMEDIATE")
+                          db.execute(
+                              """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                                 VALUES(?,?,?,?,?,?,?,?,?)
+                                 ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+                                   away_score=excluded.away_score,corners_total=excluded.corners_total,
+                                   source=excluded.source,result_source=excluded.result_source,
+                                   fetched_at=excluded.fetched_at""",
+                              (r["id"], None, e["hs"], e["as"], None, "manual", "manual", None, now_ms),
+                          )
+                          db.execute("COMMIT"); filled += 1; break
+                      except sqlite3.OperationalError as ex:
+                          try: db.execute("ROLLBACK")
+                          except: pass
+                          if "locked" in str(ex) and attempt < 9:
+                              time.sleep(2); continue
+                          raise
+          print(f"填咗 {filled} 場，搵唔到 {len(missed)}，多過一場 match {len(multi)}")
+          if missed:
+              print("--- missed ---")
+              for x in missed: print(" ", x)
+          if multi:
+              print("--- multi ---")
+              for x in multi: print(" ", x)
+          db.close()
+          PY
