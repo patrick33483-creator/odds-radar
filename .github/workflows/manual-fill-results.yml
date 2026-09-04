@@ -4,26 +4,46 @@ on:
   workflow_dispatch:
     inputs:
       home:
-        description: 主隊（原本 DB 用嘅名）
+        description: 主隊
         required: true
       away:
         description: 客隊
         required: true
       home_score:
-        description: 主隊入球
         required: true
       away_score:
-        description: 客隊入球
         required: true
       date_hkt:
-        description: 比賽日 YYYY-MM-DD (HKT)
+        description: YYYY-MM-DD (HKT)
         required: true
 
 jobs:
   fill:
     runs-on: ubuntu-24.04
     steps:
-      - name: 設定 SSH
+      - name: 裝 zhconv
+        run: pip install zhconv==1.4.3 --quiet
+
+      - name: 產生繁簡 variants
+        id: v
+        env:
+          H: ${{ github.event.inputs.home }}
+          A: ${{ github.event.inputs.away }}
+        run: |
+          python3 - <<'PY' >> $GITHUB_OUTPUT
+          import os, zhconv
+          h = os.environ["H"]; a = os.environ["A"]
+          hs = zhconv.convert(h, "zh-hans")
+          as_ = zhconv.convert(a, "zh-hans")
+          ht = zhconv.convert(h, "zh-hant")
+          at = zhconv.convert(a, "zh-hant")
+          print(f"home_simp={hs}")
+          print(f"away_simp={as_}")
+          print(f"home_trad={ht}")
+          print(f"away_trad={at}")
+          PY
+
+      - name: SSH key
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -37,49 +57,53 @@ jobs:
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          HOME: ${{ github.event.inputs.home }}
-          AWAY: ${{ github.event.inputs.away }}
+          HOME_ORIG: ${{ github.event.inputs.home }}
+          AWAY_ORIG: ${{ github.event.inputs.away }}
+          HOME_SIMP: ${{ steps.v.outputs.home_simp }}
+          AWAY_SIMP: ${{ steps.v.outputs.away_simp }}
+          HOME_TRAD: ${{ steps.v.outputs.home_trad }}
+          AWAY_TRAD: ${{ steps.v.outputs.away_trad }}
           HOME_SCORE: ${{ github.event.inputs.home_score }}
           AWAY_SCORE: ${{ github.event.inputs.away_score }}
           DATE_HKT: ${{ github.event.inputs.date_hkt }}
         run: |
           ssh "$DEPLOY_USER@$DEPLOY_HOST" \
-            "HOME='$HOME' AWAY='$AWAY' HOME_SCORE='$HOME_SCORE' AWAY_SCORE='$AWAY_SCORE' DATE_HKT='$DATE_HKT' sudo -E python3 -" <<'PY'
+            "HOME_ORIG='$HOME_ORIG' AWAY_ORIG='$AWAY_ORIG' HOME_SIMP='$HOME_SIMP' AWAY_SIMP='$AWAY_SIMP' HOME_TRAD='$HOME_TRAD' AWAY_TRAD='$AWAY_TRAD' HOME_SCORE='$HOME_SCORE' AWAY_SCORE='$AWAY_SCORE' DATE_HKT='$DATE_HKT' sudo -E python3 -" <<'PY'
           import datetime, os, sqlite3, time
           hkt = datetime.timezone(datetime.timedelta(hours=8))
-          # 用長 timeout + WAL 讀取，寫時多次 retry
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=60, isolation_level=None)
           db.execute("PRAGMA busy_timeout=60000")
           db.execute("PRAGMA journal_mode=WAL")
           db.row_factory = sqlite3.Row
-          home = os.environ["HOME"]
-          away = os.environ["AWAY"]
-          hs = int(os.environ["HOME_SCORE"])
-          as_ = int(os.environ["AWAY_SCORE"])
-          date_str = os.environ["DATE_HKT"]
-          y, m, d = [int(x) for x in date_str.split("-")]
-          lo = int(datetime.datetime(y, m, d, 0, 0, tzinfo=hkt).timestamp() * 1000)
-          hi = int(datetime.datetime(y, m, d, 23, 59, tzinfo=hkt).timestamp() * 1000)
+          hs = int(os.environ["HOME_SCORE"]); as_ = int(os.environ["AWAY_SCORE"])
+          y,m,d = [int(x) for x in os.environ["DATE_HKT"].split("-")]
+          lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
+          hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
 
-          # LIKE 兩邊
-          rows = db.execute(
-              """SELECT id, home_team, away_team, kickoff_utc, fixture_source
-                   FROM matches
-                  WHERE (home_team LIKE ? OR home_team LIKE ?)
-                    AND (away_team LIKE ? OR away_team LIKE ?)
-                    AND kickoff_utc >= ? AND kickoff_utc <= ?""",
-              (f"%{home}%", f"%{home[:3]}%", f"%{away}%", f"%{away[:3]}%", lo, hi),
-          ).fetchall()
+          def vs(orig, simp, trad):
+              o = {orig, simp, trad}
+              o.update({s[:3] for s in list(o) if len(s)>=3})
+              return list(o)
+          hvars = vs(os.environ["HOME_ORIG"], os.environ["HOME_SIMP"], os.environ["HOME_TRAD"])
+          avars = vs(os.environ["AWAY_ORIG"], os.environ["AWAY_SIMP"], os.environ["AWAY_TRAD"])
+          rows = []; seen = set()
+          for h in hvars:
+              for a in avars:
+                  for r in db.execute(
+                      """SELECT id, home_team, away_team, kickoff_utc, fixture_source
+                           FROM matches WHERE home_team LIKE ? AND away_team LIKE ?
+                             AND kickoff_utc>=? AND kickoff_utc<=?""",
+                      (f"%{h}%", f"%{a}%", lo, hi),
+                  ).fetchall():
+                      if r["id"] not in seen: seen.add(r["id"]); rows.append(r)
           print(f"搵到 {len(rows)} 場 match:")
           for r in rows:
               t = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt).strftime("%m-%d %H:%M")
               print(f"  id={r['id']}  {t}HKT  [{r['home_team']}] vs [{r['away_team']}]  ({r['fixture_source']})")
-
           if len(rows) == 0:
-              print("!! 一場都搵唔到，check 隊名")
+              print("!! 一場都搵唔到")
               raise SystemExit(1)
-
-          now_ms = int(time.time() * 1000)
+          now_ms = int(time.time()*1000)
           for r in rows:
               for attempt in range(10):
                   try:
@@ -93,15 +117,12 @@ jobs:
                                fetched_at=excluded.fetched_at""",
                           (r["id"], None, hs, as_, None, "manual", "manual", None, now_ms),
                       )
-                      db.execute("COMMIT")
-                      break
+                      db.execute("COMMIT"); break
                   except sqlite3.OperationalError as e:
                       try: db.execute("ROLLBACK")
-                      except Exception: pass
+                      except: pass
                       if "locked" in str(e) and attempt < 9:
-                          print(f"  attempt {attempt+1} locked, retrying...")
-                          time.sleep(2)
-                          continue
+                          time.sleep(2); continue
                       raise
           print(f"填咗 {len(rows)} 場: {hs}-{as_}")
           db.close()
