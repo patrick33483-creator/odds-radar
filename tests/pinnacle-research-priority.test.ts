@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  PINNACLE_RESEARCH_LOOP_MS,
   prioritizePendingPinnacleResearchTargets,
   type PinnacleResearchTarget,
 } from "../server/lib/engine";
+import { AUTO_SCAN_CHECK_MS } from "../server/lib/scan";
 
 const MINUTE = 60_000;
 
@@ -18,6 +20,10 @@ function target(matchId: string, kickoffUtc: number): PinnacleResearchTarget {
 }
 
 describe("Pinnacle-only research priority queue", () => {
+  it("must yield before the next automatic scan tick", () => {
+    expect(PINNACLE_RESEARCH_LOOP_MS).toBeLessThan(AUTO_SCAN_CHECK_MS);
+  });
+
   it("prioritizes missing T5, then T15, T30 and initial", () => {
     const now = 1_800_000_000_000;
     const result = prioritizePendingPinnacleResearchTargets([

@@ -121,6 +121,12 @@ export const REFRESH_THROTTLE_MS = 30_000;
 export const FIXTURE_CACHE_MS = 10 * 60_000;
 /** Any dense helper loop must stay under this budget (hard ceiling < 300 s). */
 export const MAX_LOOP_MS = 290_000;
+/**
+ * The Pinnacle-only collector shares a 30-second scheduler with milestone
+ * capture. It must yield well before the next tick or the overlap gate will
+ * discard every callback during the five-minute T5 window.
+ */
+export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
 
 export type PinnacleResearchTarget = {
   matchId: string;
@@ -790,6 +796,7 @@ export class RadarEngine {
    * signal path (rule provider='pinnacle', >1.70 gate) can evaluate them.
    */
   async refreshPinnacleOnlyResearch(now = Date.now()): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
+    const deadline = Date.now() + PINNACLE_RESEARCH_LOOP_MS;
     // Requires the caller to have already populated fixtureCache via
     // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
     // mock refreshPinnacleFixtures can still assert exact call counts, and so
@@ -876,7 +883,7 @@ export class RadarEngine {
     // First pass: capture normal markets for every pending milestone. Never
     // wait for a slower corner request before writing the main OU snapshot.
     for (const target of eligible) {
-      if (Date.now() > now + MAX_LOOP_MS) break;
+      if (Date.now() > deadline) break;
       try {
         let normalPrices: ProviderPrice[] = [];
         if (DEMO) {
@@ -907,7 +914,7 @@ export class RadarEngine {
     // prices have been persisted.
     if (!DEMO && this.pinnapi.status().configured) {
       for (const target of normalCaptured) {
-        if (Date.now() > now + MAX_LOOP_MS) break;
+        if (Date.now() > deadline) break;
         try {
           const cornerPrices = (await this.pinnapi.fetchEventCornerLines(target.eventId)).prices;
           if (!cornerPrices.length) continue;
