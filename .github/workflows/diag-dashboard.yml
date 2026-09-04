@@ -15,58 +15,31 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
           cat > /tmp/diag.py <<'PYEOF'
-          import datetime, sqlite3, time
+          import datetime, sqlite3
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
           db.row_factory = sqlite3.Row
-          now_ms = int(time.time()*1000)
-          q1 = db.execute("""
-            SELECT m.fixture_source,
-                   SUM(CASE WHEN r.match_id IS NULL AND m.kickoff_utc<=? THEN 1 ELSE 0 END) awaiting,
-                   SUM(CASE WHEN r.match_id IS NOT NULL THEN 1 ELSE 0 END) settled,
-                   COUNT(*) total
-              FROM ou_signal_observations o
-              JOIN matches m ON m.id=o.match_id
-              LEFT JOIN research_results r ON r.match_id=o.match_id
-             GROUP BY m.fixture_source
-          """,(now_ms,)).fetchall()
-          print("== dashboard by source ==")
-          for r in q1:
-              print(f"  {r['fixture_source']:10s} awaiting={r['awaiting']} settled={r['settled']} total={r['total']}")
-          q2 = db.execute("SELECT COUNT(*) c FROM research_results WHERE result_source='manual' AND fetched_at>=?",(now_ms - 96*3600*1000,)).fetchone()
-          print(f"== manual fills past 96h: {q2['c']} ==")
-          q3 = db.execute("""
-            SELECT m.fixture_source, COUNT(DISTINCT r.match_id) c
-              FROM research_results r JOIN matches m ON m.id=r.match_id
-             WHERE r.result_source='manual' AND r.fetched_at>=?
-             GROUP BY m.fixture_source
-          """,(now_ms - 96*3600*1000,)).fetchall()
-          print("== manual-filled by source (96h) ==")
-          for r in q3:
-              print(f"  {r['fixture_source']}: {r['c']}")
-          q4 = db.execute("""
-            SELECT m.fixture_source, COUNT(DISTINCT r.match_id) c
-              FROM research_results r
-              JOIN matches m ON m.id=r.match_id
-              JOIN ou_signal_observations o ON o.match_id=r.match_id
-             WHERE r.result_source='manual' AND r.fetched_at>=?
-             GROUP BY m.fixture_source
-          """,(now_ms - 96*3600*1000,)).fetchall()
-          print("== manual-filled AND in ou_signal_observations ==")
-          for r in q4:
-              print(f"  {r['fixture_source']}: {r['c']}")
-          q5 = db.execute("""
-            SELECT DISTINCT m.fixture_source, m.home_team, m.away_team, m.kickoff_utc
-              FROM ou_signal_observations o
-              JOIN matches m ON m.id=o.match_id
-              LEFT JOIN research_results r ON r.match_id=o.match_id
-             WHERE r.match_id IS NULL AND m.kickoff_utc<=?
-             ORDER BY m.kickoff_utc DESC LIMIT 30
-          """,(now_ms,)).fetchall()
-          print("== dashboard awaiting (top 30) ==")
           hkt = datetime.timezone(datetime.timedelta(hours=8))
-          for r in q5:
+          import time
+          now_ms = int(time.time()*1000)
+          rows = db.execute("""
+            SELECT DISTINCT m.id, m.home_team, m.away_team, m.league, m.kickoff_utc,
+                   pt.zh_home, pt.zh_away, pt.zh_league
+              FROM ou_signal_observations o
+              JOIN matches m ON m.id=o.match_id
+              LEFT JOIN research_results r ON r.match_id=o.match_id
+              LEFT JOIN pinnacle_translations pt
+                ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
+             WHERE r.match_id IS NULL
+               AND m.kickoff_utc<=?
+               AND m.fixture_source='pinnacle'
+             ORDER BY m.kickoff_utc
+          """,(now_ms,)).fetchall()
+          print(f"== pinnacle awaiting: {len(rows)} 場 ==")
+          for r in rows:
               t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
-              print(f"  {t} [{r['fixture_source']}] {r['home_team']} vs {r['away_team']}")
+              zh_h = r['zh_home'] or "-"
+              zh_a = r['zh_away'] or "-"
+              print(f"  {t} HKT | EN: {r['home_team']} vs {r['away_team']} | ZH: {zh_h} vs {zh_a} | league: {r['league']} / {r['zh_league']} | id={r['id']}")
           PYEOF
           scp /tmp/diag.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/diag.py"
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/diag.py'
