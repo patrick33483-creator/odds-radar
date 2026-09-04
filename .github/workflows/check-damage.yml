@@ -1,0 +1,38 @@
+name: check-damage
+on: workflow_dispatch
+jobs:
+  c:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          cat > /tmp/chk.py <<'PYEOF'
+          import sqlite3, datetime
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          # 睇 fetched_at 喺 bad window (17:00-17:03 UTC) 嘅 manual record，即係 UPDATE 過既
+          lo = int(datetime.datetime(2026,9,4,17,0,0,tzinfo=datetime.timezone.utc).timestamp()*1000)
+          hi = int(datetime.datetime(2026,9,4,17,3,0,tzinfo=datetime.timezone.utc).timestamp()*1000)
+          # 呢個 window 內嘅 manual record（rollback DELETE 之後仲剩返，即係 UPDATE 過既）
+          rows = db.execute("""
+            SELECT r.match_id, r.home_score, r.away_score, r.fetched_at, m.home_team, m.away_team, m.fixture_source, m.kickoff_utc
+              FROM research_results r JOIN matches m ON m.id=r.match_id
+             WHERE r.result_source='manual' AND r.fetched_at>=? AND r.fetched_at<=?
+             ORDER BY r.fetched_at
+          """,(lo,hi)).fetchall()
+          print(f"== manual records UPDATED in bad window: {len(rows)} ==")
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          for r in rows:
+              t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
+              print(f"  {t} [{r['fixture_source']}] {r['home_team']} vs {r['away_team']}: {r['home_score']}-{r['away_score']} | id={r['match_id']}")
+          PYEOF
+          scp /tmp/chk.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/chk.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/chk.py'
