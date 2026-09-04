@@ -1,0 +1,93 @@
+name: 用戶手動填賽果
+
+on:
+  workflow_dispatch:
+    inputs:
+      home:
+        description: 主隊（原本 DB 用嘅名）
+        required: true
+      away:
+        description: 客隊
+        required: true
+      home_score:
+        description: 主隊入球
+        required: true
+      away_score:
+        description: 客隊入球
+        required: true
+      date_hkt:
+        description: 比賽日 YYYY-MM-DD (HKT)
+        required: true
+
+jobs:
+  fill:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 填
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          HOME: ${{ github.event.inputs.home }}
+          AWAY: ${{ github.event.inputs.away }}
+          HOME_SCORE: ${{ github.event.inputs.home_score }}
+          AWAY_SCORE: ${{ github.event.inputs.away_score }}
+          DATE_HKT: ${{ github.event.inputs.date_hkt }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "HOME='$HOME' AWAY='$AWAY' HOME_SCORE='$HOME_SCORE' AWAY_SCORE='$AWAY_SCORE' DATE_HKT='$DATE_HKT' sudo -E python3 -" <<'PY'
+          import datetime, os, sqlite3, time
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+          home = os.environ["HOME"]
+          away = os.environ["AWAY"]
+          hs = int(os.environ["HOME_SCORE"])
+          as_ = int(os.environ["AWAY_SCORE"])
+          date_str = os.environ["DATE_HKT"]
+          y, m, d = [int(x) for x in date_str.split("-")]
+          lo = int(datetime.datetime(y, m, d, 0, 0, tzinfo=hkt).timestamp() * 1000)
+          hi = int(datetime.datetime(y, m, d, 23, 59, tzinfo=hkt).timestamp() * 1000)
+
+          # LIKE 兩邊
+          rows = db.execute(
+              """SELECT id, home_team, away_team, kickoff_utc, fixture_source
+                   FROM matches
+                  WHERE (home_team LIKE ? OR home_team LIKE ?)
+                    AND (away_team LIKE ? OR away_team LIKE ?)
+                    AND kickoff_utc >= ? AND kickoff_utc <= ?""",
+              (f"%{home}%", f"%{home[:3]}%", f"%{away}%", f"%{away[:3]}%", lo, hi),
+          ).fetchall()
+          print(f"搵到 {len(rows)} 場 match:")
+          for r in rows:
+              t = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt).strftime("%m-%d %H:%M")
+              print(f"  id={r['id']}  {t}HKT  [{r['home_team']}] vs [{r['away_team']}]  ({r['fixture_source']})")
+
+          if len(rows) == 0:
+              print("!! 一場都搵唔到，check 隊名")
+              raise SystemExit(1)
+
+          now_ms = int(time.time() * 1000)
+          for r in rows:
+              db.execute(
+                  """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                     VALUES(?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+                       away_score=excluded.away_score,corners_total=excluded.corners_total,
+                       source=excluded.source,result_source=excluded.result_source,
+                       fetched_at=excluded.fetched_at""",
+                  (r["id"], None, hs, as_, None, "manual", "manual", None, now_ms),
+              )
+          db.commit()
+          print(f"填咗 {len(rows)} 場: {hs}-{as_}")
+          db.close()
+          PY
