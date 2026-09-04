@@ -1,0 +1,36 @@
+name: 立即收集 research 賽果
+
+on:
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Call POST /api/research/results/collect
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /opt/odds-radar
+            CREDS=$(sudo cat .env | grep -E "^RADAR_ACCESS_(USER|PASSWORD)=")
+            eval "$CREDS"
+            echo "=== 觸發 collectResearchResults ==="
+            curl --fail --silent --show-error \
+              --max-time 300 \
+              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
+              -X POST http://127.0.0.1:5001/api/research/results/collect
+            echo ""
+          '
