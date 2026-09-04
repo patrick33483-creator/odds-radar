@@ -1,0 +1,132 @@
+name: 手動結算 + 診斷待賽果
+
+on:
+  workflow_dispatch:
+
+jobs:
+  settle-and-diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 手動觸發 settlement job
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /opt/odds-radar
+            set -a
+            . ./.env
+            set +a
+            test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
+            echo "=== 觸發 settleDue() ==="
+            curl --fail --silent --show-error \
+              --max-time 300 \
+              --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
+              -X POST http://127.0.0.1:5001/api/simulations/settle
+            echo ""
+          '
+
+      - name: 診斷仲有邊啲場 stuck
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo python3 -' <<'PY'
+          import datetime
+          import json
+          import sqlite3
+          import time
+
+          now_ms = int(time.time() * 1000)
+          settle_after_ms = 105 * 60 * 1000
+          eligible_cutoff = now_ms - settle_after_ms
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+
+          # 攞所有仲未 settle 但已經過 105 分鐘嘅場
+          rows = db.execute(
+              """
+              SELECT
+                sb.id AS bet_id,
+                sb.match_id,
+                sb.market,
+                sb.kickoff_utc,
+                sb.settled_at,
+                sb.excluded_from_stats,
+                m.home_name,
+                m.away_name,
+                m.pinnacle_match_id,
+                m.titan_id,
+                m.fixture_source,
+                psm.pinnapi_id,
+                pls.home_score AS live_home,
+                pls.away_score AS live_away,
+                pls.seen_live,
+                pls.no_longer_live,
+                pls.last_observed_at
+              FROM simulation_bets sb
+              LEFT JOIN matches m ON m.id = sb.match_id
+              LEFT JOIN pinnacle_source_map psm ON psm.match_id = m.id
+              LEFT JOIN pinnapi_live_scores pls ON pls.match_id = m.id
+              WHERE sb.excluded_from_stats = 0
+                AND sb.settled_at IS NULL
+                AND sb.kickoff_utc <= ?
+              ORDER BY sb.kickoff_utc ASC
+              LIMIT 50
+              """,
+              (eligible_cutoff,),
+          ).fetchall()
+
+          out = {
+              "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "now_ms": now_ms,
+              "settle_eligible_cutoff_ms": eligible_cutoff,
+              "stuck_count": len(rows),
+              "stuck_bets": [],
+          }
+
+          for r in rows:
+              d = dict(r)
+              age_hours = (now_ms - d["kickoff_utc"]) / 1000 / 3600
+              d["age_hours_since_kickoff"] = round(age_hours, 2)
+              d["kickoff_hkt"] = datetime.datetime.fromtimestamp(
+                  d["kickoff_utc"] / 1000, tz=datetime.timezone(datetime.timedelta(hours=8))
+              ).strftime("%Y-%m-%d %H:%M")
+
+              # 判斷卡喺邊
+              reasons = []
+              if d["pinnapi_id"] is None and d["pinnacle_match_id"] is None:
+                  reasons.append("no_pinnacle_id_mapped")
+              if d["live_home"] is None:
+                  reasons.append("no_pinnapi_live_cache")
+              elif d["no_longer_live"] == 0 and d["seen_live"] == 0:
+                  reasons.append("live_cache_never_seen_live")
+              if d["titan_id"] is None:
+                  reasons.append("no_titan_id_for_fallback")
+
+              d["stuck_reasons"] = reasons
+              out["stuck_bets"].append(d)
+
+          # 統計
+          from collections import Counter
+          reason_counts = Counter()
+          for b in out["stuck_bets"]:
+              for r in b["stuck_reasons"]:
+                  reason_counts[r] += 1
+          out["stuck_reason_summary"] = dict(reason_counts)
+
+          print(json.dumps(out, sort_keys=False, indent=2, ensure_ascii=False))
+          db.close()
+          PY
