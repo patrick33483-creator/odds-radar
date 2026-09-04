@@ -1,0 +1,63 @@
+name: 查用戶影嗰啲 U21/U20/亞洲杯場而家有無賽果
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 查
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo python3 -" <<'PY'
+          import datetime, sqlite3, time
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+
+          now_ms = int(time.time() * 1000)
+          # 04/09 - 05/09 HKT
+          lo = int(datetime.datetime(2026,9,4,0,0,tzinfo=hkt).timestamp()*1000)
+          hi = int(datetime.datetime(2026,9,5,23,59,tzinfo=hkt).timestamp()*1000)
+          rows = db.execute(
+              """SELECT m.id, m.kickoff_utc, m.home_team, m.away_team, m.fixture_source,
+                        rr.home_score, rr.away_score, rr.result_source, rr.fetched_at
+                   FROM matches m
+                   LEFT JOIN research_results rr ON rr.match_id=m.id
+                  WHERE m.kickoff_utc>=? AND m.kickoff_utc<=?
+                    AND (m.home_team LIKE '%U2%' OR m.away_team LIKE '%U2%' 
+                         OR m.home_team LIKE '%匈%' OR m.away_team LIKE '%匈%'
+                         OR m.home_team LIKE '%亚%' OR m.away_team LIKE '%亚%')
+                  ORDER BY m.kickoff_utc""",
+              (lo, hi),
+          ).fetchall()
+          print(f"共 {len(rows)} 場相關")
+          filled = 0
+          missing = 0
+          for r in rows:
+              t = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt).strftime("%m-%d %H:%M")
+              if r["home_score"] is not None:
+                  filled += 1
+                  print(f"  ✓ {t}HKT [{r['home_team']}] {r['home_score']}-{r['away_score']} [{r['away_team']}] ({r['result_source']}, {r['fixture_source']})")
+              else:
+                  # 未完場 (kickoff + 105min > now) 就跳
+                  if r["kickoff_utc"] + 105 * 60 * 1000 > now_ms:
+                      continue
+                  missing += 1
+                  print(f"  ✗ {t}HKT [{r['home_team']}] vs [{r['away_team']}] ({r['fixture_source']}) [已完場但冇賽果]")
+          print(f"\n填咗: {filled}  仲有缺: {missing}")
+          db.close()
+          PY
