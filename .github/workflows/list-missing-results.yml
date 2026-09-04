@@ -48,6 +48,8 @@ jobs:
                   ORDER BY m.kickoff_utc DESC""",
               (window_start, finished_before),
           ).fetchall()
+          def has_cjk(s): return any('\u4e00' <= c <= '\u9fff' for c in s)
+          rows = [r for r in rows if has_cjk(r["home_team"]) or has_cjk(r["away_team"])]
           print(f"共 {len(rows)} 場已完場但無賽果 (過去 {hb}h)：")
           # 按日分組
           from collections import defaultdict
