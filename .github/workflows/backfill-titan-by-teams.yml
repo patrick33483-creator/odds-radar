@@ -154,19 +154,23 @@ jobs:
               if not opts:
                   no_pair += 1
                   continue
-              # 揀 kickoff 最近嘅
+              # 優先：喺 pair 內先揀有分嘅 row
+              scored_opts = [r for r in opts if r["score"]]
+              pool = scored_opts if scored_opts else opts
+              # 喺 pool 揀 kickoff 最近（若時間 parse 唔到，取第一個）
               best = None
               best_diff = None
-              for r in opts:
+              for r in pool:
                   if r["kickoff_ms"] is None:
+                      if best is None:
+                          best = r  # 有分但冇時間都用
                       continue
                   diff = abs(r["kickoff_ms"] - c["kickoff_utc"])
                   if diff <= TOL_MS and (best_diff is None or diff < best_diff):
                       best = r
                       best_diff = diff
               if best is None:
-                  # 冇時間 match，但 pair 存在——如果只有一個 option 而且有分，仍然用
-                  scored_opts = [r for r in opts if r["score"]]
+                  # 完全冇 option 適合
                   if len(scored_opts) == 1:
                       best = scored_opts[0]
                   else:
