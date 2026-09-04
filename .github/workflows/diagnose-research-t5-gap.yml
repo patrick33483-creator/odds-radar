@@ -1,0 +1,117 @@
+name: Diagnose recent research T5 gaps (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Inspect recent collection logs and database state
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+
+          echo "=== collector logs (last 100 minutes) ==="
+          sudo docker compose logs --since 100m radar 2>&1 |
+            grep -E 'auto_research_timeline|pinnacle_detail|pinnapi|titan|research' |
+            tail -500 || true
+
+          echo "=== fixtures and checkpoint state (00:30-02:00 HKT) ==="
+          sudo python3 - <<'PY'
+          import json
+          import sqlite3
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+
+          hkt = ZoneInfo("Asia/Hong_Kong")
+          now = datetime.now(hkt)
+          lo = now.replace(hour=0, minute=30, second=0, microsecond=0)
+          hi = now.replace(hour=2, minute=0, second=0, microsecond=0)
+          lo_ms = int(lo.astimezone(timezone.utc).timestamp() * 1000)
+          hi_ms = int(hi.astimezone(timezone.utc).timestamp() * 1000)
+
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+          rows = db.execute(
+              """
+              SELECT m.id,m.fixture_source,m.titan_id,m.pinnacle_match_id,
+                     m.league,m.home_team,m.away_team,m.kickoff_utc,
+                     p.pinnapi_id,p.pinnapi_reversed,p.titan_id map_titan_id,
+                     p.titan_reversed,p.active_source
+                FROM matches m
+                LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+               WHERE m.kickoff_utc BETWEEN ? AND ?
+               ORDER BY m.kickoff_utc,m.id
+              """,
+              (lo_ms, hi_ms),
+          ).fetchall()
+
+          print(json.dumps({
+              "window_hkt": [lo.isoformat(), hi.isoformat()],
+              "fixture_count": len(rows),
+          }, ensure_ascii=False))
+          for row in rows:
+              item = dict(row)
+              mid = row["id"]
+              item["kickoff_hkt"] = datetime.fromtimestamp(
+                  row["kickoff_utc"] / 1000, timezone.utc
+              ).astimezone(hkt).isoformat()
+              item["points"] = [
+                  dict(x) for x in db.execute(
+                      """
+                      SELECT stage,target_at,first_captured_at,last_retry_at,status,note
+                        FROM research_timeline_points
+                       WHERE match_id=? ORDER BY target_at
+                      """,
+                      (mid,),
+                  ).fetchall()
+              ]
+              item["ou_snapshots"] = [
+                  dict(x) for x in db.execute(
+                      """
+                      SELECT provider,stage,COUNT(*) rows,MIN(captured_at) first_at,
+                             MAX(captured_at) last_at,
+                             GROUP_CONCAT(DISTINCT COALESCE(source_name,'')) source_names,
+                             GROUP_CONCAT(DISTINCT COALESCE(source_match_id,'')) source_ids
+                        FROM research_timeline_snapshots
+                       WHERE match_id=? AND market='OU'
+                       GROUP BY provider,stage ORDER BY provider,stage
+                      """,
+                      (mid,),
+                  ).fetchall()
+              ]
+              item["latest_pinnacle_ou"] = [
+                  dict(x) for x in db.execute(
+                      """
+                      SELECT line_key,selection,decimal_odds,source_updated_at,fetched_at
+                        FROM odds_latest
+                       WHERE match_id=? AND provider='pinnacle' AND market='OU'
+                       ORDER BY fetched_at DESC,line_key,selection
+                       LIMIT 20
+                      """,
+                      (mid,),
+                  ).fetchall()
+              ]
+              print(json.dumps(item, ensure_ascii=False))
+          db.close()
+          PY
+          REMOTE
