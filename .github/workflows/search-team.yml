@@ -1,0 +1,62 @@
+name: 搵隊名
+
+on:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        required: true
+      date_hkt:
+        required: false
+        default: ""
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 查
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          KEYWORD: ${{ github.event.inputs.keyword }}
+          DATE_HKT: ${{ github.event.inputs.date_hkt }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "KEYWORD='$KEYWORD' DATE_HKT='$DATE_HKT' sudo -E python3 -" <<'PY'
+          import datetime, os, sqlite3
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          kw = os.environ["KEYWORD"]
+          date_hkt = os.environ.get("DATE_HKT") or ""
+          if date_hkt:
+              y,m,d = [int(x) for x in date_hkt.split("-")]
+              lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
+              hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
+              rows = db.execute(
+                  """SELECT id, home_team, away_team, kickoff_utc, fixture_source
+                       FROM matches WHERE (home_team LIKE ? OR away_team LIKE ?)
+                         AND kickoff_utc>=? AND kickoff_utc<=? ORDER BY kickoff_utc""",
+                  (f"%{kw}%", f"%{kw}%", lo, hi),
+              ).fetchall()
+          else:
+              rows = db.execute(
+                  """SELECT id, home_team, away_team, kickoff_utc, fixture_source
+                       FROM matches WHERE (home_team LIKE ? OR away_team LIKE ?)
+                       ORDER BY kickoff_utc DESC LIMIT 30""",
+                  (f"%{kw}%", f"%{kw}%"),
+              ).fetchall()
+          print(f"共 {len(rows)}")
+          for r in rows:
+              t = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt).strftime("%m-%d %H:%M")
+              print(f"  {t}HKT  [{r['home_team']}] vs [{r['away_team']}]  ({r['fixture_source']})")
+          db.close()
+          PY
