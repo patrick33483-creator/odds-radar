@@ -85,8 +85,8 @@ jobs:
                           return True
               return False
 
-          filled = 0; missed = []; cross_hits = []; cross_skip = []
-          WIN = 30*60*1000
+          filled = 0; missed = []
+          # cross-source disabled - 太危險，用其他方法處理跨 source
           for e in fills:
               y,m,d = [int(x) for x in e["date"].split("-")]
               lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
@@ -107,38 +107,8 @@ jobs:
               tag = f"{e['home']} vs {e['away']} @ {e['date']}"
               if len(rows) == 0:
                   missed.append(tag); continue
-              # Step 2: cross-source - 只加時間內名對得上嘅
-              extra = []
-              known_ids = set(r["id"] for r in rows)
-              for r in rows:
-                  ko = r["kickoff_utc"]
-                  candidates = db.execute(
-                      """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc, m.fixture_source,
-                                pt.zh_home, pt.zh_away
-                           FROM matches m
-                           LEFT JOIN pinnacle_translations pt
-                             ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
-                          WHERE m.kickoff_utc>=? AND m.kickoff_utc<=?
-                            AND m.fixture_source!=?""",
-                      (ko - WIN, ko + WIN, r["fixture_source"]),
-                  ).fetchall()
-                  for x in candidates:
-                      if x["id"] in known_ids or x["id"] in seen: continue
-                      # 判斷主客名 overlap - 對 x 嘅每個「可比較 name」（原 team + zh_home/zh_away 譯名 + user 提交嘅原/簡/繁）
-                      cand_h = [x["home_team"], x["zh_home"]] if x["zh_home"] else [x["home_team"]]
-                      cand_a = [x["away_team"], x["zh_away"]] if x["zh_away"] else [x["away_team"]]
-                      my_h_all = hvars + [e["home"]]
-                      my_a_all = avars + [e["away"]]
-                      h_ok = any(name_overlaps(mh, ch) for mh in my_h_all for ch in cand_h if ch)
-                      a_ok = any(name_overlaps(ma, ca) for ma in my_a_all for ca in cand_a if ca)
-                      if h_ok and a_ok:
-                          extra.append(x); seen.add(x["id"])
-                          cross_hits.append(f"{tag} => [{x['fixture_source']}] {x['home_team']}/{x['zh_home']} vs {x['away_team']}/{x['zh_away']}")
-                      else:
-                          cross_skip.append(f"skip: {tag} vs [{x['fixture_source']}] {x['home_team']}/{x['zh_home']} vs {x['away_team']}/{x['zh_away']}")
-              all_rows = rows + extra
               now_ms = int(time.time()*1000)
-              for r in all_rows:
+              for r in rows:
                   for attempt in range(10):
                       try:
                           db.execute("BEGIN IMMEDIATE")
@@ -158,10 +128,7 @@ jobs:
                           if "locked" in str(ex) and attempt < 9:
                               time.sleep(2); continue
                           raise
-          print(f"填咗 {filled} 場（cross-source hits: {len(cross_hits)}, skipped: {len(cross_skip)}），搵唔到 {len(missed)}")
-          if cross_hits:
-              print("--- cross-source hits ---")
-              for x in cross_hits: print(" ", x)
+          print(f"填咗 {filled} 場，搵唔到 {len(missed)}")
           if missed:
               print("--- missed ---")
               for x in missed: print(" ", x)
