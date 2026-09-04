@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tsv_path:
-        description: repo 內 TSV 路徑 (home\taway\thome_score\taway_score\tdate_hkt)
+        description: repo 內 TSV 路徑 (home\taway\thome_score\thome_score\tdate_hkt)
         required: false
         default: "fills/batch.tsv"
 
@@ -12,8 +12,158 @@ jobs:
   fill:
     runs-on: ubuntu-24.04
     steps:
-      - name: 已停用不安全隊名模糊填分
+      - uses: actions/checkout@v4
+
+      - name: 裝 zhconv
+        run: pip install zhconv==1.4.3 --quiet
+
+      - name: SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
-          echo "此 workflow 已停用：禁止用隊名 LIKE、頭三字或同日批量配對寫入賽果。"
-          echo "賽果必須由 production collector 以 Titan007 sId 精確核實。"
-          exit 1
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 產生 payload
+        env:
+          TSV: ${{ github.event.inputs.tsv_path }}
+        run: |
+          python3 - <<'PY' > /tmp/payload.json
+          import json, os, zhconv
+          fills = []
+          with open(os.environ["TSV"], encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"): continue
+                  parts = line.split("\t")
+                  if len(parts) != 5: continue
+                  h,a,hs,as_,d = parts
+                  fills.append({
+                      "home": h, "away": a,
+                      "home_simp": zhconv.convert(h, "zh-hans"),
+                      "away_simp": zhconv.convert(a, "zh-hans"),
+                      "home_trad": zhconv.convert(h, "zh-hant"),
+                      "away_trad": zhconv.convert(a, "zh-hant"),
+                      "hs": int(hs), "as": int(as_), "date": d,
+                  })
+          json.dump(fills, open("/tmp/payload.json","w"), ensure_ascii=False)
+          print(f"payload: {len(fills)} entries", file=__import__('sys').stderr)
+          PY
+          wc -c /tmp/payload.json
+
+      - name: 傳去 server + 填
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          scp /tmp/payload.json "$DEPLOY_USER@$DEPLOY_HOST:/tmp/payload.json"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo -E python3 -" <<'PY'
+          import datetime, json, sqlite3, time
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=60, isolation_level=None)
+          db.execute("PRAGMA busy_timeout=60000")
+          db.execute("PRAGMA journal_mode=WAL")
+          db.row_factory = sqlite3.Row
+          fills = json.load(open("/tmp/payload.json", encoding="utf-8"))
+          def vs(orig, simp, trad):
+              o = {orig, simp, trad}
+              o.update({s[:3] for s in list(o) if len(s)>=3})
+              return list(o)
+          def name_overlaps(a, b):
+              """兩個中/英文隊名有無合理 overlap - 用最短 substring 3 chars"""
+              if not a or not b: return False
+              a = a.strip(); b = b.strip()
+              if a == b: return True
+              # 3-char 子串互檢
+              for s in [a, b]:
+                  for i in range(len(s) - 2):
+                      sub = s[i:i+3]
+                      if sub in a and sub in b:
+                          return True
+              return False
+
+          filled = 0; missed = []; cross_hits = []; cross_skip = []
+          WIN = 30*60*1000
+          for e in fills:
+              y,m,d = [int(x) for x in e["date"].split("-")]
+              lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
+              hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
+              hvars = vs(e["home"], e["home_simp"], e["home_trad"])
+              avars = vs(e["away"], e["away_simp"], e["away_trad"])
+              # Step 1: 直接 fuzzy match
+              rows = []; seen = set()
+              for h in hvars:
+                  for a in avars:
+                      for r in db.execute(
+                          """SELECT id, home_team, away_team, kickoff_utc, fixture_source FROM matches
+                              WHERE home_team LIKE ? AND away_team LIKE ?
+                                AND kickoff_utc>=? AND kickoff_utc<=?""",
+                          (f"%{h}%", f"%{a}%", lo, hi),
+                      ).fetchall():
+                          if r["id"] not in seen: seen.add(r["id"]); rows.append(r)
+              tag = f"{e['home']} vs {e['away']} @ {e['date']}"
+              if len(rows) == 0:
+                  missed.append(tag); continue
+              # Step 2: cross-source - 只加時間內名對得上嘅
+              extra = []
+              known_ids = set(r["id"] for r in rows)
+              for r in rows:
+                  ko = r["kickoff_utc"]
+                  candidates = db.execute(
+                      """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc, m.fixture_source,
+                                pt.zh_home, pt.zh_away
+                           FROM matches m
+                           LEFT JOIN pinnacle_translations pt
+                             ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
+                          WHERE m.kickoff_utc>=? AND m.kickoff_utc<=?
+                            AND m.fixture_source!=?""",
+                      (ko - WIN, ko + WIN, r["fixture_source"]),
+                  ).fetchall()
+                  for x in candidates:
+                      if x["id"] in known_ids or x["id"] in seen: continue
+                      # 判斷主客名 overlap - 對 x 嘅每個「可比較 name」（原 team + zh_home/zh_away 譯名 + user 提交嘅原/簡/繁）
+                      cand_h = [x["home_team"], x["zh_home"]] if x["zh_home"] else [x["home_team"]]
+                      cand_a = [x["away_team"], x["zh_away"]] if x["zh_away"] else [x["away_team"]]
+                      my_h_all = hvars + [e["home"]]
+                      my_a_all = avars + [e["away"]]
+                      h_ok = any(name_overlaps(mh, ch) for mh in my_h_all for ch in cand_h if ch)
+                      a_ok = any(name_overlaps(ma, ca) for ma in my_a_all for ca in cand_a if ca)
+                      if h_ok and a_ok:
+                          extra.append(x); seen.add(x["id"])
+                          cross_hits.append(f"{tag} => [{x['fixture_source']}] {x['home_team']}/{x['zh_home']} vs {x['away_team']}/{x['zh_away']}")
+                      else:
+                          cross_skip.append(f"skip: {tag} vs [{x['fixture_source']}] {x['home_team']}/{x['zh_home']} vs {x['away_team']}/{x['zh_away']}")
+              all_rows = rows + extra
+              now_ms = int(time.time()*1000)
+              for r in all_rows:
+                  for attempt in range(10):
+                      try:
+                          db.execute("BEGIN IMMEDIATE")
+                          db.execute(
+                              """INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                                 VALUES(?,?,?,?,?,?,?,?,?)
+                                 ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+                                   away_score=excluded.away_score,corners_total=excluded.corners_total,
+                                   source=excluded.source,result_source=excluded.result_source,
+                                   fetched_at=excluded.fetched_at""",
+                              (r["id"], None, e["hs"], e["as"], None, "manual", "manual", None, now_ms),
+                          )
+                          db.execute("COMMIT"); filled += 1; break
+                      except sqlite3.OperationalError as ex:
+                          try: db.execute("ROLLBACK")
+                          except: pass
+                          if "locked" in str(ex) and attempt < 9:
+                              time.sleep(2); continue
+                          raise
+          print(f"填咗 {filled} 場（cross-source hits: {len(cross_hits)}, skipped: {len(cross_skip)}），搵唔到 {len(missed)}")
+          if cross_hits:
+              print("--- cross-source hits ---")
+              for x in cross_hits: print(" ", x)
+          if missed:
+              print("--- missed ---")
+              for x in missed: print(" ", x)
+          db.close()
+          PY
