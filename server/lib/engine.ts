@@ -42,7 +42,11 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
-import { captureResearchTimelinePrices, researchStageFor } from "./research";
+import {
+  captureResearchTimelinePrices,
+  researchStageFor,
+  savePinnacleResearchInitialSnapshots,
+} from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
@@ -338,6 +342,7 @@ export class RadarEngine {
     optic: Awaited<ReturnType<OpticOddsProvider["fetchFixtures"]>>;
     titan: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>>;
   } | null = null;
+  private lastTitanLiveFixtureIds = new Set<string>();
   private pinnacleDetail = new Map<string, PinnacleDetailCacheEntry>();
   private crownDetail = new Map<string, PinnacleDetailCacheEntry>();
   private pinnacleRowsSeen = 0;
@@ -801,7 +806,11 @@ export class RadarEngine {
     // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
     // mock refreshPinnacleFixtures can still assert exact call counts, and so
     // the runResearchTimelineTick order-of-operations stays deterministic.
-    const titan = this.fixtureCache?.titan ?? [];
+    // Crown-opened fixtures define this research universe. Pinnacle prices
+    // are then collected against the same stable Titan sId.
+    const titan = (this.fixtureCache?.titan ?? []).filter(
+      (fixture) => fixture.handicapVal !== null || fixture.totalVal !== null,
+    );
     if (!titan.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
     // Skip Titan ids already mapped to an HKJC-linked match, so we do not
@@ -810,6 +819,16 @@ export class RadarEngine {
       (rawDb.prepare(
         "SELECT titan_id FROM matches WHERE fixture_source='hkjc' AND titan_id IS NOT NULL",
       ).all() as Array<{ titan_id: string | null }>).map((row) => row.titan_id).filter((v): v is string => !!v),
+    );
+    const ownerByTitan = new Map(
+      (rawDb.prepare(
+        `SELECT id,titan_id,fixture_source FROM matches
+          WHERE titan_id IS NOT NULL`,
+      ).all() as Array<{
+        id: string;
+        titan_id: string;
+        fixture_source: "hkjc" | "pinnacle" | "crown";
+      }>).map((row) => [row.titan_id, row]),
     );
     const upsertFixture = rawDb.prepare(
       `INSERT INTO matches(
@@ -830,7 +849,33 @@ export class RadarEngine {
         // Only fixtures still in the future or just kicked off are useful for
         // research; historical rows may still be settled later by a separate job.
         if (fixture.kickoffUtc < now - 5 * 60_000) continue;
-        const matchId = `pinnacle:titan:${fixture.providerMatchId}`;
+        const owner = ownerByTitan.get(fixture.providerMatchId);
+        if (owner?.fixture_source === "hkjc") continue;
+        const matchId = owner?.id ?? `pinnacle:titan:${fixture.providerMatchId}`;
+        if (owner?.fixture_source === "crown") {
+          // Older Crown-driven ingestion used the same unique Titan id. Convert
+          // that canonical fixture in place: Crown remains only the selection
+          // criterion and its price rows must not enter the research dataset.
+          rawDb.prepare(
+            `UPDATE matches
+                SET fixture_source='pinnacle',pinnacle_match_id=?,updated_at=?
+              WHERE id=? AND fixture_source='crown'`,
+          ).run(`titan:${fixture.providerMatchId}`, now, matchId);
+          rawDb.prepare(
+            "DELETE FROM research_timeline_snapshots WHERE match_id=? AND provider='crown'",
+          ).run(matchId);
+          rawDb.prepare(
+            `UPDATE research_timeline_points
+                SET status=CASE WHEN EXISTS(
+                      SELECT 1 FROM research_timeline_snapshots q
+                       WHERE q.match_id=research_timeline_points.match_id
+                         AND q.stage=research_timeline_points.stage
+                         AND q.provider IN ('hkjc','pinnacle')
+                    ) THEN 'partial' ELSE 'pending' END,
+                    captured_at=NULL,note='等待馬會／平博收集',updated_at=?
+              WHERE match_id=?`,
+          ).run(now, matchId);
+        }
         upsertFixture.run(
           matchId,
           fixture.providerMatchId,
@@ -879,17 +924,32 @@ export class RadarEngine {
         const target = eligible[nextTarget++];
         if (!target) return;
         try {
-          const normalPrices = DEMO
-            ? DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? []
-            : await this.pinnacle.fetchMatchPrices(target.eventId);
+          const researchPrices = DEMO
+            ? {
+                opening: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
+                current: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
+                sourceUrls: { AH: "demo:pinnacle:AH", OU: "demo:pinnacle:OU" },
+              }
+            : await this.pinnacle.fetchPinnacleResearchPrices(target.eventId);
           fetched++;
-          if (normalPrices.length) {
+          const capturedAt = Date.now();
+          if (researchPrices.opening.length) {
+            const inserted = savePinnacleResearchInitialSnapshots(
+              target.matchId,
+              target.eventId,
+              researchPrices.opening,
+              researchPrices.sourceUrls,
+              capturedAt,
+            );
+            if (inserted) rows++;
+          }
+          if (researchPrices.current.length) {
             const inserted = captureResearchTimelinePrices(
               target.matchId,
               "pinnacle",
-              normalPrices,
+              researchPrices.current,
               target.kickoffUtc,
-              Date.now(),
+              capturedAt,
             );
             if (inserted) rows++;
           }
@@ -1645,6 +1705,31 @@ export class RadarEngine {
   async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
+    // The complete same-day Titan feed changes much faster than future-day
+    // schedules. Refresh it independently on every research pass instead of
+    // leaving a failed boot-time response stuck behind the 10-minute shared
+    // fixture cache. A failed refresh never deletes the last good universe.
+    if (!DEMO && this.fixtureCache) {
+      try {
+        const live = await this.pinnacle.fetchTitanLiveFixtures([0, 1, 2, 3, 4]);
+        const liveIds = new Set(live.map((fixture) => fixture.providerMatchId));
+        const merged = new Map(
+          [...this.fixtureCache.titan, ...live].map((fixture) => [fixture.providerMatchId, fixture]),
+        );
+        this.fixtureCache.titan = [...merged.values()];
+        this.lastTitanLiveFixtureIds = liveIds;
+        log("titan_live_fixture_refresh", {
+          liveFixtures: live.length,
+          mergedFixtures: this.fixtureCache.titan.length,
+        });
+      } catch (err) {
+        log("titan_live_fixture_error", {
+          error: (err as Error).message,
+          retainedLiveFixtures: this.lastTitanLiveFixtureIds.size,
+          retainedMergedFixtures: this.fixtureCache.titan.length,
+        });
+      }
+    }
     // Pinnacle-only research runs after the shared fixture cache is warm.
     // It writes only research-timeline rows and never touches HKJC execution
     // or the T-30 window scanner.

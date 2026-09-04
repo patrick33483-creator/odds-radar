@@ -155,7 +155,8 @@ export function parseSchedulePage(html: string, yyyymmdd: string): PinnacleFixtu
  *
  * Record fields used here:
  *  0 sId, 2/3 league SC/TC, 5/6 home SC/TC, 8/9 away SC/TC,
- *  12 local UTC+8 kickoff tuple with a zero-based month.
+ *  12 local UTC+8 kickoff tuple with a zero-based month,
+ *  29 Crown/default Asian line, 46 Crown/default total line.
  */
 export function parseTitanLiveData(jsText: string): PinnacleFixture[] {
   const out: PinnacleFixture[] = [];
@@ -178,6 +179,8 @@ export function parseTitanLiveData(jsText: string): PinnacleFixture[] {
     const league = (fields[3] || fields[2] || "").trim();
     const homeTeam = (fields[6] || fields[5] || "").trim();
     const awayTeam = (fields[9] || fields[8] || "").trim();
+    const handicapVal = fields[29]?.trim() === "" ? null : Number(fields[29]);
+    const totalVal = fields[46]?.trim() === "" ? null : Number(fields[46]);
     if (!league || !homeTeam || !awayTeam || !Number.isFinite(kickoffUtc)) continue;
     out.push({
       providerMatchId,
@@ -190,8 +193,8 @@ export function parseTitanLiveData(jsText: string): PinnacleFixture[] {
       awayScore: null,
       halfHome: null,
       halfAway: null,
-      handicapVal: null,
-      totalVal: null,
+      handicapVal: handicapVal !== null && Number.isFinite(handicapVal) ? handicapVal : null,
+      totalVal: totalVal !== null && Number.isFinite(totalVal) ? totalVal : null,
     });
   }
   return out;
@@ -273,6 +276,15 @@ export function parsePinnacleAsianTriple(html: string): PinnacleRowTriple | null
   const picked = selectPinnacleRow(listBookmakerRows(html));
   if (!picked) return null;
   const triple = rowTriple(picked.row.html);
+  if (!triple) return null;
+  return { ...triple, companyId: picked.row.companyId, matchedBy: picked.matchedBy };
+}
+
+/** Pinnacle's explicit opening triple; never a first-seen current quote. */
+export function parsePinnacleOpeningAsianTriple(html: string): PinnacleRowTriple | null {
+  const picked = selectPinnacleRow(listBookmakerRows(html));
+  if (!picked) return null;
+  const triple = openingRowTriple(picked.row.html);
   if (!triple) return null;
   return { ...triple, companyId: picked.row.companyId, matchedBy: picked.matchedBy };
 }
@@ -418,21 +430,56 @@ export class PinnacleProvider {
     return this.fetchTitanFixtures(dayOffsets);
   }
 
+  /**
+   * Fetch Titan's complete live fixture universe independently from the
+   * slower multi-day static schedule.  A HTTP 200 with an empty body is a
+   * source failure, not a valid zero-fixture slate.
+   *
+   * This method is public so the research scheduler can refresh the volatile
+   * same-day universe on every pass without invalidating the 10-minute cache
+   * used by PinnAPI, OpticOdds and future-day static pages.
+   */
+  async fetchTitanLiveFixtures(dayOffsets: number[] = [0, 1]): Promise<PinnacleFixture[]> {
+    const now = Date.now();
+    const requestedKeys = new Set(dayOffsets.map((off) => ymd(new Date(now + off * 86_400_000))));
+    const candidates = [LIVE_DATA];
+    if (LIVE_DATA.startsWith("https://")) candidates.push(LIVE_DATA.replace(/^https:/, "http:"));
+    let lastError: Error | null = null;
+
+    for (const url of [...new Set(candidates)]) {
+      try {
+        const liveJs = await fetchText(`${url}?r=007${now}`, {
+          headers: {
+            referer: "https://live.titan007.com/oldIndexall_big.aspx",
+            accept: "*/*",
+            "accept-language": "zh-HK,zh-TW;q=0.9,en;q=0.8",
+            "sec-fetch-dest": "script",
+            "sec-fetch-mode": "no-cors",
+            "sec-fetch-site": "same-site",
+          },
+          timeoutMs: 8_000,
+          retries: 0,
+        });
+        if (!liveJs.trim()) throw new Error("HTTP 200 但回傳空內容");
+        const parsed = parseTitanLiveData(liveJs);
+        if (!parsed.length) throw new Error(`回傳 ${liveJs.length} bytes 但解析到 0 場`);
+        return parsed.filter((fixture) => requestedKeys.has(ymd(new Date(fixture.kickoffUtc))));
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+    throw lastError ?? new Error("Titan 即時完整賽程沒有可用回應");
+  }
+
   private async fetchTitanFixtures(dayOffsets: number[]): Promise<PinnacleFixture[]> {
     const out: PinnacleFixture[] = [];
     const now = Date.now();
-    const requestedKeys = new Set(dayOffsets.map((off) => ymd(new Date(now + off * 86_400_000))));
 
     // The live feed is the complete same-day universe. It includes fixtures
     // omitted from Next_ pages (notably youth and smaller leagues), so let it
     // win deduplication and use the static pages as future-day/backup coverage.
     try {
-      const liveJs = await fetchText(`${LIVE_DATA}?r=007${now}`, {
-        headers: { referer: "https://live.titan007.com/" },
-        timeoutMs: 15_000,
-        retries: 1,
-      });
-      out.push(...parseTitanLiveData(liveJs).filter((fixture) => requestedKeys.has(ymd(new Date(fixture.kickoffUtc)))));
+      out.push(...await this.fetchTitanLiveFixtures(dayOffsets));
     } catch (err) {
       this.warn(`Titan 即時完整賽程暫時不可用 (${(err as Error).message}); 已改用靜態賽程後備`);
     }
@@ -587,6 +634,62 @@ export class PinnacleProvider {
     if (ou.status === "fulfilled") {
       append(opening, "OU", parseCrownOpeningAsianTriple(ou.value), null);
       append(current, "OU", parseCrownAsianTriple(ou.value), now);
+    }
+    return { opening, current, sourceUrls };
+  }
+
+  /** Research-only Pinnacle AH/OU with explicit opening and current values. */
+  async fetchPinnacleResearchPrices(sId: string): Promise<CrownResearchPrices> {
+    const now = Date.now();
+    const sourceUrls = {
+      AH: `${VIP}/AsianOdds_n.aspx?id=${sId}`,
+      OU: `${VIP}/OverDown_n.aspx?id=${sId}`,
+    };
+    const [ah, ou] = await Promise.allSettled([
+      fetchText(sourceUrls.AH, { timeoutMs: 30_000, retries: 1 }),
+      fetchText(sourceUrls.OU, { timeoutMs: 30_000, retries: 1 }),
+    ]);
+    if (ah.status === "rejected" && ou.status === "rejected") {
+      throw new Error(`Pinnacle research detail unavailable for ${sId}: ${(ah.reason as Error)?.message ?? "unknown"}`);
+    }
+    const opening: ProviderPrice[] = [];
+    const current: ProviderPrice[] = [];
+    const append = (
+      target: ProviderPrice[],
+      market: "AH" | "OU",
+      row: { home: number; goals: number; away: number } | null,
+      sourceUpdatedAt: number | null,
+    ) => {
+      const lineValue = row
+        ? market === "AH"
+          ? parsePinnacleHandicap(row.goals)
+          : parsePinnacleTotal(Math.abs(row.goals))
+        : null;
+      if (!row || lineValue === null) return;
+      target.push({
+        market,
+        lineValue,
+        isMain: true,
+        selection: market === "AH" ? "H" : "O",
+        decimalOdds: hkToDecimal(row.home),
+        sourceUpdatedAt,
+      });
+      target.push({
+        market,
+        lineValue,
+        isMain: true,
+        selection: market === "AH" ? "A" : "U",
+        decimalOdds: hkToDecimal(row.away),
+        sourceUpdatedAt,
+      });
+    };
+    if (ah.status === "fulfilled") {
+      append(opening, "AH", parsePinnacleOpeningAsianTriple(ah.value), null);
+      append(current, "AH", parsePinnacleAsianTriple(ah.value), now);
+    }
+    if (ou.status === "fulfilled") {
+      append(opening, "OU", parsePinnacleOpeningAsianTriple(ou.value), null);
+      append(current, "OU", parsePinnacleAsianTriple(ou.value), now);
     }
     return { opening, current, sourceUrls };
   }

@@ -1,0 +1,78 @@
+name: Verify Titan live fixtures in production
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Verify live-feed refresh and photographed fixtures
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          sleep 45
+          echo "=== live fixture collector events ==="
+          sudo docker compose logs --since 5m radar 2>&1 |
+            grep -E 'titan_live_fixture_(refresh|error)|pinnacle_only_research' |
+            tail -40 || true
+          echo "=== photographed 21:45/22:00/22:30 Titan IDs and Pinnacle openings ==="
+          sudo python3 - <<'PY'
+          import json, sqlite3
+          # Crown-opened rows visible in the user's 22:00/22:30 screenshot.
+          ids = (
+              "3057138","3037793","3041547","2933133","2933134","3078030","2969772",
+              "2961615","3085480","3085562","2952564","2952567","3059387",
+              "2969777","3046401",
+          )
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+          marks = ",".join("?" for _ in ids)
+          rows = db.execute(
+              f"""SELECT titan_id,league,home_team,away_team,kickoff_utc,fixture_source
+                    FROM matches WHERE titan_id IN ({marks}) ORDER BY kickoff_utc,titan_id""",
+              ids,
+          ).fetchall()
+          found = {str(row["titan_id"]) for row in rows}
+          opening_rows = db.execute(
+              f"""SELECT m.titan_id,COUNT(DISTINCT s.selection) selections
+                    FROM matches m
+                    JOIN research_timeline_snapshots s ON s.match_id=m.id
+                   WHERE m.titan_id IN ({marks})
+                     AND s.provider='pinnacle' AND s.market='OU'
+                     AND s.stage='initial' AND s.origin='external_opening'
+                   GROUP BY m.titan_id""",
+              ids,
+          ).fetchall()
+          opening = {str(row["titan_id"]): int(row["selections"]) for row in opening_rows}
+          missing_opening = [x for x in ids if opening.get(x, 0) < 2]
+          print(json.dumps({
+              "expected": len(ids),
+              "found": len(found),
+              "missing": [x for x in ids if x not in found],
+              "opening_ou_selections": opening,
+              "missing_pinnacle_opening_ou": missing_opening,
+              "rows": [dict(row) for row in rows],
+          }, ensure_ascii=False))
+          db.close()
+          if len(found) < len(ids):
+              raise SystemExit(f"missing {len(ids)-len(found)} photographed Titan fixtures")
+          if missing_opening:
+              raise SystemExit(f"missing Pinnacle opening OU for {len(missing_opening)} photographed fixtures")
+          PY
+          REMOTE

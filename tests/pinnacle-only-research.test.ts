@@ -143,16 +143,21 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
         awayScore: null,
         halfHome: null,
         halfAway: null,
-        handicapVal: null,
+        handicapVal: 0.25,
         totalVal: null,
       }],
     };
-    (radar as any).pinnacle.fetchMatchPrices = vi.fn(async (sId: string) => {
+    (radar as any).pinnacle.fetchPinnacleResearchPrices = vi.fn(async (sId: string) => {
       expect(sId).toBe("3085481");
-      return [
+      const prices = [
         { market: "OU", lineValue: 2.5, isMain: true, selection: "O", decimalOdds: 1.91 },
         { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 1.93 },
       ];
+      return {
+        opening: prices,
+        current: prices,
+        sourceUrls: { AH: "https://example.test/ah", OU: "https://example.test/ou" },
+      };
     });
 
     const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
@@ -196,18 +201,26 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
         awayScore: null,
         halfHome: null,
         halfAway: null,
-        handicapVal: null,
+        handicapVal: 0.25,
         totalVal: null,
       }],
     };
-    (radar as any).pinnacle.fetchMatchPrices = vi.fn().mockResolvedValue([
-      { market: "OU", lineValue: 3.25, isMain: true, selection: "O", decimalOdds: 1.92 },
-      { market: "OU", lineValue: 3.25, isMain: true, selection: "U", decimalOdds: 1.83 },
-    ]);
+    const fetchResearchPrices = vi.fn().mockResolvedValue({
+      opening: [
+        { market: "OU", lineValue: 3.25, isMain: true, selection: "O", decimalOdds: 1.92 },
+        { market: "OU", lineValue: 3.25, isMain: true, selection: "U", decimalOdds: 1.83 },
+      ],
+      current: [
+        { market: "OU", lineValue: 3.25, isMain: true, selection: "O", decimalOdds: 1.92 },
+        { market: "OU", lineValue: 3.25, isMain: true, selection: "U", decimalOdds: 1.83 },
+      ],
+      sourceUrls: { AH: "https://example.test/ah", OU: "https://example.test/ou" },
+    });
+    (radar as any).pinnacle.fetchPinnacleResearchPrices = fetchResearchPrices;
 
     const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
     expect(outcome.fetched).toBe(1);
-    expect((radar as any).pinnacle.fetchMatchPrices).toHaveBeenCalledWith("3085657");
+    expect(fetchResearchPrices).toHaveBeenCalledWith("3085657");
     expect(rawDb.prepare(
       "SELECT league,home_team,away_team FROM matches WHERE id='pinnacle:titan:3085657'",
     ).get()).toEqual({
@@ -215,6 +228,15 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
       home_team: "伊斯坦堡U19",
       away_team: "加拉塔沙雷U19",
     });
+    expect(rawDb.prepare(
+      `SELECT DISTINCT origin,source_name,source_match_id
+         FROM research_timeline_snapshots
+        WHERE match_id='pinnacle:titan:3085657' AND stage='initial'`,
+    ).all()).toEqual([{
+      origin: "external_opening",
+      source_name: "titan007-pinnacle",
+      source_match_id: "3085657",
+    }]);
   });
 
   it("shows a discovered Titan fixture as pending before its first quote arrives", () => {

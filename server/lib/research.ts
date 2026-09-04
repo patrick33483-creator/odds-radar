@@ -309,7 +309,7 @@ function fixtureIdentity(matchId: string): {
 /** Number of genuinely supported provider/market pairs for this fixture. */
 export function expectedPairCount(matchId: string, stage: ResearchStage): number {
   const fixture = fixtureIdentity(matchId);
-  if (fixture.fixture_source === "crown") return 2; // Crown AH + OU only.
+  if (fixture.fixture_source === "crown") return 2; // Legacy Crown-selected fixture: Pinnacle AH + OU.
   if (fixture.fixture_source === "pinnacle") {
     // Titan-driven Pinnacle-only fixtures collect Pinnacle AH + OU. Corners
     // are not exposed by Titan's standard Pinnacle detail rows.
@@ -441,6 +441,79 @@ export function saveCrownResearchInitialSnapshots(
   let inserted = 0;
   rawDb.transaction(() => {
     ensurePoint.run(matchId, capturedAt, capturedAt);
+    for (const price of accepted) {
+      inserted += insert.run(
+        matchId,
+        price.market,
+        lineKeyOf(price.market, price.lineValue),
+        price.selection,
+        price.decimalOdds,
+        price.isMain ? 1 : 0,
+        price.sourceUpdatedAt ?? null,
+        capturedAt,
+        titanId,
+        sourceUrls[price.market as "AH" | "OU"],
+      ).changes;
+    }
+    const complete = initialPairCount(matchId);
+    const expected = expectedPairCount(matchId, "initial");
+    const point = rawDb.prepare(
+      "SELECT first_captured_at FROM research_timeline_points WHERE match_id=? AND stage='initial'",
+    ).get(matchId) as { first_captured_at: number | null };
+    rawDb.prepare(
+      `UPDATE research_timeline_points
+          SET first_captured_at=COALESCE(first_captured_at,?),
+              captured_at=COALESCE(captured_at,?),
+              last_retry_at=CASE WHEN first_captured_at IS NULL THEN last_retry_at ELSE ? END,
+              status=?,note=?,updated_at=?
+        WHERE match_id=? AND stage='initial'`,
+    ).run(
+      capturedAt,
+      capturedAt,
+      point.first_captured_at === null ? null : capturedAt,
+      complete >= expected ? "captured" : "partial",
+      complete >= expected ? null : `${complete}/${expected} provider-market pairs complete`,
+      capturedAt,
+      matchId,
+    );
+  })();
+  return inserted;
+}
+
+/** Immutable explicit Pinnacle opening from Titan's bookmaker row. */
+export function savePinnacleResearchInitialSnapshots(
+  matchId: string,
+  titanId: string,
+  prices: ProviderPrice[],
+  sourceUrls: { AH: string; OU: string },
+  capturedAt = Date.now(),
+): number {
+  const accepted = prices.filter((price) => price.market === "AH" || price.market === "OU");
+  if (!accepted.length) return 0;
+  const insert = rawDb.prepare(
+    `INSERT OR IGNORE INTO research_timeline_snapshots(
+      match_id,provider,market,stage,line_key,selection,decimal_odds,is_main,
+      source_updated_at,captured_at,target_at,status,origin,source_name,source_match_id,source_url
+    ) VALUES(?,'pinnacle',?,'initial',?,?,?,?,?, ?,NULL,'captured','external_opening','titan007-pinnacle',?,?)`,
+  );
+  const ensurePoint = rawDb.prepare(
+    `INSERT INTO research_timeline_points(
+      match_id,stage,target_at,first_captured_at,last_retry_at,captured_at,status,note,created_at,updated_at
+    ) VALUES(?,'initial',NULL,NULL,NULL,NULL,'pending',NULL,?,?)
+    ON CONFLICT(match_id,stage) DO NOTHING`,
+  );
+  const deleteLegacyFirstSeen = rawDb.prepare(
+    `DELETE FROM research_timeline_snapshots
+      WHERE match_id=? AND provider='pinnacle' AND stage='initial'
+        AND origin='live_observation'`,
+  );
+  let inserted = 0;
+  rawDb.transaction(() => {
+    ensurePoint.run(matchId, capturedAt, capturedAt);
+    // Repair rows created by the former Pinnacle-only fallback, which labelled
+    // the first live observation as "initial". Once Titan exposes the explicit
+    // bookmaker opening, that historical value is authoritative.
+    deleteLegacyFirstSeen.run(matchId);
     for (const price of accepted) {
       inserted += insert.run(
         matchId,
@@ -886,7 +959,10 @@ function researchCellStatus(
   const pairQuotes = stageQuotes.filter((quote) => quote.provider === provider && quote.market === market);
   if (pairQuotes.length >= 2) return "captured";
   if (pairQuotes.length > 0) return "partial";
-  if (fixtureSource === "crown" && provider !== "crown") return "source_unavailable";
+  // Legacy Crown-selected rows use Crown only as the fixture criterion. They
+  // collect Pinnacle prices; HKJC is unavailable unless the row is reconciled
+  // into an HKJC canonical fixture.
+  if (fixtureSource === "crown" && provider === "hkjc") return "source_unavailable";
   // Pinnacle-only fixtures have no HKJC or Crown counterpart, and their
   // initial checkpoint has no external Tipsme opening.
   if (fixtureSource === "pinnacle" && provider !== "pinnacle") return "source_unavailable";

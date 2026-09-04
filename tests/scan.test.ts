@@ -10,7 +10,7 @@
  *     the events selected by the window filter)
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createAutoScanTickGate,
   crownLegsWithinLimit,
@@ -36,12 +36,14 @@ import {
   BLOCKED_COMPANY_IDS,
 } from "../server/providers/pinnacle-names";
 import {
+  PinnacleProvider,
   listBookmakerRows,
   parseCrown1X2,
   parseCrownAsianTriple,
   parseCrownOpeningAsianTriple,
   parsePinnacle1X2,
   parsePinnacleAsianTriple,
+  parsePinnacleOpeningAsianTriple,
   parseTitanLiveData,
 } from "../server/providers/pinnacle";
 import { parseOpticPrices } from "../server/providers/opticodds";
@@ -389,6 +391,26 @@ describe("Pinnacle bookmaker-row identification", () => {
     expect(parsePinnacleAsianTriple(onlyCrown)).toBeNull();
   });
 
+  it("keeps Pinnacle explicit opening separate from the current Asian triple", () => {
+    expect(parsePinnacleOpeningAsianTriple(ASIAN_PAGE)).toMatchObject({
+      home: 1,
+      goals: 0.75,
+      away: 0.81,
+      companyId: "47",
+      matchedBy: "name",
+    });
+    expect(parsePinnacleAsianTriple(ASIAN_PAGE)?.goals).toBe(1);
+  });
+
+  it("does not invent a Pinnacle opening from current-only fields", () => {
+    const currentOnly = ASIAN_PAGE.replace(
+      "<td>1.00</td><td goals=\"0.75\">半球/一球</td><td>0.81</td>",
+      "",
+    );
+    expect(parsePinnacleOpeningAsianTriple(currentOnly)).toBeNull();
+    expect(parsePinnacleAsianTriple(currentOnly)).not.toBeNull();
+  });
+
   it("selects Pinnacle by full name in the 1X2 feed and ignores Crown", () => {
     const js = 'var game = Array("545|1|Crown|1.83|4.05|3.45|50|22|26|92|1.56|4.65|4.50|59|20|20","177|2|Pinnacle|1.78|3.93|3.95|52|23|23|93|1.61|4.63|4.81|59|20|19");';
     const out = parsePinnacle1X2(js);
@@ -444,6 +466,30 @@ describe("Titan complete live fixture feed", () => {
       awayTeam: "加拉塔沙雷U19",
       kickoffUtc: Date.UTC(2026, 8, 4, 13, 0, 0),
     });
+  });
+
+  it("reads Crown AH/OU opening indicators from the complete live fixture feed", () => {
+    const fields = Array(69).fill("");
+    fields[0] = "3037793";
+    fields[3] = "卡塔爾聯";
+    fields[6] = "艾沙姆";
+    fields[9] = "艾沙哈尼亞";
+    fields[12] = "2026,8,4,22,00,00";
+    fields[29] = "0.75";
+    fields[46] = "3";
+    const fixtures = parseTitanLiveData(`A[1]="${fields.join("^")}".split('^');`);
+    expect(fixtures[0]).toMatchObject({ handicapVal: 0.75, totalVal: 3 });
+  });
+
+  it("rejects an empty HTTP 200 live feed instead of accepting a zero-fixture slate", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => new Response("", { status: 200 })) as typeof fetch;
+    try {
+      const provider = new PinnacleProvider();
+      await expect(provider.fetchTitanLiveFixtures([0])).rejects.toThrow(/空內容/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
