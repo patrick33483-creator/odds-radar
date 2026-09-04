@@ -49,7 +49,7 @@ import type { FinalResult, ProviderEvent, ProviderPrice } from "./types";
 
 /** Base URLs are overridable so the source can be swapped or fault-injected. */
 const BF = process.env.TITAN_BF_BASE ?? "http://bf.titan007.com/football";
-const VIP = process.env.TITAN_VIP_BASE ?? "http://vip.titan007.com";
+const VIP = process.env.TITAN_VIP_BASE ?? "https://vip.titan007.com";
 const X2 = process.env.TITAN_1X2_BASE ?? "http://1x2d.titan007.com";
 const LIVE_DATA = process.env.TITAN_LIVE_DATA_URL ?? "https://livestatic.titan007.com/vbsxml/bfdata_ut.js";
 const HK_TZ_OFFSET_MS = 8 * 60 * 60 * 1000;

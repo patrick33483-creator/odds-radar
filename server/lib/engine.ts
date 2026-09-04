@@ -899,7 +899,7 @@ export class RadarEngine {
         }
       }
     };
-    const workerCount = Math.min(6, eligible.length);
+    const workerCount = Math.min(12, eligible.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     // Pinnacle-only fixtures can qualify for the OU signal path via the

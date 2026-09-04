@@ -832,18 +832,24 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
   ];
   const params: unknown[] = [bounds.lo, bounds.hi, now];
   if (filters.provider !== "all") {
-    clauses.push("q.provider=?");
+    // A directly discovered Titan/Pinnacle fixture must remain visible while
+    // its first quote is pending; filtering on the LEFT JOIN alone used to
+    // hide the whole fixture until collection had already succeeded.
+    clauses.push(filters.provider === "pinnacle"
+      ? "(q.provider=? OR m.fixture_source='pinnacle')"
+      : "q.provider=?");
     params.push(filters.provider);
   }
   if (filters.market !== "all") {
-    clauses.push("q.market=?");
+    clauses.push("(q.market=? OR m.fixture_source='pinnacle')");
     params.push(filters.market);
   }
-  // HKJC remains visible before capture. A Titan fixture only becomes a
-  // Pinnacle-only research row after a genuine Pinnacle quote is captured;
-  // this prevents Titan fixtures with no Pinnacle market from appearing.
+  // Both HKJC and direct Titan fixtures remain visible before capture. The
+  // timeline cells tell the truth as pending/missing/source-unavailable; the
+  // UI must not silently remove discovered fixtures merely because a provider
+  // request is still queued, slow or temporarily unavailable.
   clauses.push(
-    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source='hkjc')",
+    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source IN ('hkjc','pinnacle'))",
   );
   return { clause: clauses.join(" AND "), params };
 }

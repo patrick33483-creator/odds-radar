@@ -217,6 +217,28 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
     });
   });
 
+  it("shows a discovered Titan fixture as pending before its first quote arrives", () => {
+    const kickoff = NOW + 20 * 60_000;
+    addPinnacleOnlyFixture("pinnacle:titan:pending-3085657", kickoff);
+
+    const dataset = researchDataset({
+      window: "upcoming",
+      days: 7,
+      horizonDays: 1,
+      provider: "pinnacle",
+      market: "OU",
+      limit: 300,
+    }, NOW);
+
+    expect(dataset.matches).toHaveLength(1);
+    expect(dataset.matches[0]).toMatchObject({
+      matchId: "pinnacle:titan:pending-3085657",
+      fixtureSource: "pinnacle",
+      snapshotCount: 0,
+    });
+    expect(dataset.matches[0].timeline.T30.status).toBe("missing");
+  });
+
   it("creates a Pinnacle-only match row and captures live snapshots into T30/T15/T5 without touching execution tables", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-100", kickoff);
