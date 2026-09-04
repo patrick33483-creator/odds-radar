@@ -43,14 +43,25 @@ describe("Pinnacle-only research priority queue", () => {
     ]);
   });
 
-  it("skips a fixture when its current OU stage is already captured", () => {
+  it("skips a fixture when its current OU stage and explicit opening are captured", () => {
     const now = 1_800_000_000_000;
     const result = prioritizePendingPinnacleResearchTargets([
       target("pinnacle:done", now + 3 * MINUTE),
       target("pinnacle:missing", now + 4 * MINUTE),
-    ], new Set(["pinnacle:done:T5"]), now);
+    ], new Set(["pinnacle:done:T5", "pinnacle:done:initial"]), now);
 
     expect(result.map((row) => row.matchId)).toEqual(["pinnacle:missing"]);
+  });
+
+  it("repairs an explicit opening even when the current OU stage is captured", () => {
+    const now = 1_800_000_000_000;
+    const result = prioritizePendingPinnacleResearchTargets([
+      target("pinnacle:repair", now + 3 * MINUTE),
+    ], new Set(["pinnacle:repair:T5"]), now);
+
+    expect(result.map(({ matchId, stage }) => [matchId, stage])).toEqual([
+      ["pinnacle:repair", "initial"],
+    ]);
   });
 
   it("excludes kicked-off fixtures and fixtures outside the 24-hour horizon", () => {

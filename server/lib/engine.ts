@@ -160,10 +160,17 @@ export function prioritizePendingPinnacleResearchTargets(
     .flatMap((target): PendingPinnacleResearchTarget[] => {
       const untilKickoff = target.kickoffUtc - now;
       if (untilKickoff <= 0 || untilKickoff > 24 * 60 * 60_000) return [];
-      const stage = researchStageFor(target.kickoffUtc, now)
-        ?? (untilKickoff > 30 * 60_000 ? "initial" : null);
-      if (!stage || capturedOuStages.has(`${target.matchId}:${stage}`)) return [];
-      return [{ ...target, stage }];
+      const milestone = researchStageFor(target.kickoffUtc, now);
+      if (milestone && !capturedOuStages.has(`${target.matchId}:${milestone}`)) {
+        return [{ ...target, stage: milestone }];
+      }
+      // Opening is fetched from Titan's explicit bookmaker history and remains
+      // recoverable after T-30. A captured live milestone must not prevent an
+      // older first-seen "initial" row from being repaired.
+      if (!capturedOuStages.has(`${target.matchId}:initial`)) {
+        return [{ ...target, stage: "initial" }];
+      }
+      return [];
     })
     .sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc);
 }
@@ -907,7 +914,8 @@ export class RadarEngine {
       (rawDb.prepare(
         `SELECT DISTINCT match_id,stage
            FROM research_timeline_snapshots
-          WHERE provider='pinnacle' AND market='OU' AND match_id LIKE 'pinnacle:%'`,
+          WHERE provider='pinnacle' AND market='OU'
+            AND (stage<>'initial' OR origin='external_opening')`,
       ).all() as Array<{ match_id: string; stage: "initial" | "T30" | "T15" | "T5" }>)
         .map((row) => `${row.match_id}:${row.stage}`),
     );
