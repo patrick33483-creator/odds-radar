@@ -51,9 +51,15 @@ jobs:
              BACKUP="/opt/odds-radar/backups/pre-deploy-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
              PARTIAL="$BACKUP.partial"
              trap "sudo rm -f \"$PARTIAL\"" EXIT
-             sudo RADAR_BACKUP="$PARTIAL" python3 -c "import gzip, os, sqlite3; source=sqlite3.connect(\"file:/opt/odds-radar/data/data.db?mode=ro\", uri=True); target=gzip.open(os.environ[\"RADAR_BACKUP\"], \"wt\", encoding=\"utf-8\", compresslevel=6); target.writelines(line + \"\\n\" for line in source.iterdump()); target.close(); source.close()"
-             sudo test -s "$PARTIAL"
-             sudo mv "$PARTIAL" "$BACKUP"
+             # Bound the backup step so a stuck iterdump cannot wedge the deploy.
+             # If it fails or times out, existing hourly backups remain the safety net.
+             if ! sudo timeout 180s env RADAR_BACKUP="$PARTIAL" python3 -c "import gzip, os, sqlite3; source=sqlite3.connect(\"file:/opt/odds-radar/data/data.db?mode=ro\", uri=True); target=gzip.open(os.environ[\"RADAR_BACKUP\"], \"wt\", encoding=\"utf-8\", compresslevel=6); target.writelines(line + \"\\n\" for line in source.iterdump()); target.close(); source.close()"; then
+               echo "pre-deploy backup failed or timed out; continuing with existing hourly backups"
+               sudo rm -f "$PARTIAL"
+             else
+               sudo test -s "$PARTIAL"
+               sudo mv "$PARTIAL" "$BACKUP"
+             fi
              trap - EXIT
              sudo sh -c "ls -1t /opt/odds-radar/backups/pre-deploy-*.sql.gz 2>/dev/null | tail -n +8 | xargs -r rm -f"
              git fetch origin master
