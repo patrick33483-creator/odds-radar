@@ -1,5 +1,7 @@
 import type { HkjcProvider } from "../providers/hkjc";
 import { hkjcHktDate } from "../providers/hkjc";
+import { parseSchedulePage } from "../providers/pinnacle";
+import { fetchText } from "./http";
 import {
   TipsmeOpeningProvider,
   type TipsmeOpeningResult,
@@ -602,12 +604,6 @@ export async function collectResearchResults(
   const candidateCount = hkjcCandidates.length;
 
   setState("researchResultsLastRunAt", String(now));
-  if (!candidateCount) {
-    setState("researchResultsLastSuccessAt", String(now));
-    setState("researchResultsLastCollected", "0");
-    setState("researchResultsLastError", "");
-    return { candidates: 0, collected: 0 };
-  }
 
   const byDate = new Map<string, typeof hkjcCandidates>();
   for (const candidate of hkjcCandidates) {
@@ -620,6 +616,7 @@ export async function collectResearchResults(
 
   let collected = 0;
   try {
+    if (candidateCount > 0) {
     for (const rows of byDate.values()) {
       const official = await hkjc.fetchHistoricResults(
         rows.map((row) => ({ matchId: row.hkjc_id, kickoffUtc: row.kickoff_utc })),
@@ -653,14 +650,120 @@ export async function collectResearchResults(
       });
       tx();
     }
+    }
+    // titan007 fallback：非 HKJC 場（fixture_source != 'hkjc'）用 matches.titan_id
+    // 對 http://bf.titan007.com/football/Over_YYYYMMDD.htm 每日一頁攞比分。
+    let titanCandidateCount = 0;
+    let titanCollected = 0;
+    try {
+      const titanCandidates = rawDb
+        .prepare(
+          `SELECT m.id, m.titan_id, m.kickoff_utc
+             FROM matches m
+             LEFT JOIN research_results rr ON rr.match_id=m.id
+            WHERE rr.match_id IS NULL
+              AND m.kickoff_utc<=?
+              AND m.kickoff_utc>=?
+              AND m.fixture_source!='hkjc'
+              AND m.titan_id IS NOT NULL
+            ORDER BY m.kickoff_utc DESC
+            LIMIT 1000`,
+        )
+        .all(now - RESULT_DELAY_MS, now - lookbackDays * 24 * 60 * 60_000) as Array<{
+        id: string;
+        titan_id: string;
+        kickoff_utc: number;
+      }>;
+      titanCandidateCount = titanCandidates.length;
+
+      if (titanCandidateCount > 0) {
+        // 用開賽日期（HKT）去分頁
+        const titanByDate = new Map<string, typeof titanCandidates>();
+        for (const candidate of titanCandidates) {
+          const key = titanHktYyyymmdd(candidate.kickoff_utc);
+          const rows = titanByDate.get(key) ?? [];
+          rows.push(candidate);
+          titanByDate.set(key, rows);
+        }
+
+        const titanBase = process.env.TITAN_BF_BASE ?? "http://bf.titan007.com/football";
+        const titanUpsert = rawDb.prepare(
+          `INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+           VALUES(?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(match_id) DO UPDATE SET home_score=excluded.home_score,
+             away_score=excluded.away_score,corners_total=excluded.corners_total,
+             source=excluded.source,result_source=excluded.result_source,
+             source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at`,
+        );
+
+        for (const [yyyymmdd, rows] of titanByDate.entries()) {
+          try {
+            const html = await fetchText(`${titanBase}/Over_${yyyymmdd}.htm`, {
+              charset: "gb18030",
+              timeoutMs: 25_000,
+              retries: 1,
+            });
+            const fixtures = parseSchedulePage(html, yyyymmdd);
+            const byTitanId = new Map(fixtures.map((f) => [f.providerMatchId, f]));
+            const tx = rawDb.transaction(() => {
+              for (const row of rows) {
+                const fixture = byTitanId.get(row.titan_id);
+                if (!fixture) continue;
+                if (fixture.homeScore === null || fixture.awayScore === null) continue;
+                titanUpsert.run(
+                  row.id,
+                  null,
+                  fixture.homeScore,
+                  fixture.awayScore,
+                  null,
+                  "titan007",
+                  "titan007",
+                  row.titan_id,
+                  now,
+                );
+                titanCollected++;
+              }
+            });
+            tx();
+          } catch (err) {
+            console.error(JSON.stringify({
+              ts: new Date().toISOString(),
+              scope: "radar",
+              event: "research_results_titan_error",
+              yyyymmdd,
+              rows: rows.length,
+              error: (err as Error).message,
+            }));
+          }
+        }
+      }
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_results_titan_fatal",
+        error: (err as Error).message,
+      }));
+    }
+
+    const totalCollected = collected + titanCollected;
     setState("researchResultsLastSuccessAt", String(now));
-    setState("researchResultsLastCollected", String(collected));
+    setState("researchResultsLastCollected", String(totalCollected));
     setState("researchResultsLastError", "");
-    return { candidates: candidateCount, collected };
+    return { candidates: candidateCount + titanCandidateCount, collected: totalCollected };
   } catch (error) {
     setState("researchResultsLastError", (error as Error).message);
     throw error;
   }
+}
+
+/** HKT YYYYMMDD (kickoff 當日) for titan007 Over_ page keys. */
+function titanHktYyyymmdd(utcMs: number): string {
+  const hkt = new Date(utcMs + 8 * 3600 * 1000);
+  const y = hkt.getUTCFullYear();
+  const m = String(hkt.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(hkt.getUTCDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
 }
 
 function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: number } {
