@@ -15,26 +15,42 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
           cat > /tmp/diag.py <<'PYEOF'
-          import sqlite3, time
+          import sqlite3, time, datetime
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
           db.row_factory = sqlite3.Row
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
           now_ms = int(time.time()*1000)
-          q1 = db.execute("""
-            SELECT m.fixture_source,
-                   SUM(CASE WHEN r.match_id IS NULL AND m.kickoff_utc<=? THEN 1 ELSE 0 END) awaiting,
-                   SUM(CASE WHEN r.match_id IS NOT NULL THEN 1 ELSE 0 END) settled,
-                   COUNT(*) total
-              FROM ou_signal_observations o
-              JOIN matches m ON m.id=o.match_id
-              LEFT JOIN research_results r ON r.match_id=o.match_id
-             GROUP BY m.fixture_source
-          """,(now_ms,)).fetchall()
-          print("== FINAL VERIFY ==")
-          total = 0
-          for r in q1:
-              print(f"  {r['fixture_source']:10s} awaiting={r['awaiting']} settled={r['settled']} total={r['total']}")
-              total += r['awaiting']
-          print(f"== TOTAL awaiting across all sources = {total} ==")
+          # 全部 fixture 有「蒂米什瓦拉」or 「Timisoara」or「布加勒斯特快速」or「Rapid」
+          rows = db.execute("""
+            SELECT m.id, m.fixture_source, m.home_team, m.away_team, m.league, m.kickoff_utc,
+                   r.home_score, r.away_score, r.result_source
+              FROM matches m
+              LEFT JOIN research_results r ON r.match_id=m.id
+             WHERE (m.home_team LIKE '%蒂米什瓦拉%' OR m.home_team LIKE '%Timisoara%' 
+                    OR m.away_team LIKE '%布加勒斯特%快速%' OR m.away_team LIKE '%Rapid%')
+               AND m.kickoff_utc > ? AND m.kickoff_utc < ?
+             ORDER BY m.kickoff_utc
+          """,(now_ms - 5*86400*1000, now_ms + 86400*1000)).fetchall()
+          print(f"== 蒂米什瓦拉/Timisoara related fixtures: {len(rows)} ==")
+          for r in rows:
+              t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
+              has = f"{r['home_score']}-{r['away_score']}({r['result_source']})" if r['home_score'] is not None else "MISSING"
+              print(f"  {t} [{r['fixture_source']}] {r['home_team']} vs {r['away_team']} | league={r['league']} | id={r['id']} | result={has}")
+          # 而家全 DB 邊啲 pinnacle 場 awaiting，包括冇 signal 觀察嗰啲都列
+          print()
+          rows2 = db.execute("""
+            SELECT m.id, m.home_team, m.away_team, m.league, m.kickoff_utc,
+                   (SELECT COUNT(*) FROM ou_signal_observations o WHERE o.match_id=m.id) obs_cnt
+              FROM matches m
+              LEFT JOIN research_results r ON r.match_id=m.id
+             WHERE m.fixture_source='pinnacle' AND r.match_id IS NULL
+               AND m.kickoff_utc<=? AND m.kickoff_utc>=?
+             ORDER BY m.kickoff_utc DESC
+          """,(now_ms, now_ms - 4*86400*1000)).fetchall()
+          print(f"== ALL pinnacle awaiting past 96h (including no-obs): {len(rows2)} ==")
+          for r in rows2[:15]:
+              t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
+              print(f"  {t} obs={r['obs_cnt']} {r['home_team']} vs {r['away_team']} | {r['league']}")
           PYEOF
           scp /tmp/diag.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/diag.py"
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/diag.py'
