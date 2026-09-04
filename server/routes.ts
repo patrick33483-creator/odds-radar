@@ -24,6 +24,9 @@ const clearSchema = z.object({ category: z.enum(["case1_arb", "case2_ev", "synth
 const matchRefreshSchema = z.object({ matchId: z.string().min(1).max(120) });
 let autoScanTimer: NodeJS.Timeout | null = null;
 let autoScanStartupTimer: NodeJS.Timeout | null = null;
+let researchTimelineTimer: NodeJS.Timeout | null = null;
+let researchTimelineStartupTimer: NodeJS.Timeout | null = null;
+let researchTimelineInFlight: ReturnType<typeof engine.runResearchTimelineTick> | null = null;
 let hourlyPrewarmTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmStartupTimer: NodeJS.Timeout | null = null;
 let cornerValidationInFlight: Promise<unknown> | null = null;
@@ -150,16 +153,6 @@ function installAutoWindowScan(): void {
   const tick = () => {
     void tickGate.run(async () => {
       try {
-        const research = await engine.runResearchTimelineTick();
-        console.log(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            scope: "radar",
-            event: "auto_research_timeline",
-            selected: research.selected,
-            detailCalls: research.detailCalls,
-          }),
-        );
         const inWindow = engine.windowPreview();
         if (!inWindow.length) return;
         const outcome = await engine.runScan();
@@ -191,6 +184,42 @@ function installAutoWindowScan(): void {
   autoScanStartupTimer.unref();
   autoScanTimer = setInterval(() => void tick(), AUTO_SCAN_CHECK_MS);
   autoScanTimer.unref();
+}
+
+/**
+ * Research checkpoints must not share the dense HKJC scan gate. A dense scan
+ * can legitimately run for the full 30-minute window; coupling the two loops
+ * would suppress every Crown/Pinnacle T30 tick during that period.
+ */
+function installResearchTimelineCollection(): void {
+  if (!autoScanEnabled() || researchTimelineTimer) return;
+  const run = async () => {
+    if (researchTimelineInFlight) return;
+    researchTimelineInFlight = engine.runResearchTimelineTick();
+    try {
+      const research = await researchTimelineInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "auto_research_timeline",
+        selected: research.selected,
+        detailCalls: research.detailCalls,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "auto_research_timeline_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      researchTimelineInFlight = null;
+    }
+  };
+  researchTimelineStartupTimer = setTimeout(() => void run(), 30_000);
+  researchTimelineStartupTimer.unref();
+  researchTimelineTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
+  researchTimelineTimer.unref();
 }
 
 /**
@@ -392,6 +421,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   if (process.env.RADAR_BOOTSTRAP !== "0") {
     void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
   }
+  installResearchTimelineCollection();
   installAutoWindowScan();
   installHourlyPrewarm();
   installResearchOpeningCollection();

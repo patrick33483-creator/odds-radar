@@ -54,4 +54,19 @@ describe("Pinnacle translation is isolated from the research timeline", () => {
     expect(autoScanBody).not.toMatch(/runPinnacleTranslationBackfillBatch/);
     expect(autoScanBody).not.toMatch(/listPinnacleTranslationBackfillTargets/);
   });
+
+  it("runs research checkpoints independently from the long-lived window scan", () => {
+    const src = readSource("server/routes.ts");
+    const researchStart = src.indexOf("function installResearchTimelineCollection(");
+    const autoScanStart = src.indexOf("function installAutoWindowScan(");
+    expect(researchStart).toBeGreaterThan(-1);
+    expect(autoScanStart).toBeGreaterThan(-1);
+
+    const researchBody = src.slice(researchStart, src.indexOf("\n}\n", researchStart) + 3);
+    const autoScanBody = src.slice(autoScanStart, researchStart);
+    expect(researchBody).toMatch(/runResearchTimelineTick/);
+    expect(researchBody).toMatch(/setInterval\(\(\) => void run\(\), AUTO_SCAN_CHECK_MS\)/);
+    expect(autoScanBody).not.toMatch(/runResearchTimelineTick/);
+    expect(autoScanBody).toMatch(/runScan/);
+  });
 });
