@@ -25,9 +25,8 @@ jobs:
           ssh "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /opt/odds-radar
-            set -a
-            . ./.env
-            set +a
+            CREDS=$(sudo cat .env | grep -E "^RADAR_ACCESS_(USER|PASSWORD)=")
+            eval "$CREDS"
             test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
             echo "=== 觸發 settleDue() ==="
             curl --fail --silent --show-error \
