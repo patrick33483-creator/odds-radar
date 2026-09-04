@@ -690,13 +690,32 @@ export async function collectResearchResults(
 
         for (const [yyyymmdd, rows] of titanByDate.entries()) {
           try {
-            const html = await fetchText(`${titanBase}/Over_${yyyymmdd}.htm`, {
-              charset: "gb18030",
-              timeoutMs: 25_000,
-              retries: 1,
-            });
-            const fixtures = parseSchedulePage(html, yyyymmdd);
-            const byTitanId = new Map(fixtures.map((f) => [f.providerMatchId, f]));
+            // titan007：已完場包在 Over_ 及 Next_ 兩頁。當日/前一日場常在 Next_ 頁
+            //           （Over_ 只有已命名雷場時已採集完成）。兩頁先 Over_ 後 Next_ 都試。
+            const byTitanId = new Map<string, ReturnType<typeof parseSchedulePage>[number]>();
+            for (const kind of ["Over", "Next"] as const) {
+              try {
+                const html = await fetchText(`${titanBase}/${kind}_${yyyymmdd}.htm`, {
+                  charset: "gb18030",
+                  timeoutMs: 25_000,
+                  retries: 1,
+                });
+                const fixtures = parseSchedulePage(html, yyyymmdd);
+                for (const f of fixtures) {
+                  const existing = byTitanId.get(f.providerMatchId);
+                  // 只保留有分數那份；Over_ 優先，但如果 Over_ 沒分而 Next_ 有分就換。
+                  const fHasScore = f.homeScore !== null && f.awayScore !== null;
+                  const existingHasScore = existing !== undefined
+                    && existing.homeScore !== null
+                    && existing.awayScore !== null;
+                  if (!existing || (!existingHasScore && fHasScore)) {
+                    byTitanId.set(f.providerMatchId, f);
+                  }
+                }
+              } catch {
+                // 喺一頁 404 不影響另一頁
+              }
+            }
             const tx = rawDb.transaction(() => {
               for (const row of rows) {
                 const fixture = byTitanId.get(row.titan_id);
