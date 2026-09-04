@@ -1,0 +1,38 @@
+name: rollback-bad-fills
+on: workflow_dispatch
+jobs:
+  r:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          cat > /tmp/rb.py <<'PYEOF'
+          import sqlite3, datetime
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30, isolation_level=None)
+          db.execute("PRAGMA busy_timeout=60000")
+          db.row_factory = sqlite3.Row
+          # 錯 batch run 時段 (UTC): 2026-09-04 17:00 - 17:02
+          lo = int(datetime.datetime(2026,9,4,17,0,0,tzinfo=datetime.timezone.utc).timestamp()*1000)
+          hi = int(datetime.datetime(2026,9,4,17,3,0,tzinfo=datetime.timezone.utc).timestamp()*1000)
+          # 睇下數
+          n = db.execute("SELECT COUNT(*) c FROM research_results WHERE result_source='manual' AND fetched_at>=? AND fetched_at<=?",(lo,hi)).fetchone()['c']
+          print(f"about to delete {n} rows (manual + fetched_at in bad window)")
+          # 樣本
+          for r in db.execute("SELECT match_id, home_score, away_score, fetched_at FROM research_results WHERE result_source='manual' AND fetched_at>=? AND fetched_at<=? LIMIT 5",(lo,hi)):
+              print(f"  sample: {r['match_id']} {r['home_score']}-{r['away_score']} fetched_at={r['fetched_at']}")
+          # 執行
+          db.execute("BEGIN IMMEDIATE")
+          cur = db.execute("DELETE FROM research_results WHERE result_source='manual' AND fetched_at>=? AND fetched_at<=?",(lo,hi))
+          db.execute("COMMIT")
+          print(f"deleted {cur.rowcount}")
+          PYEOF
+          scp /tmp/rb.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/rb.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/rb.py'
