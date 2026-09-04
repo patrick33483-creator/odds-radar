@@ -59,6 +59,7 @@ afterEach(() => {
   rawDb.prepare("DELETE FROM market_lines").run();
   rawDb.prepare("DELETE FROM opportunities").run();
   rawDb.prepare("DELETE FROM simulation_bets").run();
+  rawDb.prepare("DELETE FROM pinnacle_source_map").run();
   rawDb.prepare("DELETE FROM matches").run();
   rawDb.prepare("DELETE FROM pinnacle_translations").run();
 });
@@ -237,6 +238,111 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
       source_name: "titan007-pinnacle",
       source_match_id: "3085657",
     }]);
+  });
+
+  it("uses a safely mapped PinnAPI current quote when Titan omits company 47 and reuses the mapping", async () => {
+    const { RadarEngine } = await import("../server/lib/engine");
+    const kickoff = NOW + 25 * 60_000;
+    const matchId = "pinnacle:titan:company47-missing";
+    const radar = new RadarEngine();
+    const titanFixture = {
+      providerMatchId: "company47-missing",
+      league: "測試聯賽",
+      homeTeam: "中文主隊甲",
+      awayTeam: "中文客隊乙",
+      kickoffUtc: kickoff,
+      statusText: "未開賽",
+      homeScore: null,
+      awayScore: null,
+      halfHome: null,
+      halfAway: null,
+      handicapVal: 0.25,
+      totalVal: 2.5,
+    };
+    (radar as any).fixtureCache = {
+      at: NOW,
+      pinnapi: [{
+        providerMatchId: "pinnapi-safe-event",
+        league: "Test League",
+        homeTeam: "English Home Alpha",
+        awayTeam: "English Away Beta",
+        kickoffUtc: kickoff,
+        inplay: false,
+        status: "scheduled",
+        parentId: null,
+      }],
+      optic: [],
+      titan: [titanFixture],
+    };
+    const insertAlias = rawDb.prepare(
+      "INSERT OR REPLACE INTO team_aliases(canonical,alias,provider,confirmed_at) VALUES(?,?,?,?)",
+    );
+    insertAlias.run("fallback-home", "中文主甲", "hkjc", NOW);
+    insertAlias.run("fallback-home", "englishhomealpha", "pinnacle", NOW);
+    insertAlias.run("fallback-away", "中文客乙", "hkjc", NOW);
+    insertAlias.run("fallback-away", "englishawaybeta", "pinnacle", NOW);
+
+    const fetchTitan = vi.fn().mockResolvedValue({
+      opening: [],
+      current: [],
+      sourceUrls: { AH: "https://example.test/ah", OU: "https://example.test/ou" },
+    });
+    const fetchPinnapi = vi.fn().mockResolvedValue([
+      { market: "OU", lineValue: 2.5, isMain: true, selection: "O", decimalOdds: 1.91 },
+      { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 1.93 },
+    ]);
+    (radar as any).pinnacle.fetchPinnacleResearchPrices = fetchTitan;
+    (radar as any).pinnapi.fetchMatchPrices = fetchPinnapi;
+
+    const t30 = await radar.refreshPinnacleOnlyResearch(NOW);
+    expect(t30).toMatchObject({ fixtures: 1, fetched: 1, failed: 0, rows: 1 });
+    expect(fetchPinnapi).toHaveBeenCalledWith("pinnapi-safe-event");
+    expect(rawDb.prepare(
+      "SELECT pinnapi_id,pinnapi_reversed,titan_id FROM pinnacle_source_map WHERE match_id=?",
+    ).get(matchId)).toEqual({
+      pinnapi_id: "pinnapi-safe-event",
+      pinnapi_reversed: 0,
+      titan_id: "company47-missing",
+    });
+    expect(rawDb.prepare(
+      "SELECT league,home_team,away_team,league_en,home_team_en,away_team_en FROM matches WHERE id=?",
+    ).get(matchId)).toEqual({
+      league: "測試聯賽",
+      home_team: "中文主隊甲",
+      away_team: "中文客隊乙",
+      league_en: null,
+      home_team_en: null,
+      away_team_en: null,
+    });
+    expect(rawDb.prepare(
+      `SELECT DISTINCT provider,stage,origin,source_name,source_match_id FROM research_timeline_snapshots
+        WHERE match_id=? ORDER BY stage`,
+    ).all(matchId)).toEqual([{
+      provider: "pinnacle",
+      stage: "T30",
+      origin: "live_observation",
+      source_name: "pinnapi",
+      source_match_id: "pinnapi-safe-event",
+    }]);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE match_id=? AND provider='crown'",
+    ).get(matchId)).toEqual({ c: 0 });
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE match_id=? AND stage='initial'",
+    ).get(matchId)).toEqual({ c: 0 });
+
+    // The cached fixture list can rotate after mapping; the next milestone
+    // still uses the persisted PinnAPI event id.
+    (radar as any).fixtureCache = { at: NOW + 15 * 60_000, pinnapi: [], optic: [], titan: [titanFixture] };
+    const t15 = await radar.refreshPinnacleOnlyResearch(NOW + 15 * 60_000);
+    expect(t15).toMatchObject({ fixtures: 1, fetched: 1, failed: 0, rows: 1 });
+    expect(fetchPinnapi).toHaveBeenCalledTimes(2);
+    expect(rawDb.prepare(
+      "SELECT DISTINCT stage FROM research_timeline_snapshots WHERE match_id=? ORDER BY stage",
+    ).all(matchId)).toEqual([{ stage: "T15" }, { stage: "T30" }]);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE match_id=? AND stage='initial'",
+    ).get(matchId)).toEqual({ c: 0 });
   });
 
   it("shows a discovered Titan fixture as pending before its first quote arrives", () => {

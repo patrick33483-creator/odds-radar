@@ -129,6 +129,11 @@ export function captureResearchTimelinePrices(
   prices: ProviderPrice[],
   kickoffUtc: number,
   observedAt: number,
+  provenance?: {
+    sourceName?: string;
+    sourceMatchId?: string | null;
+    sourceUrl?: string | null;
+  },
 ): number {
   const accepted = prices.filter((price) =>
     RESEARCH_MARKETS.includes(price.market as (typeof RESEARCH_MARKETS)[number])
@@ -206,9 +211,9 @@ export function captureResearchTimelinePrices(
           price.sourceUpdatedAt ?? null,
           observedAt,
           stageTargetAt(stage, kickoffUtc),
-          provider,
-          null,
-          null,
+          provenance?.sourceName ?? provider,
+          provenance?.sourceMatchId ?? null,
+          provenance?.sourceUrl ?? null,
         ).changes;
       }
       const complete = (completeGroups.get(matchId, stage) as { count: number }).count;

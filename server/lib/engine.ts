@@ -140,11 +140,43 @@ export type PinnacleResearchTarget = {
   league: string;
   homeTeam: string;
   awayTeam: string;
+  leagueEn?: string | null;
+  homeTeamEn?: string | null;
+  awayTeamEn?: string | null;
 };
 
 type PendingPinnacleResearchTarget = PinnacleResearchTarget & {
   stage: "initial" | "T30" | "T15" | "T5";
 };
+
+/**
+ * Retry a name-safe match with PinnAPI's occasionally shifted kickoff time.
+ * The wider window is accepted only when the ordinary matcher reaches very
+ * high confidence after time is neutralised.
+ */
+export function matchWithVerifiedTimeFallback(
+  target: CandidateEvent,
+  candidates: CandidateEvent[],
+  sourceAliases?: AliasIndex,
+) {
+  const direct = matchEvent(target, candidates, sourceAliases);
+  if (direct.pinnacleMatchId) return direct;
+  const nearby = candidates.filter((c) => Math.abs(c.kickoffUtc - target.kickoffUtc) <= 35 * 60_000);
+  if (!nearby.length) return direct;
+  const originalTimes = new Map(nearby.map((c) => [c.id, c.kickoffUtc]));
+  const retry = matchEvent(
+    target,
+    nearby.map((c) => ({ ...c, kickoffUtc: target.kickoffUtc })),
+    sourceAliases,
+  );
+  if (!retry.pinnacleMatchId || retry.confidence < 0.9) return direct;
+  const original = originalTimes.get(retry.pinnacleMatchId) ?? target.kickoffUtc;
+  return {
+    ...retry,
+    method: "extended-time+league+verified-alias",
+    kickoffDeltaSec: Math.round((original - target.kickoffUtc) / 1000),
+  };
+}
 
 /**
  * Only return fixtures whose current OU checkpoint is still missing.
@@ -673,29 +705,6 @@ export class RadarEngine {
       (m) => m.fixtureSource === "hkjc" && m.kickoffUtc > now - 5 * 60_000,
     );
     let mapped = 0;
-    const matchWithVerifiedTimeFallback = (
-      target: CandidateEvent,
-      candidates: CandidateEvent[],
-      sourceAliases?: AliasIndex,
-    ) => {
-      const direct = matchEvent(target, candidates, sourceAliases);
-      if (direct.pinnacleMatchId) return direct;
-      const nearby = candidates.filter((c) => Math.abs(c.kickoffUtc - target.kickoffUtc) <= 35 * 60_000);
-      if (!nearby.length) return direct;
-      const originalTimes = new Map(nearby.map((c) => [c.id, c.kickoffUtc]));
-      const retry = matchEvent(
-        target,
-        nearby.map((c) => ({ ...c, kickoffUtc: target.kickoffUtc })),
-        sourceAliases,
-      );
-      if (!retry.pinnacleMatchId || retry.confidence < 0.9) return direct;
-      const original = originalTimes.get(retry.pinnacleMatchId) ?? target.kickoffUtc;
-      return {
-        ...retry,
-        method: "extended-time+league+verified-alias",
-        kickoffDeltaSec: Math.round((original - target.kickoffUtc) / 1000),
-      };
-    };
     const mapTx = rawDb.transaction(() => {
       for (const m of pending) {
         const target = { id: m.id, league: m.league, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoffUtc: m.kickoffUtc };
@@ -833,12 +842,15 @@ export class RadarEngine {
     );
     const ownerByTitan = new Map(
       (rawDb.prepare(
-        `SELECT id,titan_id,fixture_source FROM matches
+        `SELECT id,titan_id,fixture_source,league_en,home_team_en,away_team_en FROM matches
           WHERE titan_id IS NOT NULL`,
       ).all() as Array<{
         id: string;
         titan_id: string;
         fixture_source: "hkjc" | "pinnacle" | "crown";
+        league_en: string | null;
+        home_team_en: string | null;
+        away_team_en: string | null;
       }>).map((row) => [row.titan_id, row]),
     );
     const upsertFixture = rawDb.prepare(
@@ -905,12 +917,107 @@ export class RadarEngine {
           league: fixture.league,
           homeTeam: fixture.homeTeam,
           awayTeam: fixture.awayTeam,
+          leagueEn: owner?.league_en ?? null,
+          homeTeamEn: owner?.home_team_en ?? null,
+          awayTeamEn: owner?.away_team_en ?? null,
         });
       }
     });
     upsertTx();
 
     if (!targets.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
+
+    // Map the Titan-canonical research rows to cached PinnAPI fixtures once,
+    // then retain that provider id for later collector cycles. Existing
+    // mappings win, and a newly selected PinnAPI id cannot be claimed by a
+    // second fixture in the same database.
+    this.seedTeamAliases(now);
+    const aliases = this.aliasIndex();
+    const pinnapiCandidates: CandidateEvent[] = (this.fixtureCache?.pinnapi ?? []).map((fixture) => ({
+      id: fixture.providerMatchId,
+      league: fixture.league,
+      homeTeam: fixture.homeTeam,
+      awayTeam: fixture.awayTeam,
+      kickoffUtc: fixture.kickoffUtc,
+    }));
+    const mappedPinnapi = new Map<string, { eventId: string; reversed: boolean }>();
+    const claimedPinnapi = new Map(
+      (rawDb.prepare(
+        "SELECT match_id,pinnapi_id FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL ORDER BY updated_at DESC",
+      ).all() as Array<{ match_id: string; pinnapi_id: string }>).map((row) => [row.pinnapi_id, row.match_id]),
+    );
+    const saveResearchSource = rawDb.prepare(
+      `INSERT INTO pinnacle_source_map(
+         match_id,pinnapi_id,pinnapi_reversed,titan_id,titan_reversed,active_source,updated_at
+       ) VALUES(?,?,?,?,0,'titan007',?)
+       ON CONFLICT(match_id) DO UPDATE SET
+         pinnapi_id=excluded.pinnapi_id,
+         pinnapi_reversed=excluded.pinnapi_reversed,
+         titan_id=COALESCE(pinnacle_source_map.titan_id,excluded.titan_id),
+         active_source=COALESCE(pinnacle_source_map.active_source,excluded.active_source),
+         updated_at=excluded.updated_at`,
+    );
+    for (const target of targets) {
+      const previous = this.sourceMap(target.matchId);
+      if (
+        previous?.pinnapi_id
+        && (!claimedPinnapi.has(previous.pinnapi_id) || claimedPinnapi.get(previous.pinnapi_id) === target.matchId)
+      ) {
+        mappedPinnapi.set(target.matchId, {
+          eventId: previous.pinnapi_id,
+          reversed: !!previous.pinnapi_reversed,
+        });
+        continue;
+      }
+      const available = pinnapiCandidates.filter(
+        (candidate) => !claimedPinnapi.has(candidate.id) || claimedPinnapi.get(candidate.id) === target.matchId,
+      );
+      if (!available.length) continue;
+      const canonicalTarget: CandidateEvent = {
+        id: target.matchId,
+        league: target.league,
+        homeTeam: target.homeTeam,
+        awayTeam: target.awayTeam,
+        kickoffUtc: target.kickoffUtc,
+      };
+      const englishTarget: CandidateEvent = {
+        ...canonicalTarget,
+        league: target.leagueEn || target.league,
+        homeTeam: target.homeTeamEn || target.homeTeam,
+        awayTeam: target.awayTeamEn || target.awayTeam,
+      };
+      let decision = matchWithVerifiedTimeFallback(englishTarget, available, aliases);
+      if (!decision.pinnacleMatchId) {
+        // A prior translation lookup may provide the Chinese side of a
+        // PinnAPI fixture. Use it only for identity matching; never write the
+        // PinnAPI English labels or translated labels into the Titan row.
+        const translated = available.map((candidate) => {
+          const translation = getPinnacleTranslation(candidate.id);
+          return translation?.zh_home && translation.zh_away
+            ? {
+                ...candidate,
+                league: translation.zh_league || candidate.league,
+                homeTeam: translation.zh_home,
+                awayTeam: translation.zh_away,
+              }
+            : candidate;
+        });
+        decision = matchWithVerifiedTimeFallback(canonicalTarget, translated, aliases);
+      }
+      if (!decision.pinnacleMatchId) continue;
+      claimedPinnapi.set(decision.pinnacleMatchId, target.matchId);
+      mappedPinnapi.set(target.matchId, {
+        eventId: decision.pinnacleMatchId,
+        reversed: decision.reversed,
+      });
+      saveResearchSource.run(
+        target.matchId,
+        decision.pinnacleMatchId,
+        decision.reversed ? 1 : 0,
+        target.eventId,
+        now,
+      );
+    }
 
     // Do not spend provider calls on an OU checkpoint already frozen in the
     // timeline. A single query avoids one DB lookup per fixture.
@@ -935,16 +1042,29 @@ export class RadarEngine {
       while (Date.now() <= deadline) {
         const target = eligible[nextTarget++];
         if (!target) return;
+        let providerSucceeded = false;
         try {
-          const researchPrices = DEMO
-            ? {
-                opening: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
-                current: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
-                sourceUrls: { AH: "demo:pinnacle:AH", OU: "demo:pinnacle:OU" },
-              }
-            : await this.pinnacle.fetchPinnacleResearchPrices(target.eventId);
-          fetched++;
-          const capturedAt = Date.now();
+          let researchPrices: {
+            opening: ProviderPrice[];
+            current: ProviderPrice[];
+            sourceUrls: { AH: string; OU: string };
+          } = { opening: [], current: [], sourceUrls: { AH: "", OU: "" } };
+          try {
+            researchPrices = DEMO
+              ? {
+                  opening: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
+                  current: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
+                  sourceUrls: { AH: "demo:pinnacle:AH", OU: "demo:pinnacle:OU" },
+                }
+              : await this.pinnacle.fetchPinnacleResearchPrices(target.eventId);
+            providerSucceeded = true;
+          } catch (err) {
+            log("pinnacle_only_titan_detail_error", {
+              eventId: target.eventId,
+              error: (err as Error).message,
+            });
+          }
+          const capturedAt = now;
           if (researchPrices.opening.length) {
             const inserted = savePinnacleResearchInitialSnapshots(
               target.matchId,
@@ -955,16 +1075,48 @@ export class RadarEngine {
             );
             if (inserted) rows++;
           }
-          if (researchPrices.current.length) {
+          let current = researchPrices.current;
+          let currentSourceName = "titan007-pinnacle";
+          let currentSourceMatchId = target.eventId;
+          const pinnapiMapping = mappedPinnapi.get(target.matchId);
+          if (
+            !current.length
+            && target.stage !== "initial"
+            && pinnapiMapping
+          ) {
+            try {
+              current = await this.pinnapi.fetchMatchPrices(pinnapiMapping.eventId);
+              if (pinnapiMapping.reversed) current = this.reversePinnaclePrices(current);
+              currentSourceName = "pinnapi";
+              currentSourceMatchId = pinnapiMapping.eventId;
+              providerSucceeded = true;
+            } catch (err) {
+              log("pinnacle_only_pinnapi_detail_error", {
+                eventId: target.eventId,
+                pinnapiEventId: pinnapiMapping.eventId,
+                error: (err as Error).message,
+              });
+            }
+          }
+          // Current quotes are checkpoint observations only. In particular, a
+          // first-seen PinnAPI quote outside T30/T15/T5 must never become an
+          // opening or retroactively fill a missed milestone.
+          if (current.length && researchStageFor(target.kickoffUtc, capturedAt)) {
             const inserted = captureResearchTimelinePrices(
               target.matchId,
               "pinnacle",
-              researchPrices.current,
+              current,
               target.kickoffUtc,
               capturedAt,
+              {
+                sourceName: currentSourceName,
+                sourceMatchId: currentSourceMatchId,
+              },
             );
             if (inserted) rows++;
           }
+          if (providerSucceeded) fetched++;
+          else failed++;
         } catch (err) {
           failed++;
           log("pinnacle_only_detail_error", { eventId: target.eventId, error: (err as Error).message });
