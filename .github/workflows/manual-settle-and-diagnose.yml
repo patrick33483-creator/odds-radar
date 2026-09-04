@@ -32,11 +32,11 @@ jobs:
             curl --fail --silent --show-error \
               --max-time 300 \
               --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/simulations/settle
+              -X POST http://127.0.0.1:5001/api/simulations/settle | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in [chr(115)+chr(101)+chr(116)+chr(116)+chr(108)+chr(101)+chr(100), chr(112)+chr(101)+chr(110)+chr(100)+chr(105)+chr(110)+chr(103), chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(115)+chr(70)+chr(101)+chr(116)+chr(99)+chr(104)+chr(101)+chr(100)]}))"
             echo ""
           '
 
-      - name: 診斷仲有邊啲場 stuck
+      - name: 診斷 results 表覆蓋率
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -54,78 +54,90 @@ jobs:
           db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
           db.row_factory = sqlite3.Row
 
-          # 攞所有仲未 settle 但已經過 105 分鐘嘅場
-          rows = db.execute(
-              """
-              SELECT
-                sb.id AS bet_id,
-                sb.match_id,
-                sb.market,
-                sb.kickoff_utc,
-                sb.settled_at,
-                sb.excluded_from_stats,
-                m.home_name,
-                m.away_name,
-                m.pinnacle_match_id,
-                m.titan_id,
-                m.fixture_source,
-                psm.pinnapi_id,
-                pls.home_score AS live_home,
-                pls.away_score AS live_away,
-                pls.seen_live,
-                pls.no_longer_live,
-                pls.last_observed_at
-              FROM simulation_bets sb
-              LEFT JOIN matches m ON m.id = sb.match_id
-              LEFT JOIN pinnacle_source_map psm ON psm.match_id = m.id
-              LEFT JOIN pinnapi_live_scores pls ON pls.match_id = m.id
-              WHERE sb.excluded_from_stats = 0
-                AND sb.settled_at IS NULL
-                AND sb.kickoff_utc <= ?
-              ORDER BY sb.kickoff_utc ASC
-              LIMIT 50
-              """,
-              (eligible_cutoff,),
-          ).fetchall()
-
           out = {
-              "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "now_ms": now_ms,
-              "settle_eligible_cutoff_ms": eligible_cutoff,
-              "stuck_count": len(rows),
-              "stuck_bets": [],
+              "observed_at_hkt": datetime.datetime.now(
+                  datetime.timezone(datetime.timedelta(hours=8))
+              ).strftime("%Y-%m-%d %H:%M:%S"),
           }
 
-          for r in rows:
+          # 1. 已開賽 matches 覆蓋率
+          past = db.execute(
+              "SELECT COUNT(*) c FROM matches WHERE kickoff_utc <= ?",
+              (eligible_cutoff,),
+          ).fetchone()["c"]
+
+          past_with_results = db.execute(
+              """SELECT COUNT(*) c FROM matches m
+                 WHERE m.kickoff_utc <= ?
+                   AND EXISTS(SELECT 1 FROM results r WHERE r.match_id = m.id)""",
+              (eligible_cutoff,),
+          ).fetchone()["c"]
+
+          out["past_matches_total"] = past
+          out["past_matches_with_results"] = past_with_results
+          out["past_matches_missing_results"] = past - past_with_results
+          out["coverage_pct"] = round(past_with_results * 100 / max(past, 1), 1)
+
+          # 2. results 最新 fetch 時間
+          latest = db.execute("SELECT MAX(fetched_at) f FROM results").fetchone()["f"]
+          if latest:
+              out["results_latest_fetched_hkt"] = datetime.datetime.fromtimestamp(
+                  latest / 1000, tz=datetime.timezone(datetime.timedelta(hours=8))
+              ).strftime("%Y-%m-%d %H:%M")
+              out["results_lag_hours"] = round((now_ms - latest) / 3600000, 2)
+          out["results_total_rows"] = db.execute(
+              "SELECT COUNT(*) c FROM results"
+          ).fetchone()["c"]
+
+          # 3. results source 分布
+          src = db.execute(
+              "SELECT source, COUNT(*) c FROM results GROUP BY source"
+          ).fetchall()
+          out["results_by_source"] = {r["source"]: r["c"] for r in src}
+
+          # 4. simulation_bets 卡場數
+          stuck = db.execute(
+              """SELECT COUNT(*) c FROM simulation_bets
+                 WHERE excluded_from_stats = 0 AND settled_at IS NULL
+                   AND kickoff_utc <= ?""",
+              (eligible_cutoff,),
+          ).fetchone()["c"]
+          out["stuck_simulation_bets"] = stuck
+
+          # 5. 過去 24 小時開賽場數 + 有無結果
+          day_ago = now_ms - 24 * 3600 * 1000
+          out["past_24h_matches"] = db.execute(
+              "SELECT COUNT(*) c FROM matches WHERE kickoff_utc BETWEEN ? AND ?",
+              (day_ago, eligible_cutoff),
+          ).fetchone()["c"]
+          out["past_24h_with_results"] = db.execute(
+              """SELECT COUNT(*) c FROM matches m
+                 WHERE m.kickoff_utc BETWEEN ? AND ?
+                   AND EXISTS(SELECT 1 FROM results r WHERE r.match_id = m.id)""",
+              (day_ago, eligible_cutoff),
+          ).fetchone()["c"]
+
+          # 6. 抽 10 場最近開但冇 result 嘅
+          missing = db.execute(
+              """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc,
+                        m.fixture_source, m.titan_id, m.pinnacle_match_id
+                 FROM matches m
+                 WHERE m.kickoff_utc <= ?
+                   AND NOT EXISTS(SELECT 1 FROM results r WHERE r.match_id = m.id)
+                 ORDER BY m.kickoff_utc DESC
+                 LIMIT 10""",
+              (eligible_cutoff,),
+          ).fetchall()
+          out["sample_missing_results"] = []
+          for r in missing:
               d = dict(r)
-              age_hours = (now_ms - d["kickoff_utc"]) / 1000 / 3600
-              d["age_hours_since_kickoff"] = round(age_hours, 2)
               d["kickoff_hkt"] = datetime.datetime.fromtimestamp(
                   d["kickoff_utc"] / 1000, tz=datetime.timezone(datetime.timedelta(hours=8))
               ).strftime("%Y-%m-%d %H:%M")
+              d["age_hours"] = round((now_ms - d["kickoff_utc"]) / 3600000, 2)
+              del d["kickoff_utc"]
+              out["sample_missing_results"].append(d)
 
-              # 判斷卡喺邊
-              reasons = []
-              if d["pinnapi_id"] is None and d["pinnacle_match_id"] is None:
-                  reasons.append("no_pinnacle_id_mapped")
-              if d["live_home"] is None:
-                  reasons.append("no_pinnapi_live_cache")
-              elif d["no_longer_live"] == 0 and d["seen_live"] == 0:
-                  reasons.append("live_cache_never_seen_live")
-              if d["titan_id"] is None:
-                  reasons.append("no_titan_id_for_fallback")
-
-              d["stuck_reasons"] = reasons
-              out["stuck_bets"].append(d)
-
-          # 統計
-          from collections import Counter
-          reason_counts = Counter()
-          for b in out["stuck_bets"]:
-              for r in b["stuck_reasons"]:
-                  reason_counts[r] += 1
-          out["stuck_reason_summary"] = dict(reason_counts)
-
-          print(json.dumps(out, sort_keys=False, indent=2, ensure_ascii=False))
+          print(json.dumps(out, indent=2, ensure_ascii=False))
           db.close()
           PY
