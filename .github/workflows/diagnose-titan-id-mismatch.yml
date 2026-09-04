@@ -1,0 +1,95 @@
+name: Diagnose titan_id 對唔上 titan007 sId
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 對比 candidate titan_id 同 titan007 網頁 sId
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo python3 -" <<'PY'
+          import datetime, sqlite3, time, urllib.request, re
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+
+          now_ms = int(time.time() * 1000)
+          cutoff = now_ms - 105 * 60 * 1000
+          lo = now_ms - 7 * 24 * 3600 * 1000
+
+          cands = db.execute(
+              """SELECT m.id, m.titan_id, m.kickoff_utc, m.home_team, m.away_team, m.fixture_source
+                   FROM matches m
+                   LEFT JOIN research_results rr ON rr.match_id=m.id
+                  WHERE rr.match_id IS NULL AND m.kickoff_utc<=? AND m.kickoff_utc>=?
+                    AND m.fixture_source!='hkjc' AND m.titan_id IS NOT NULL
+                  ORDER BY m.kickoff_utc DESC
+                  LIMIT 10""",
+              (cutoff, lo),
+          ).fetchall()
+          print("=== 10 個 candidate 樣 ===")
+          for r in cands:
+              day = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt).strftime("%m-%d %H:%M")
+              print(f"  id={r['id']}  titan_id={r['titan_id']!r}  {r['fixture_source']}  {day}HKT  {r['home_team']} vs {r['away_team']}")
+
+          # 攞 titan007 Over_20260903 前 10 個 sId
+          html = urllib.request.urlopen(urllib.request.Request(
+              "http://bf.titan007.com/football/Over_20260903.htm",
+              headers={"User-Agent":"Mozilla/5.0","Referer":"http://bf.titan007.com/"}), timeout=25).read().decode("gb18030","ignore")
+          sids = re.findall(r"sId=['\"]?(\d+)", html)[:10]
+          print(f"\n=== titan007 Over_20260903 前 10 sId ===")
+          print(sids)
+
+          # 檢查 candidate titan_id 有無出現喺任何 titan007 頁
+          print("\n=== candidate titan_id 喺 titan007 頁邊 ===")
+          for day in ("20260903", "20260904", "20260902", "20260901"):
+              try:
+                  h = urllib.request.urlopen(urllib.request.Request(
+                      f"http://bf.titan007.com/football/Over_{day}.htm",
+                      headers={"User-Agent":"Mozilla/5.0","Referer":"http://bf.titan007.com/"}), timeout=25).read().decode("gb18030","ignore")
+                  pageids = set(re.findall(r"sId=['\"]?(\d+)", h))
+                  matched = [r["titan_id"] for r in cands if r["titan_id"] in pageids]
+                  print(f"  Over_{day}: total={len(pageids)}  matched_from_cands={len(matched)}  {matched[:3]}")
+              except Exception as e:
+                  print(f"  Over_{day}: ERR {e}")
+
+          # 統計 titan_id 格式
+          rows = db.execute(
+              """SELECT titan_id FROM matches
+                  WHERE titan_id IS NOT NULL AND kickoff_utc>=? AND kickoff_utc<=?""",
+              (lo, cutoff)
+          ).fetchall()
+          lengths = {}
+          for r in rows:
+              tid = str(r["titan_id"])
+              lengths.setdefault(len(tid), 0)
+              lengths[len(tid)] += 1
+          print(f"\n=== titan_id 長度分佈 (past 7d, {len(rows)} rows) ===")
+          print(dict(sorted(lengths.items())))
+
+          # 睇 fixture_source 分佈
+          sources = db.execute(
+              """SELECT fixture_source, COUNT(*) c FROM matches
+                  WHERE kickoff_utc>=? AND kickoff_utc<=?
+                  GROUP BY fixture_source""",
+              (lo, cutoff)
+          ).fetchall()
+          print(f"\n=== fixture_source 分佈 ===")
+          for s in sources: print(f"  {s['fixture_source']}: {s['c']}")
+          db.close()
+          PY
