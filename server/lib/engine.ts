@@ -1010,7 +1010,7 @@ export class RadarEngine {
    * signal path (rule provider='pinnacle', >1.70 gate) can evaluate them.
    */
   async refreshPinnacleOnlyResearch(now = Date.now()): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
-    const deadline = Date.now() + PINNACLE_RESEARCH_LOOP_MS;
+    const refreshStartedAt = Date.now();
     // Requires the caller to have already populated fixtureCache via
     // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
     // mock refreshPinnacleFixtures can still assert exact call counts, and so
@@ -1296,6 +1296,12 @@ export class RadarEngine {
         .map((row) => `${row.match_id}:${row.stage}`),
     );
     const eligible = prioritizePendingPinnacleResearchTargets(targets, capturedOuStages, now);
+    // Fixture reconciliation can be expensive on a busy slate. The provider
+    // budget must start only after that preparation has finished; otherwise
+    // pre-processing can consume the whole window and no Titan detail request
+    // is attempted for an entire T30 batch.
+    const collectorStartedAt = Date.now();
+    const deadline = collectorStartedAt + PINNACLE_RESEARCH_LOOP_MS;
     let fetched = 0;
     let failed = 0;
     let rows = 0;
@@ -1414,6 +1420,8 @@ export class RadarEngine {
       fetched,
       failed,
       rows,
+      preparationMs: collectorStartedAt - refreshStartedAt,
+      collectionMs: Date.now() - collectorStartedAt,
     });
     return { fixtures: targets.length, fetched, failed, rows };
   }
