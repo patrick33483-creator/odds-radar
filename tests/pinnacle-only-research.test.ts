@@ -15,11 +15,13 @@ let unsentOuSignals: typeof import("../server/lib/ou-signals").unsentOuSignals;
 let unsentOuPrealerts: typeof import("../server/lib/ou-signals").unsentOuPrealerts;
 let markOuSignalNotified: typeof import("../server/lib/ou-signals").markOuSignalNotified;
 let OU_SIGNAL_RULES: typeof import("../server/lib/ou-signals").OU_SIGNAL_RULES;
+let buildOuSignalMessage: typeof import("../server/lib/telegram").buildOuSignalMessage;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
   const research = await import("../server/lib/research");
   const signals = await import("../server/lib/ou-signals");
+  const telegram = await import("../server/lib/telegram");
   rawDb = store.rawDb;
   captureResearchTimelinePrices = research.captureResearchTimelinePrices;
   researchDataset = research.researchDataset;
@@ -31,6 +33,7 @@ beforeAll(async () => {
   unsentOuPrealerts = signals.unsentOuPrealerts;
   markOuSignalNotified = signals.markOuSignalNotified;
   OU_SIGNAL_RULES = signals.OU_SIGNAL_RULES;
+  buildOuSignalMessage = telegram.buildOuSignalMessage;
   store.migrate();
 });
 
@@ -355,6 +358,40 @@ describe("Pinnacle-only in OU signal engine", () => {
     for (const row of first) markOuSignalNotified(row.uniqueKey, NOW);
     const second = unsentOuSignals(["pinnacle:evt-once"], NOW);
     expect(second).toHaveLength(0);
+  });
+
+  it("renders Titan direct Chinese names in Pinnacle-only Telegram messages", () => {
+    const matchId = "pinnacle:3085481";
+    const kickoff = NOW + 30 * 60_000;
+    rawDb.prepare(
+      `INSERT INTO matches(
+        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,
+        league,league_en,home_team,away_team,home_team_en,away_team_en,
+        kickoff_utc,status,inplay,updated_at
+      ) VALUES(?,NULL,'pinnacle','3085481','titan:3085481',
+        '以色列甲組聯賽',NULL,'卡法沙巴1928','耶路撒冷體育會',NULL,NULL,
+        ?,'PREEVENT',0,?)`,
+    ).run(matchId, kickoff, Date.now());
+    rawDb.prepare(
+      `INSERT INTO pinnacle_translations(
+        pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempted_at,attempt_count,last_error
+      ) VALUES('3085481','錯誤主隊翻譯','錯誤客隊翻譯','錯誤聯賽翻譯','titan',?,?,1,NULL)`,
+    ).run(Date.now(), Date.now());
+    addStage(matchId, "pinnacle", "initial", "2.5", 1.90, 1.80, NOW - 25 * 60_000);
+    addStage(matchId, "pinnacle", "T30", "2.5", 1.78, 1.96, NOW - 20 * 60_000);
+    addStage(matchId, "pinnacle", "T5", "2.5", 1.84, 2.00, NOW - 60_000);
+
+    syncOuSignalObservations([matchId]);
+    const signal = unsentOuSignals([matchId], NOW)[0];
+    expect(signal).toBeDefined();
+    expect(signal).toMatchObject({
+      league: "以色列甲組聯賽",
+      homeTeam: "卡法沙巴1928",
+      awayTeam: "耶路撒冷體育會",
+    });
+    const message = buildOuSignalMessage([signal!]);
+    expect(message).toContain("以色列甲組聯賽｜卡法沙巴1928 vs 耶路撒冷體育會");
+    expect(message).not.toContain("錯誤");
   });
 
   it("skips a Pinnacle-only triple where any selected checkpoint price is ≤ 1.70", () => {
