@@ -77,11 +77,15 @@ function SignalRow({ row, activatedAt }: { row: OuSignalObservation; activatedAt
         </div>
         <div>
           <p className="text-[10px] text-muted-foreground">判定邊初盤 → T-5</p>
-          <p className="tnum font-semibold">{row.originalSelection === "O" ? "大" : "小"} {row.referenceInitialOdds.toFixed(3)} → {row.referenceT5Odds.toFixed(3)}</p>
+          <p className="tnum font-semibold">{row.originalSelection === "O" ? "大" : "小"} {row.initialLineKey} @ {row.referenceInitialOdds.toFixed(3)} → {row.t5LineKey} @ {row.referenceT5Odds.toFixed(3)}</p>
         </div>
         <div>
           <p className="text-[10px] text-muted-foreground">變化</p>
-          <p className="tnum font-semibold">{row.driftBucket} ({row.oddsGap >= 0 ? "+" : ""}{row.oddsGap.toFixed(3)})</p>
+          <p className="tnum font-semibold">
+            {row.driftComparable && row.oddsGap !== null
+              ? `${row.driftBucket} (${row.oddsGap >= 0 ? "+" : ""}${row.oddsGap.toFixed(3)})`
+              : "跨盤，不比較原始水位"}
+          </p>
         </div>
         <div>
           <p className="text-[10px] text-muted-foreground">賽果</p>
@@ -90,6 +94,7 @@ function SignalRow({ row, activatedAt }: { row: OuSignalObservation; activatedAt
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+        <span>主盤線路 {row.linePath}</span>
         <span className="flex items-center gap-1"><Clock3 className="h-3 w-3" />符合於 {fmtTime(row.detectedAt)}</span>
         <span className="flex items-center gap-1">
           <BellRing className="h-3 w-3" />
@@ -200,7 +205,7 @@ export default function OuSignals() {
           <div className="mb-2 flex items-center gap-2">
             <Radio className="h-4 w-4 text-pinnacle" />
             <h2 id="rules-heading" className="text-sm font-semibold">監察條件</h2>
-            <span className="text-[10px] text-muted-foreground">所有方向都用初盤、T-30、T-5 同一條線；三段低水方賠率均須 &gt; 1.70</span>
+            <span className="text-[10px] text-muted-foreground">每段獨立採用完整主盤；主盤跨線時不比較原始水位；三段低水方賠率均須 &gt; 1.70</span>
           </div>
           <div className="flex snap-x gap-2 overflow-x-auto pb-2 md:grid md:grid-cols-2 md:overflow-visible md:pb-0">
             {(data?.summaries ?? []).map((summary, index) => {

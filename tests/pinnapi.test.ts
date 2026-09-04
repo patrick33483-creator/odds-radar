@@ -165,6 +165,46 @@ describe("PinnAPI Edge full-match prices", () => {
       ]),
     );
   });
+
+  it("preserves an explicit totals main flag regardless of row order", () => {
+    const parsed = parsePinnapiLines({
+      totals: [
+        { points: 3.25, over: 1.91, under: 1.99 },
+        { points: 3.5, over: 2.02, under: 1.86, is_main: true },
+      ],
+    });
+    const totals = parsed.prices.filter((price) => price.market === "OU");
+    expect(totals.filter((price) => price.isMain).map((price) => price.lineValue)).toEqual([3.5, 3.5]);
+    expect(totals.filter((price) => price.lineValue === 3.25).every((price) => !price.isMain)).toBe(true);
+  });
+
+  it("does not guess the first totals row as main when multiple lines have no metadata", () => {
+    const parsed = parsePinnapiLines({
+      totals: [
+        { points: 3.25, over: 1.91, under: 1.99 },
+        { points: 3.5, over: 2.02, under: 1.86 },
+      ],
+    });
+    expect(parsed.prices.filter((price) => price.market === "OU")).toHaveLength(4);
+    expect(parsed.prices.filter((price) => price.market === "OU").every((price) => !price.isMain)).toBe(true);
+  });
+
+  it("infers main only for a sole complete unflagged totals line", () => {
+    const parsed = parsePinnapiLines({
+      totals: [{ points: 3.25, over: 1.91, under: 1.99 }],
+    });
+    expect(parsed.prices.filter((price) => price.market === "OU")).toEqual([
+      expect.objectContaining({ lineValue: 3.25, selection: "O", isMain: true }),
+      expect.objectContaining({ lineValue: 3.25, selection: "U", isMain: true }),
+    ]);
+  });
+
+  it("does not override an explicit false main flag on a sole totals line", () => {
+    const parsed = parsePinnapiLines({
+      totals: [{ points: 3.25, over: 1.91, under: 1.99, main: false }],
+    });
+    expect(parsed.prices.filter((price) => price.market === "OU").every((price) => !price.isMain)).toBe(true);
+  });
 });
 
 describe("PinnAPI Edge full-match corner child prices", () => {

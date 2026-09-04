@@ -61,15 +61,16 @@ function addStage(
   over: number,
   under: number,
   capturedAt: number,
+  isMain = true,
 ): void {
   const insert = rawDb.prepare(
     `INSERT INTO research_timeline_snapshots(
       match_id,provider,market,stage,line_key,selection,decimal_odds,is_main,
       captured_at,status,origin,source_name
-    ) VALUES(?,?,?,?,?,?,?,1,?,'captured','test','test')`,
+    ) VALUES(?,?,?,?,?,?,?,?,?,'captured','test','test')`,
   );
   for (const [selection, odds] of [["O", over], ["U", under]] as Array<[Side, number]>) {
-    insert.run(matchId, provider, "OU", stage, lineKey, selection, odds, capturedAt);
+    insert.run(matchId, provider, "OU", stage, lineKey, selection, odds, isMain ? 1 : 0, capturedAt);
   }
 }
 
@@ -371,5 +372,105 @@ describe("OU signal monitor", () => {
     expect(dataset.observations.map((row) => row.ruleId)).toContain(
       "hkjc-ooo-flat-wide-reverse",
     );
+  });
+
+  it("keeps same-line observations on v1 with an explicit three-stage line path", () => {
+    const row = ouSignalDataset().observations.find((observation) =>
+      observation.matchId === "uoo"
+      && observation.ruleId === "pinnacle-uoo-short-005-010"
+    );
+    expect(row).toMatchObject({
+      lineKey: "2.5",
+      initialLineKey: "2.5",
+      t30LineKey: "2.5",
+      t5LineKey: "2.5",
+      linePath: "2.5→2.5→2.5",
+      evaluatorVersion: "same-line-v1",
+      driftComparable: true,
+    });
+    expect(row?.oddsGap).toBeCloseTo(0.06);
+  });
+
+  it("evaluates each explicit stage main independently and settles on the T-5 line", () => {
+    const now = afterWatchActivation + 120_000;
+    const matchId = "moved-main-ouu";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "pinnacle", "initial", "2.5", 1.80, 1.95, now - 25 * 60_000);
+    addStage(matchId, "pinnacle", "initial", "2.75", 1.91, 1.91, now - 25 * 60_000, false);
+    addStage(matchId, "pinnacle", "T30", "3.5", 1.96, 1.82, now - 20 * 60_000);
+    addStage(matchId, "pinnacle", "T30", "3.25", 1.91, 1.91, now - 20 * 60_000, false);
+    addStage(matchId, "pinnacle", "T5", "3.5", 1.98, 1.85, now - 60_000);
+    addStage(matchId, "pinnacle", "T5", "3.25", 1.91, 1.91, now - 60_000, false);
+
+    expect(syncOuSignalPrealerts([matchId])).toBe(1);
+    expect(syncOuSignalObservations([matchId])).toBe(1);
+    const stored = rawDb.prepare(
+      `SELECT rule_id,line_key,initial_line_key,t30_line_key,t5_line_key,line_path,
+              evaluator_version,drift_comparable,odds_gap
+         FROM ou_signal_observations WHERE match_id=?`,
+    ).get(matchId);
+    expect(stored).toEqual({
+      rule_id: "pinnacle-ouu-t5-selected-180-190-over-watch",
+      line_key: "3.5",
+      initial_line_key: "2.5",
+      t30_line_key: "3.5",
+      t5_line_key: "3.5",
+      line_path: "2.5→3.5→3.5",
+      evaluator_version: "stage-main-v2",
+      drift_comparable: 0,
+      odds_gap: 0,
+    });
+    const prealert = rawDb.prepare(
+      `SELECT rule_id,line_key,initial_line_key,t30_line_key,line_path,evaluator_version
+         FROM ou_signal_prealerts WHERE match_id=?`,
+    ).get(matchId);
+    expect(prealert).toEqual({
+      rule_id: "pinnacle-ouu-t5-selected-180-190-over-watch",
+      line_key: "3.5",
+      initial_line_key: "2.5",
+      t30_line_key: "3.5",
+      line_path: "2.5→3.5",
+      evaluator_version: "stage-main-v2",
+    });
+
+    rawDb.prepare(
+      "INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,source,fetched_at) VALUES(?,?,?,?,?,?)",
+    ).run(matchId, matchId, 2, 1, "test", now);
+    const observation = ouSignalDataset(now).observations.find((row) => row.matchId === matchId);
+    expect(observation).toMatchObject({
+      lineKey: "3.5",
+      t5LineKey: "3.5",
+      linePath: "2.5→3.5→3.5",
+      evaluatorVersion: "stage-main-v2",
+      driftComparable: false,
+      oddsGap: null,
+      result: { totalGoals: 3, outcome: "miss" },
+    });
+  });
+
+  it("fails closed when a stage has multiple complete lines without a main", () => {
+    const now = afterWatchActivation + 180_000;
+    const matchId = "ambiguous-stage-main";
+    addMatch(matchId, now + 30 * 60_000);
+    for (const stage of ["initial", "T30", "T5"] as Stage[]) {
+      addStage(matchId, "pinnacle", stage, "2.5", 1.80, 1.95, now - 60_000, false);
+      addStage(matchId, "pinnacle", stage, "2.75", 1.80, 1.95, now - 60_000, false);
+    }
+    expect(syncOuSignalPrealerts([matchId])).toBe(0);
+    expect(syncOuSignalObservations([matchId])).toBe(0);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_observations WHERE match_id=?",
+    ).get(matchId)).toEqual({ count: 0 });
+  });
+
+  it("does not fabricate a drift rule from prices on different lines", () => {
+    const now = afterWatchActivation + 240_000;
+    const matchId = "moved-no-fabricated-drift";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "pinnacle", "initial", "2.5", 1.90, 1.80, now - 25 * 60_000);
+    addStage(matchId, "pinnacle", "T30", "3.0", 1.78, 1.96, now - 20 * 60_000);
+    addStage(matchId, "pinnacle", "T5", "3.0", 1.84, 2.00, now - 60_000);
+    expect(syncOuSignalPrealerts([matchId])).toBe(0);
+    expect(syncOuSignalObservations([matchId])).toBe(0);
   });
 });

@@ -209,12 +209,12 @@ function boundary(value: number, inclusive: boolean, lower: boolean): string {
 
 function t5OddsRangeLine(rule: OuSignalRule, initialSelectedOdds: number): string {
   const range = ouRuleT5OddsRange(rule, initialSelectedOdds);
-  if (!range) return "T-5 原方向低水賠率：按目前初盤沒有可達成範圍";
+  if (!range) return "條件 T-5 原方向賠率範圍：按目前初盤沒有可達成範圍";
   const lower = boundary(range.min, range.minInclusive, true);
   const upper = range.max === null
     ? ""
     : ` 且 ${boundary(range.max, range.maxInclusive, false)}`;
-  return `T-5 原方向低水賠率：${lower}${upper}`;
+  return `條件 T-5 原方向賠率範圍：${lower}${upper}`;
 }
 
 function lineCondition(rule: OuSignalRule): string {
@@ -239,11 +239,19 @@ function signalLines(signal: OuSignalObservation): string[] {
   const buy = signal.signalSelection === "O" ? "大球" : "小球";
   const mode = signal.mode === "reverse" ? "反向買入訊號" : "歷史正向訊號";
   const rule = ouRuleById(signal.ruleId);
+  const initialLineKey = signal.initialLineKey ?? signal.lineKey;
+  const t5LineKey = signal.t5LineKey ?? signal.lineKey;
+  const linePath = signal.linePath ?? `${initialLineKey}→${signal.t30LineKey ?? signal.lineKey}→${t5LineKey}`;
+  const movement = signal.driftComparable !== false && signal.oddsGap !== null
+    ? `同線水位差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}`
+    : "跨盤：不作原始賠率差比較";
   return [
     `${mode}｜${signal.providerLabel}｜${buy} ${signal.lineKey} @ ${signal.signalT5Odds.toFixed(3)}`,
-    rule ? ruleConditionLine(rule) : `達成條件：${signal.ruleId}`,
+    rule ? ruleConditionLine(rule, "命中條件") : `命中條件：${signal.ruleId}`,
+    `主盤線路：${linePath}`,
+    `T-5 最終：${buy} ${t5LineKey} @ ${signal.signalT5Odds.toFixed(3)}`,
     `盤路：${signal.directionPath}｜${signal.driftBucket}`,
-    `原方向 ${signal.originalSelection === "O" ? "大" : "小"}：初盤 ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${signal.referenceT5Odds.toFixed(3)}（差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}）`,
+    `原方向 ${signal.originalSelection === "O" ? "大" : "小"}：初盤 ${initialLineKey} @ ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${t5LineKey} @ ${signal.referenceT5Odds.toFixed(3)}（${movement}）`,
     ...(rule ? [t5OddsRangeLine(rule, signal.referenceInitialOdds)] : []),
     rule ? historicalLine(rule) : "歷史：暫無可核實統計",
     safeHitRateLine(signal.ruleId, signal.lineKey, "observation"),
@@ -304,14 +312,18 @@ export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
   const possibleBuy = signal.signalSelection === "O" ? "大球" : "小球";
   const mode = signal.mode === "reverse" ? "反向候選" : "正向候選";
   const rule = ouRuleById(signal.ruleId);
+  const initialLineKey = signal.initialLineKey ?? signal.lineKey;
+  const t30LineKey = signal.t30LineKey ?? signal.lineKey;
+  const linePath = signal.linePath ?? `${initialLineKey}→${t30LineKey}`;
   return [
     "盤路雷達：T-30 OU 候選預警",
     `${mode}｜${signal.providerLabel}`,
     `${signal.league}｜${signal.homeTeam} vs ${signal.awayTeam}`,
     `開賽：${hkt(signal.kickoffUtc)} HKT`,
-    `目前兩段方向：${signal.directionPath}｜同線 ${signal.lineKey}`,
+    `目前兩段方向：${signal.directionPath}`,
+    `主盤線路：${linePath}`,
     `低水方賠率：初盤 ${signal.initialSelectedOdds.toFixed(3)} → T-30 ${signal.t30SelectedOdds.toFixed(3)}`,
-    `如果 T-5 完成條件，可能留意：${possibleBuy} ${signal.lineKey}｜目前 T-30 賠率 ${signal.signalT30Odds.toFixed(3)}`,
+    `如果 T-5 完成條件，可能留意：${possibleBuy}｜目前 T-30 ${t30LineKey} @ ${signal.signalT30Odds.toFixed(3)}`,
     ...(rule ? [
       ruleConditionLine(rule, "候選條件"),
       t5OddsRangeLine(rule, signal.initialSelectedOdds),

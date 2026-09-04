@@ -139,18 +139,22 @@ export async function fetchApiPrices(providerMatchId: string): Promise<ProviderP
         prices.push({ market: "1X2", lineValue: null, isMain: true, selection: "A", decimalOdds: ft.moneyline.away, sourceUpdatedAt: now });
       }
       const spreads = (ft.spreads ?? []).filter((s) => s.home > 1 && s.away > 1);
-      spreads.forEach((s, i) => {
+      spreads.forEach((s) => {
         const lineValue = snapToQuarter(s.hdp);
         if (Math.abs(lineValue - s.hdp) > 1e-9) return;
-        prices.push({ market: "AH", lineValue, isMain: i === 0, selection: "H", decimalOdds: s.home, sourceUpdatedAt: now });
-        prices.push({ market: "AH", lineValue, isMain: i === 0, selection: "A", decimalOdds: s.away, sourceUpdatedAt: now });
+        // Pinnacle's official contract identifies alternates with altLineId;
+        // array order is not a main-line guarantee.
+        const isMain = s.altLineId === undefined;
+        prices.push({ market: "AH", lineValue, isMain, selection: "H", decimalOdds: s.home, sourceUpdatedAt: now });
+        prices.push({ market: "AH", lineValue, isMain, selection: "A", decimalOdds: s.away, sourceUpdatedAt: now });
       });
       const totals = (ft.totals ?? []).filter((t) => t.over > 1 && t.under > 1);
-      totals.forEach((t, i) => {
+      totals.forEach((t) => {
         const lineValue = snapToQuarter(t.points);
         if (Math.abs(lineValue - t.points) > 1e-9) return;
-        prices.push({ market: "OU", lineValue, isMain: i === 0, selection: "O", decimalOdds: t.over, sourceUpdatedAt: now });
-        prices.push({ market: "OU", lineValue, isMain: i === 0, selection: "U", decimalOdds: t.under, sourceUpdatedAt: now });
+        const isMain = t.altLineId === undefined;
+        prices.push({ market: "OU", lineValue, isMain, selection: "O", decimalOdds: t.over, sourceUpdatedAt: now });
+        prices.push({ market: "OU", lineValue, isMain, selection: "U", decimalOdds: t.under, sourceUpdatedAt: now });
       });
     }
   }

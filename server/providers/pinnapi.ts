@@ -369,6 +369,36 @@ function values(value: unknown): JsonRecord[] {
   return record ? Object.values(record).map(asRecord).filter((v): v is JsonRecord => !!v) : [];
 }
 
+type ExplicitMain = boolean | null;
+
+function explicitMain(row: JsonRecord): ExplicitMain {
+  if (typeof row.is_main === "boolean") return row.is_main;
+  if (typeof row.main === "boolean") return row.main;
+  return null;
+}
+
+interface TwoSidedLine {
+  lineValue: number;
+  first: number | null;
+  second: number | null;
+  explicitMain: ExplicitMain;
+}
+
+/**
+ * PinnAPI line arrays/maps do not document ordering as main-market metadata.
+ * Preserve a provider boolean when present. With no boolean anywhere, the
+ * only defensible inference is a sole complete line; multiple complete lines
+ * remain unmarked so downstream stage-main selection fails closed.
+ */
+function resolvedMainLines(lines: TwoSidedLine[]): Set<number> {
+  const explicitlyMain = new Set(
+    lines.filter((line) => line.explicitMain === true).map((line) => line.lineValue),
+  );
+  if (lines.some((line) => line.explicitMain !== null)) return explicitlyMain;
+  const complete = lines.filter((line) => line.first !== null && line.second !== null);
+  return complete.length === 1 ? new Set([complete[0].lineValue]) : new Set();
+}
+
 function cornerEvent(row: JsonRecord): boolean {
   // PinnAPI returns corners as child fixtures. Never infer corners from an
   // ordinary parent price tree or from a period/market name alone.
@@ -517,25 +547,39 @@ export function parsePinnapiLines(payload: unknown, requestedEventId = ""): Pinn
     if (away !== null) prices.push({ market: "1X2", lineValue: null, isMain: true, selection: "A", decimalOdds: away, sourceUpdatedAt: now });
   }
 
-  for (const [index, spread] of values(period.spreads ?? period.handicaps).entries()) {
+  const spreads = values(period.spreads ?? period.handicaps).flatMap((spread): TwoSidedLine[] => {
     const lineValue = num(spread.hdp ?? spread.handicap ?? spread.line);
-    const home = validDecimal(spread.home ?? spread.home_odds);
-    const away = validDecimal(spread.away ?? spread.away_odds);
-    if (lineValue === null || !isQuarterStep(lineValue)) continue;
+    if (lineValue === null || !isQuarterStep(lineValue)) return [];
+    return [{
+      lineValue,
+      first: validDecimal(spread.home ?? spread.home_odds),
+      second: validDecimal(spread.away ?? spread.away_odds),
+      explicitMain: explicitMain(spread),
+    }];
+  });
+  const mainSpreads = resolvedMainLines(spreads);
+  for (const spread of spreads) {
     // PinnAPI's hdp is already home-perspective: negative = home gives.
-    const isMain = spread.is_main !== false && spread.main !== false && (spread.is_main === true || spread.main === true || index === 0);
-    if (home !== null) prices.push({ market: "AH", lineValue, isMain, selection: "H", decimalOdds: home, sourceUpdatedAt: now });
-    if (away !== null) prices.push({ market: "AH", lineValue, isMain, selection: "A", decimalOdds: away, sourceUpdatedAt: now });
+    const isMain = mainSpreads.has(spread.lineValue);
+    if (spread.first !== null) prices.push({ market: "AH", lineValue: spread.lineValue, isMain, selection: "H", decimalOdds: spread.first, sourceUpdatedAt: now });
+    if (spread.second !== null) prices.push({ market: "AH", lineValue: spread.lineValue, isMain, selection: "A", decimalOdds: spread.second, sourceUpdatedAt: now });
   }
 
-  for (const [index, total] of values(period.totals ?? period.total).entries()) {
+  const totals = values(period.totals ?? period.total).flatMap((total): TwoSidedLine[] => {
     const lineValue = num(total.points ?? total.total ?? total.line);
-    const over = validDecimal(total.over ?? total.over_odds);
-    const under = validDecimal(total.under ?? total.under_odds);
-    if (lineValue === null || lineValue < 0 || !isQuarterStep(lineValue)) continue;
-    const isMain = total.is_main !== false && total.main !== false && (total.is_main === true || total.main === true || index === 0);
-    if (over !== null) prices.push({ market: "OU", lineValue, isMain, selection: "O", decimalOdds: over, sourceUpdatedAt: now });
-    if (under !== null) prices.push({ market: "OU", lineValue, isMain, selection: "U", decimalOdds: under, sourceUpdatedAt: now });
+    if (lineValue === null || lineValue < 0 || !isQuarterStep(lineValue)) return [];
+    return [{
+      lineValue,
+      first: validDecimal(total.over ?? total.over_odds),
+      second: validDecimal(total.under ?? total.under_odds),
+      explicitMain: explicitMain(total),
+    }];
+  });
+  const mainTotals = resolvedMainLines(totals);
+  for (const total of totals) {
+    const isMain = mainTotals.has(total.lineValue);
+    if (total.first !== null) prices.push({ market: "OU", lineValue: total.lineValue, isMain, selection: "O", decimalOdds: total.first, sourceUpdatedAt: now });
+    if (total.second !== null) prices.push({ market: "OU", lineValue: total.lineValue, isMain, selection: "U", decimalOdds: total.second, sourceUpdatedAt: now });
   }
 
   return { eventId, marketStatus, prices };

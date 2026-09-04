@@ -765,13 +765,28 @@ describe("Pinnacle-only in OU signal engine", () => {
     expect(syncOuSignalObservations(["pinnacle:evt-thresh"])).toBe(0);
   });
 
-  it("skips when the qualifying triple has a mismatched line", () => {
+  it("keeps a qualifying triple when only the T-30 main line moved", () => {
     const kickoff = NOW + 30 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-mixed", kickoff);
     addStage("pinnacle:evt-mixed", "pinnacle", "initial", "2.5", 1.90, 1.80, NOW - 25 * 60_000);
     addStage("pinnacle:evt-mixed", "pinnacle", "T30", "2.75", 1.78, 1.96, NOW - 20 * 60_000);
     addStage("pinnacle:evt-mixed", "pinnacle", "T5", "2.5", 1.84, 2.00, NOW - 60_000);
-    expect(syncOuSignalObservations(["pinnacle:evt-mixed"])).toBe(0);
+    expect(syncOuSignalObservations(["pinnacle:evt-mixed"])).toBeGreaterThanOrEqual(1);
+    expect(
+      rawDb.prepare(
+        `SELECT initial_line_key,t30_line_key,t5_line_key,line_path,
+                evaluator_version,drift_comparable
+           FROM ou_signal_observations
+          WHERE match_id=?`,
+      ).get("pinnacle:evt-mixed"),
+    ).toMatchObject({
+      initial_line_key: "2.5",
+      t30_line_key: "2.75",
+      t5_line_key: "2.5",
+      line_path: "2.5→2.75→2.5",
+      evaluator_version: "stage-main-v2",
+      drift_comparable: 1,
+    });
   });
 
   it("skips when the T-5 snapshot is missing", () => {

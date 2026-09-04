@@ -425,6 +425,7 @@ export interface ResearchDatasetResponse {
 
 export type OuSignalMode = "direct" | "reverse";
 export type OuSignalMatchStatus = "upcoming" | "live" | "completed" | "awaiting_result";
+export type OuSignalEvaluatorVersion = "same-line-v1" | "stage-main-v2";
 
 export interface OuSignalRule {
   id: string;
@@ -460,16 +461,24 @@ export interface OuSignalObservation {
   provider: ResearchProvider;
   providerLabel: string;
   ruleId: string;
+  /** Backward-compatible alias for the signal and settlement line (T-5). */
   lineKey: string;
+  initialLineKey: string;
+  t30LineKey: string;
+  t5LineKey: string;
+  linePath: string;
+  evaluatorVersion: OuSignalEvaluatorVersion;
   directionPath: string;
   driftBucket: string;
+  driftComparable: boolean;
   originalSelection: "O" | "U";
   signalSelection: "O" | "U";
   mode: OuSignalMode;
   referenceInitialOdds: number;
   referenceT5Odds: number;
   signalT5Odds: number;
-  oddsGap: number;
+  /** Null when initial and T-5 prices refer to different totals. */
+  oddsGap: number | null;
   detectedAt: number;
   notifiedAt: number | null;
   result: {
@@ -490,7 +499,12 @@ export interface OuSignalPrealert {
   provider: ResearchProvider;
   providerLabel: string;
   ruleId: string;
+  /** Backward-compatible alias for the current candidate line (T-30). */
   lineKey: string;
+  initialLineKey: string;
+  t30LineKey: string;
+  linePath: string;
+  evaluatorVersion: OuSignalEvaluatorVersion;
   directionPath: string;
   signalSelection: "O" | "U";
   mode: OuSignalMode;

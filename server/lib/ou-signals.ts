@@ -18,6 +18,7 @@ interface SnapshotRow {
   line_key: string;
   selection: Side;
   decimal_odds: number;
+  is_main: number;
   captured_at: number;
 }
 
@@ -39,6 +40,12 @@ interface StoredSignalRow {
   provider: Provider;
   rule_id: string;
   line_key: string;
+  initial_line_key: string | null;
+  t30_line_key: string | null;
+  t5_line_key: string | null;
+  line_path: string | null;
+  evaluator_version: "same-line-v1" | "stage-main-v2";
+  drift_comparable: number;
   direction_path: string;
   drift_bucket: string;
   original_selection: Side;
@@ -46,7 +53,7 @@ interface StoredSignalRow {
   initial_signal_odds: number;
   t5_signal_odds: number;
   signal_t5_odds: number;
-  odds_gap: number;
+  odds_gap: number | null;
   detected_at: number;
   notified_at: number | null;
   league: string;
@@ -65,6 +72,10 @@ interface StoredPrealertRow {
   provider: Provider;
   rule_id: string;
   line_key: string;
+  initial_line_key: string | null;
+  t30_line_key: string | null;
+  line_path: string | null;
+  evaluator_version: "same-line-v1" | "stage-main-v2";
   direction_path: string;
   initial_selected_odds: number;
   t30_selected_odds: number;
@@ -370,7 +381,7 @@ export function ouRuleT5OddsRange(
 function matchingRules(
   provider: Provider,
   path: string,
-  gap: number,
+  gap: number | null,
   lineKey: string,
   selectedT5Odds: number,
 ): OuSignalRule[] {
@@ -379,10 +390,81 @@ function matchingRules(
     if (!matchesLine(rule, lineKey)) return false;
     if (!matchesSelectedT5Odds(rule, selectedT5Odds)) return false;
     if (rule.driftBucket === "任何水位走勢") return true;
+    if (gap === null) return false;
     if (rule.driftBucket === "收水 0.05–0.10") return gap >= 0.05 && gap < 0.1;
     if (rule.driftBucket === "收水 0.10–0.20") return gap >= 0.1 && gap < 0.2;
     return rule.driftBucket === "持平或拉闊" && gap <= 0;
   });
+}
+
+type StageLineRows = Map<string, Map<Side, SnapshotRow>>;
+type StageRows = Map<Stage, StageLineRows>;
+
+interface SelectedStageMain {
+  lineKey: string;
+  rows: Map<Side, SnapshotRow>;
+}
+
+function groupByMatchProvider(rows: SnapshotRow[]): Map<string, StageRows> {
+  const groups = new Map<string, StageRows>();
+  for (const row of rows) {
+    const key = `${row.match_id}|${row.provider}`;
+    const stages = groups.get(key) ?? new Map<Stage, StageLineRows>();
+    const lines = stages.get(row.stage) ?? new Map<string, Map<Side, SnapshotRow>>();
+    const prices = lines.get(row.line_key) ?? new Map<Side, SnapshotRow>();
+    prices.set(row.selection, row);
+    lines.set(row.line_key, prices);
+    stages.set(row.stage, lines);
+    groups.set(key, stages);
+  }
+  return groups;
+}
+
+/**
+ * Select one auditable complete O/U main pair for a stage.
+ *
+ * Provider main flags win only when exactly one line has both sides marked
+ * main and no other row claims main. If the source supplied no main flags at
+ * all, a sole complete line is unambiguous and may be inferred. Multiple
+ * complete unmarked lines, conflicting mains and incomplete explicit mains
+ * all fail closed.
+ */
+function selectStageMain(lines: StageLineRows | undefined): SelectedStageMain | null {
+  if (!lines) return null;
+  const complete = [...lines.entries()].filter(([, rows]) => rows.has("O") && rows.has("U"));
+  const flaggedLineKeys = new Set(
+    [...lines.entries()]
+      .filter(([, rows]) => [...rows.values()].some((row) => row.is_main === 1))
+      .map(([lineKey]) => lineKey),
+  );
+  if (flaggedLineKeys.size) {
+    if (flaggedLineKeys.size !== 1) return null;
+    const lineKey = [...flaggedLineKeys][0];
+    const rows = lines.get(lineKey);
+    if (!rows || !rows.has("O") || !rows.has("U")) return null;
+    if ([...rows.values()].some((row) => row.is_main !== 1)) return null;
+    return { lineKey, rows };
+  }
+  if (complete.length !== 1) return null;
+  return { lineKey: complete[0][0], rows: complete[0][1] };
+}
+
+function evaluatorVersion(lineKeys: string[]): "same-line-v1" | "stage-main-v2" {
+  return new Set(lineKeys).size === 1 ? "same-line-v1" : "stage-main-v2";
+}
+
+function uniqueSignalKey(
+  matchId: string,
+  provider: Provider,
+  lineKey: string,
+  ruleId: string,
+  version: "same-line-v1" | "stage-main-v2",
+  linePath: string,
+  stage?: "T30",
+): string {
+  const base = `${matchId}|${provider}|OU|${lineKey}|${ruleId}`;
+  if (version === "same-line-v1") return stage ? `${base}|T30` : base;
+  return `${base}|stage-main-v2|${linePath}${stage ? "|T30" : ""}`;
 }
 
 /** Lock T-30 candidates once their first two directions match a frozen rule. */
@@ -393,7 +475,7 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
     : "AND m.kickoff_utc>=?";
   const params = matchIds.length ? matchIds : [cutoff];
   const rows = rawDb.prepare(
-    `SELECT s.match_id,s.provider,s.stage,s.line_key,s.selection,s.decimal_odds,s.captured_at
+    `SELECT s.match_id,s.provider,s.stage,s.line_key,s.selection,s.decimal_odds,s.is_main,s.captured_at
        FROM research_timeline_snapshots s
        JOIN matches m ON m.id=s.match_id
       WHERE s.market='OU'
@@ -403,56 +485,59 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
         AND s.stage IN ('initial','T30')
         AND s.selection IN ('O','U')
         ${matchFilter}
-      ORDER BY s.match_id,s.provider,s.line_key,s.stage,s.selection`,
+      ORDER BY s.match_id,s.provider,s.stage,s.line_key,s.selection`,
   ).all(...params) as SnapshotRow[];
 
-  const groups = new Map<string, Map<Stage, Map<Side, SnapshotRow>>>();
-  for (const row of rows) {
-    const key = `${row.match_id}|${row.provider}|${row.line_key}`;
-    const stages = groups.get(key) ?? new Map<Stage, Map<Side, SnapshotRow>>();
-    const prices = stages.get(row.stage) ?? new Map<Side, SnapshotRow>();
-    prices.set(row.selection, row);
-    stages.set(row.stage, prices);
-    groups.set(key, stages);
-  }
+  const groups = groupByMatchProvider(rows);
 
   const insert = rawDb.prepare(
     `INSERT OR IGNORE INTO ou_signal_prealerts(
        unique_key,match_id,provider,rule_id,line_key,direction_path,
+       initial_line_key,t30_line_key,line_path,evaluator_version,
        initial_selected_odds,t30_selected_odds,signal_t30_odds,detected_at,notified_at
-     ) VALUES(?,?,?,?,?,?,?,?,?,?,NULL)`,
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
   );
   let inserted = 0;
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
-      const initialRows = stages.get("initial");
-      const t30Rows = stages.get("T30");
-      if (!initialRows || !t30Rows) continue;
-      const decisions = [initialRows, t30Rows].map((stage) =>
-        selectedSide(new Map([...stage].map(([side, row]) => [side, row.decimal_odds]))),
+      const initial = selectStageMain(stages.get("initial"));
+      const t30 = selectStageMain(stages.get("T30"));
+      if (!initial || !t30) continue;
+      const stageMains = [initial, t30];
+      const decisions = stageMains.map((stage) =>
+        selectedSide(new Map([...stage.rows].map(([side, row]) => [side, row.decimal_odds]))),
       );
       if (decisions.some((decision) => !decision || decision.side === "D")) continue;
       if (decisions.some((decision) => decision!.odds <= 1.7)) continue;
       const path = decisions.map((decision) => decision!.side).join("→");
-      const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
-      const detectedAt = Math.max(...[...t30Rows.values()].map((row) => row.captured_at));
+      const [matchId, provider] = groupKey.split("|") as [string, Provider];
+      const linePath = `${initial.lineKey}→${t30.lineKey}`;
+      const version = evaluatorVersion([initial.lineKey, t30.lineKey]);
+      const detectedAt = Math.max(...[...t30.rows.values()].map((row) => row.captured_at));
       const rules = (T30_RULES_BY_PREFIX.get(`${provider}|${path}`) ?? [])
         .filter((rule) =>
-          matchesLine(rule, lineKey)
+          matchesLine(rule, t30.lineKey)
+          && (version === "same-line-v1" || rule.driftBucket === "任何水位走勢")
           && ouRuleT5OddsRange(rule, decisions[0]!.odds) !== null
           && (rule.activatedAt === undefined || detectedAt >= rule.activatedAt)
         );
       for (const rule of rules) {
-        const signalT30Odds = t30Rows.get(rule.signalSelection)?.decimal_odds;
+        const signalT30Odds = t30.rows.get(rule.signalSelection)?.decimal_odds;
         if (signalT30Odds === undefined) continue;
-        const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}|T30`;
+        const uniqueKey = uniqueSignalKey(
+          matchId, provider, t30.lineKey, rule.id, version, linePath, "T30",
+        );
         inserted += insert.run(
           uniqueKey,
           matchId,
           provider,
           rule.id,
-          lineKey,
+          t30.lineKey,
           path,
+          initial.lineKey,
+          t30.lineKey,
+          linePath,
+          version,
           decisions[0]!.odds,
           decisions[1]!.odds,
           signalT30Odds,
@@ -466,9 +551,11 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
 }
 
 /**
- * Lock every qualifying same-line observation. The signal is based on
- * initial/T-30/T-5 only and keeps the audit's strict selected-price > 1.70
- * threshold at every checkpoint.
+ * Lock every qualifying observation from each stage's independently selected
+ * main O/U pair. same-line-v1 keeps historical identity and price-drift
+ * semantics. stage-main-v2 permits a main-line path, but a cross-line raw
+ * price difference is never evaluated: drift-specific rules fail closed
+ * unless initial and T-5 return to the same outcome line.
  */
 export function syncOuSignalObservations(matchIds: string[] = []): number {
   const cutoff = Date.now() - 120 * 24 * 60 * 60_000;
@@ -477,7 +564,7 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
     : "AND m.kickoff_utc>=?";
   const params = matchIds.length ? matchIds : [cutoff];
   const rows = rawDb.prepare(
-    `SELECT s.match_id,s.provider,s.stage,s.line_key,s.selection,s.decimal_odds,s.captured_at
+    `SELECT s.match_id,s.provider,s.stage,s.line_key,s.selection,s.decimal_odds,s.is_main,s.captured_at
        FROM research_timeline_snapshots s
        JOIN matches m ON m.id=s.match_id
       WHERE s.market='OU'
@@ -487,67 +574,73 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
         AND s.stage IN ('initial','T30','T5')
         AND s.selection IN ('O','U')
         ${matchFilter}
-      ORDER BY s.match_id,s.provider,s.line_key,s.stage,s.selection`,
+      ORDER BY s.match_id,s.provider,s.stage,s.line_key,s.selection`,
   ).all(...params) as SnapshotRow[];
 
-  const groups = new Map<string, Map<Stage, Map<Side, SnapshotRow>>>();
-  for (const row of rows) {
-    const key = `${row.match_id}|${row.provider}|${row.line_key}`;
-    const stages = groups.get(key) ?? new Map<Stage, Map<Side, SnapshotRow>>();
-    const prices = stages.get(row.stage) ?? new Map<Side, SnapshotRow>();
-    prices.set(row.selection, row);
-    stages.set(row.stage, prices);
-    groups.set(key, stages);
-  }
+  const groups = groupByMatchProvider(rows);
 
   const insert = rawDb.prepare(
     `INSERT OR IGNORE INTO ou_signal_observations(
        unique_key,match_id,provider,rule_id,line_key,direction_path,drift_bucket,
+       initial_line_key,t30_line_key,t5_line_key,line_path,evaluator_version,drift_comparable,
        original_selection,signal_selection,initial_signal_odds,t5_signal_odds,
        signal_t5_odds,odds_gap,detected_at,notified_at
-     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
   );
   let inserted = 0;
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
-      const initialRows = stages.get("initial");
-      const t30Rows = stages.get("T30");
-      const t5Rows = stages.get("T5");
-      if (!initialRows || !t30Rows || !t5Rows) continue;
-      const stageRows = [initialRows, t30Rows, t5Rows];
-      const decisions = stageRows.map((stage) =>
-        selectedSide(new Map([...stage].map(([side, row]) => [side, row.decimal_odds]))),
+      const initial = selectStageMain(stages.get("initial"));
+      const t30 = selectStageMain(stages.get("T30"));
+      const t5 = selectStageMain(stages.get("T5"));
+      if (!initial || !t30 || !t5) continue;
+      const stageMains = [initial, t30, t5];
+      const decisions = stageMains.map((stage) =>
+        selectedSide(new Map([...stage.rows].map(([side, row]) => [side, row.decimal_odds]))),
       );
       if (decisions.some((decision) => !decision || decision.side === "D")) continue;
       if (decisions.some((decision) => decision!.odds <= 1.7)) continue;
       const path = decisions.map((decision) => decision!.side).join("→");
       const t5Side = decisions[2]!.side as Side;
-      const initialSignalOdds = initialRows.get(t5Side)?.decimal_odds;
-      const t5SignalOdds = t5Rows.get(t5Side)?.decimal_odds;
+      const initialSignalOdds = initial.rows.get(t5Side)?.decimal_odds;
+      const t5SignalOdds = t5.rows.get(t5Side)?.decimal_odds;
       if (initialSignalOdds === undefined || t5SignalOdds === undefined) continue;
-      const gap = Math.round((initialSignalOdds - t5SignalOdds) * 10_000) / 10_000;
-      const [matchId, provider, lineKey] = groupKey.split("|") as [string, Provider, string];
-      const detectedAt = Math.max(...[...t5Rows.values()].map((row) => row.captured_at));
-      const rules = matchingRules(provider, path, gap, lineKey, decisions[2]!.odds)
+      const driftComparable = initial.lineKey === t5.lineKey;
+      const gap = driftComparable
+        ? Math.round((initialSignalOdds - t5SignalOdds) * 10_000) / 10_000
+        : null;
+      const [matchId, provider] = groupKey.split("|") as [string, Provider];
+      const linePath = [initial.lineKey, t30.lineKey, t5.lineKey].join("→");
+      const version = evaluatorVersion([initial.lineKey, t30.lineKey, t5.lineKey]);
+      const detectedAt = Math.max(...[...t5.rows.values()].map((row) => row.captured_at));
+      const rules = matchingRules(provider, path, gap, t5.lineKey, decisions[2]!.odds)
         .filter((rule) => rule.activatedAt === undefined || detectedAt >= rule.activatedAt);
       for (const rule of rules) {
-        const signalT5Odds = t5Rows.get(rule.signalSelection)?.decimal_odds;
+        const signalT5Odds = t5.rows.get(rule.signalSelection)?.decimal_odds;
         if (signalT5Odds === undefined) continue;
-        const uniqueKey = `${matchId}|${provider}|OU|${lineKey}|${rule.id}`;
+        const uniqueKey = uniqueSignalKey(
+          matchId, provider, t5.lineKey, rule.id, version, linePath,
+        );
         inserted += insert.run(
           uniqueKey,
           matchId,
           provider,
           rule.id,
-          lineKey,
+          t5.lineKey,
           path,
-          driftBucket(gap),
+          gap === null ? "跨盤，不比較水位" : driftBucket(gap),
+          initial.lineKey,
+          t30.lineKey,
+          t5.lineKey,
+          linePath,
+          version,
+          driftComparable ? 1 : 0,
           t5Side,
           rule.signalSelection,
           initialSignalOdds,
           t5SignalOdds,
           signalT5Odds,
-          gap,
+          gap ?? 0,
           detectedAt,
         ).changes;
       }
@@ -592,15 +685,21 @@ function toObservation(row: StoredSignalRow, now: number): OuSignalObservation {
     providerLabel: rule.providerLabel,
     ruleId: row.rule_id,
     lineKey: row.line_key,
+    initialLineKey: row.initial_line_key ?? row.line_key,
+    t30LineKey: row.t30_line_key ?? row.line_key,
+    t5LineKey: row.t5_line_key ?? row.line_key,
+    linePath: row.line_path ?? `${row.line_key}→${row.line_key}→${row.line_key}`,
+    evaluatorVersion: row.evaluator_version ?? "same-line-v1",
     directionPath: row.direction_path,
     driftBucket: row.drift_bucket,
+    driftComparable: row.drift_comparable !== 0,
     originalSelection: row.original_selection,
     signalSelection: row.signal_selection,
     mode: rule.mode,
     referenceInitialOdds: row.initial_signal_odds,
     referenceT5Odds: row.t5_signal_odds,
     signalT5Odds: row.signal_t5_odds,
-    oddsGap: row.odds_gap,
+    oddsGap: row.drift_comparable === 0 ? null : row.odds_gap,
     detectedAt: row.detected_at,
     notifiedAt: row.notified_at,
     result: resultFor(row),
@@ -621,6 +720,10 @@ function toPrealert(row: StoredPrealertRow): OuSignalPrealert {
     providerLabel: rule.providerLabel,
     ruleId: row.rule_id,
     lineKey: row.line_key,
+    initialLineKey: row.initial_line_key ?? row.line_key,
+    t30LineKey: row.t30_line_key ?? row.line_key,
+    linePath: row.line_path ?? `${row.line_key}→${row.line_key}`,
+    evaluatorVersion: row.evaluator_version ?? "same-line-v1",
     directionPath: row.direction_path,
     signalSelection: rule.signalSelection,
     mode: rule.mode,

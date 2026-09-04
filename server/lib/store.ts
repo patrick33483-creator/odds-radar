@@ -150,6 +150,9 @@ CREATE INDEX IF NOT EXISTS crown_research_attempts_due_idx
 CREATE TABLE IF NOT EXISTS ou_signal_observations (
   unique_key TEXT PRIMARY KEY, match_id TEXT NOT NULL, provider TEXT NOT NULL,
   rule_id TEXT NOT NULL, line_key TEXT NOT NULL, direction_path TEXT NOT NULL,
+  initial_line_key TEXT, t30_line_key TEXT, t5_line_key TEXT, line_path TEXT,
+  evaluator_version TEXT NOT NULL DEFAULT 'same-line-v1',
+  drift_comparable INTEGER NOT NULL DEFAULT 1,
   drift_bucket TEXT NOT NULL, original_selection TEXT NOT NULL,
   signal_selection TEXT NOT NULL, initial_signal_odds REAL NOT NULL,
   t5_signal_odds REAL NOT NULL, signal_t5_odds REAL NOT NULL, odds_gap REAL NOT NULL,
@@ -162,6 +165,8 @@ CREATE INDEX IF NOT EXISTS ou_signal_rule_idx
 CREATE TABLE IF NOT EXISTS ou_signal_prealerts (
   unique_key TEXT PRIMARY KEY, match_id TEXT NOT NULL, provider TEXT NOT NULL,
   rule_id TEXT NOT NULL, line_key TEXT NOT NULL, direction_path TEXT NOT NULL,
+  initial_line_key TEXT, t30_line_key TEXT, line_path TEXT,
+  evaluator_version TEXT NOT NULL DEFAULT 'same-line-v1',
   initial_selected_odds REAL NOT NULL, t30_selected_odds REAL NOT NULL,
   signal_t30_odds REAL NOT NULL, detected_at INTEGER NOT NULL, notified_at INTEGER);
 CREATE INDEX IF NOT EXISTS ou_signal_prealert_match_idx
@@ -253,6 +258,43 @@ CREATE INDEX IF NOT EXISTS pinnacle_translation_entities_updated_idx
     sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN signal_t5_odds REAL");
     sqlite.exec("UPDATE ou_signal_observations SET signal_t5_odds=t5_signal_odds WHERE signal_t5_odds IS NULL");
   }
+  const ouSignalNames = new Set(ouSignalColumns.map((column) => column.name));
+  if (!ouSignalNames.has("initial_line_key")) sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN initial_line_key TEXT");
+  if (!ouSignalNames.has("t30_line_key")) sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN t30_line_key TEXT");
+  if (!ouSignalNames.has("t5_line_key")) sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN t5_line_key TEXT");
+  if (!ouSignalNames.has("line_path")) sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN line_path TEXT");
+  if (!ouSignalNames.has("evaluator_version")) {
+    sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN evaluator_version TEXT NOT NULL DEFAULT 'same-line-v1'");
+  }
+  if (!ouSignalNames.has("drift_comparable")) {
+    sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN drift_comparable INTEGER NOT NULL DEFAULT 1");
+  }
+  sqlite.exec(`
+    UPDATE ou_signal_observations
+       SET initial_line_key=COALESCE(initial_line_key,line_key),
+           t30_line_key=COALESCE(t30_line_key,line_key),
+           t5_line_key=COALESCE(t5_line_key,line_key),
+           line_path=COALESCE(line_path,line_key || '→' || line_key || '→' || line_key)
+     WHERE initial_line_key IS NULL OR t30_line_key IS NULL
+        OR t5_line_key IS NULL OR line_path IS NULL;
+  `);
+  const ouPrealertColumns = sqlite
+    .prepare("PRAGMA table_info(ou_signal_prealerts)")
+    .all() as Array<{ name: string }>;
+  const ouPrealertNames = new Set(ouPrealertColumns.map((column) => column.name));
+  if (!ouPrealertNames.has("initial_line_key")) sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN initial_line_key TEXT");
+  if (!ouPrealertNames.has("t30_line_key")) sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN t30_line_key TEXT");
+  if (!ouPrealertNames.has("line_path")) sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN line_path TEXT");
+  if (!ouPrealertNames.has("evaluator_version")) {
+    sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN evaluator_version TEXT NOT NULL DEFAULT 'same-line-v1'");
+  }
+  sqlite.exec(`
+    UPDATE ou_signal_prealerts
+       SET initial_line_key=COALESCE(initial_line_key,line_key),
+           t30_line_key=COALESCE(t30_line_key,line_key),
+           line_path=COALESCE(line_path,line_key || '→' || line_key)
+     WHERE initial_line_key IS NULL OR t30_line_key IS NULL OR line_path IS NULL;
+  `);
   // Existing installations predate PinnAPI. SQLite's CREATE TABLE IF NOT EXISTS
   // does not evolve the table, so add only the two additive mapping columns.
   const sourceColumns = sqlite
