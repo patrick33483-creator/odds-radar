@@ -43,10 +43,10 @@ describe("Pinnacle translation is isolated from the research timeline", () => {
     expect(src).toMatch(/maxFixtures/);
   });
 
-  it("routes.ts installs the backfill worker only when explicitly enabled", () => {
+  it("routes.ts installs the backfill worker unless explicitly disabled", () => {
     const src = readSource("server/routes.ts");
     expect(src).toMatch(/installPinnacleTranslationBackfill\s*\(/);
-    expect(src).toMatch(/RADAR_PINNACLE_TRANSLATION_BACKFILL\s*!==\s*"1"/);
+    expect(src).toMatch(/RADAR_PINNACLE_TRANSLATION_BACKFILL\s*===\s*"0"/);
     // The auto-scan tick MUST NOT call the backfill worker.
     const autoScanStart = src.indexOf("function installAutoWindowScan(");
     const autoScanEnd = src.indexOf("\n}\n", autoScanStart);

@@ -198,25 +198,26 @@ function installAutoWindowScan(): void {
  * `pinnacle_translations` so OU Telegram notifications can render Pinnacle-only
  * fixtures in Chinese. It is intentionally decoupled from the research
  * timeline: it never runs on the auto-scan tick and never blocks OU capture.
- * Disabled unless RADAR_PINNACLE_TRANSLATION_BACKFILL=1.
+ * Enabled by default; set RADAR_PINNACLE_TRANSLATION_BACKFILL=0 to disable.
+ * Default cadence: every 5 minutes, up to 50 fixtures per run.
  */
 function installPinnacleTranslationBackfill(): void {
   if (
-    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL !== "1" ||
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL === "0" ||
     pinnacleTranslationBackfillTimer
   ) return;
   const configuredMinutes = Number(
-    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_INTERVAL_MINUTES ?? 15,
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_INTERVAL_MINUTES ?? 5,
   );
   const intervalMs =
-    Math.max(5, Math.min(6 * 60, Number.isFinite(configuredMinutes) ? configuredMinutes : 15)) *
+    Math.max(5, Math.min(6 * 60, Number.isFinite(configuredMinutes) ? configuredMinutes : 5)) *
     60_000;
   const configuredBatch = Number(
-    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_BATCH ?? 25,
+    process.env.RADAR_PINNACLE_TRANSLATION_BACKFILL_BATCH ?? 50,
   );
   const batchSize = Math.max(
     1,
-    Math.min(100, Number.isFinite(configuredBatch) ? configuredBatch : 25),
+    Math.min(100, Number.isFinite(configuredBatch) ? configuredBatch : 50),
   );
   const run = async () => {
     if (pinnacleTranslationBackfillInFlight) return;

@@ -1,0 +1,85 @@
+name: Audit Phase 1 production verification (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+      - name: Read deployed commit, database freshness and logs without writing production
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          commit="$(git rev-parse HEAD)"
+          container_id="$(sudo docker compose ps -aq radar)"
+          health="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id")"
+          started="$(sudo docker inspect --format '{{.State.StartedAt}}' "$container_id")"
+          log_lines="$(sudo docker compose logs --since "$started" radar 2>&1 || true)"
+          COMMIT="$commit" HEALTH="$health" STARTED="$started" LOG_LINES="$log_lines" python3 - <<'PY'
+          import json, os, re, sqlite3, time
+          now = int(time.time() * 1000)
+          db = sqlite3.connect('file:/opt/odds-radar/data/data.db?mode=ro', uri=True, timeout=1)
+          db.execute('PRAGMA query_only=ON')
+          db.execute('PRAGMA busy_timeout=1000')
+          db.row_factory = sqlite3.Row
+          def rows(sql, params=()):
+              return [dict(r) for r in db.execute(sql, params).fetchall()]
+          freshness = rows("""SELECT provider, COUNT(*) AS rows, MAX(fetched_at) AS max_fetched_at,
+                                   ? - MAX(fetched_at) AS lag_ms
+                              FROM odds_latest WHERE provider IN ('hkjc','pinnacle')
+                             GROUP BY provider ORDER BY provider""", (now,))
+          stages = rows("""SELECT provider, stage, COUNT(*) AS rows, MAX(captured_at) AS max_captured_at
+                          FROM research_timeline_snapshots
+                         WHERE provider IN ('hkjc','pinnacle') AND stage IN ('initial','T30','T5')
+                         GROUP BY provider,stage ORDER BY provider,stage""")
+          states = dict(db.execute("SELECT key,value FROM app_state WHERE key IN ('lastScan','researchResultsLastRunAt','researchOpeningsLastRunAt','crownBackfillLastRunAt','crownBackfillLastSuccessAt','crownBackfillLastError')").fetchall())
+          health_rows = rows("""SELECT provider,ok,last_success_at,last_attempt_at,last_error_at,last_error,
+                                      consecutive_failures,item_count,mode
+                               FROM provider_health WHERE provider IN ('hkjc','pinnacle') ORDER BY provider""")
+          ou_counts = rows("""SELECT 'prealerts' AS kind,COUNT(*) AS total,MAX(detected_at) AS latest_detected_at,
+                                     SUM(CASE WHEN notified_at IS NULL THEN 1 ELSE 0 END) AS unsent
+                              FROM ou_signal_prealerts
+                              UNION ALL
+                              SELECT 'observations',COUNT(*),MAX(detected_at),SUM(CASE WHEN notified_at IS NULL THEN 1 ELSE 0 END)
+                              FROM ou_signal_observations""")
+          execution_counts = {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                              for table in ('odds_latest','odds_snapshots','market_lines','opportunities','simulation_bets','ou_signal_prealerts','ou_signal_observations')}
+          db.close()
+          clean=[]
+          for line in os.environ.get('LOG_LINES','').splitlines():
+              line=re.sub(r'\x1b\[[0-9;]*m','',line)
+              if any(x in line for x in ('auto_research_timeline','today_crown_backfill','crown_research_detail_error','pinnacle_detail_error','pinnapi_fixtures_error','ou_signal')):
+                  clean.append(line)
+          post_crown=[x for x in clean if 'today_crown_backfill' in x or 'crown_research_detail' in x]
+          post_detail=[x for x in clean if 'auto_research_timeline' in x and ('detailCalls' in x or 'detail_calls' in x)]
+          ou_errors=[x for x in clean if 'ou_signal' in x and 'error' in x.lower()]
+          print(json.dumps({
+            'read_only_connection':True,'checked_at_utc_ms':now,
+            'production_commit':os.environ['COMMIT'],'container_health':os.environ['HEALTH'],
+            'container_started_at':os.environ['STARTED'],
+            'odds_latest_freshness':freshness,'timeline_initial_t30_t5':stages,
+            'provider_health':health_rows,'app_state':states,'ou_counts':ou_counts,
+            'execution_table_counts':execution_counts,
+            'post_start_crown_events':post_crown[-100:],
+            'post_start_auto_research_detail_events':post_detail[-100:],
+            'post_start_ou_errors':ou_errors[-100:],
+          }, ensure_ascii=False, sort_keys=True))
+          PY
+          REMOTE
