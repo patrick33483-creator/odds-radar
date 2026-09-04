@@ -727,22 +727,45 @@ export async function collectResearchResults(
     try {
       const titanCandidates = rawDb
         .prepare(
-          `SELECT m.id, m.titan_id, m.kickoff_utc
+          `SELECT m.id, m.titan_id, m.kickoff_utc,
+                  CASE
+                    WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL
+                      THEN COALESCE(pt.zh_league,m.league)
+                    ELSE m.league
+                  END league,
+                  CASE
+                    WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL
+                      THEN COALESCE(pt.zh_home,m.home_team)
+                    ELSE m.home_team
+                  END home_team,
+                  CASE
+                    WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL
+                      THEN COALESCE(pt.zh_away,m.away_team)
+                    ELSE m.away_team
+                  END away_team,
+                  rr.result_source
              FROM matches m
              LEFT JOIN research_results rr ON rr.match_id=m.id
-            WHERE rr.match_id IS NULL
+             LEFT JOIN pinnacle_translations pt
+               ON m.fixture_source='pinnacle'
+              AND m.id LIKE 'pinnacle:%'
+              AND pt.pinnapi_id=SUBSTR(m.id,10)
+            WHERE (rr.match_id IS NULL OR rr.result_source!='titan007')
               AND m.kickoff_utc<=?
               AND m.kickoff_utc>=?
               AND m.fixture_source!='hkjc'
-              AND m.titan_id IS NOT NULL
             ORDER BY m.kickoff_utc DESC
             LIMIT 1000`,
         )
         .all(now - RESULT_DELAY_MS, now - lookbackDays * 24 * 60 * 60_000) as Array<{
-        id: string;
-        titan_id: string;
-        kickoff_utc: number;
-      }>;
+          id: string;
+          titan_id: string | null;
+          kickoff_utc: number;
+          league: string;
+          home_team: string;
+          away_team: string;
+          result_source: string | null;
+        }>;
       titanCandidateCount = titanCandidates.length;
 
       if (titanCandidateCount > 0) {
@@ -779,6 +802,9 @@ export async function collectResearchResults(
                 });
                 const fixtures = parseSchedulePage(html, yyyymmdd);
                 for (const f of fixtures) {
+                  const finished = /完|-1/.test(f.statusText)
+                    || yyyymmdd < titanHktYyyymmdd(now);
+                  if (!finished) continue;
                   const existing = byTitanId.get(f.providerMatchId);
                   // 只保留有分數那份；Over_ 優先，但如果 Over_ 沒分而 Next_ 有分就換。
                   const fHasScore = f.homeScore !== null && f.awayScore !== null;
@@ -795,18 +821,40 @@ export async function collectResearchResults(
             }
             const tx = rawDb.transaction(() => {
               for (const row of rows) {
-                const fixture = byTitanId.get(row.titan_id);
+                let fixture = row.titan_id ? byTitanId.get(row.titan_id) : undefined;
+                let reversed = false;
+                if (!fixture) {
+                  const decision = matchEvent(
+                    {
+                      id: row.id,
+                      league: row.league,
+                      homeTeam: row.home_team,
+                      awayTeam: row.away_team,
+                      kickoffUtc: row.kickoff_utc,
+                    },
+                    Array.from(byTitanId.values()).map((candidate) => ({
+                      id: candidate.providerMatchId,
+                      league: candidate.league,
+                      homeTeam: candidate.homeTeam,
+                      awayTeam: candidate.awayTeam,
+                      kickoffUtc: candidate.kickoffUtc,
+                    })),
+                  );
+                  if (!decision.pinnacleMatchId) continue;
+                  fixture = byTitanId.get(decision.pinnacleMatchId);
+                  reversed = decision.reversed;
+                }
                 if (!fixture) continue;
                 if (fixture.homeScore === null || fixture.awayScore === null) continue;
                 titanUpsert.run(
                   row.id,
                   null,
-                  fixture.homeScore,
-                  fixture.awayScore,
+                  reversed ? fixture.awayScore : fixture.homeScore,
+                  reversed ? fixture.homeScore : fixture.awayScore,
                   null,
                   "titan007",
                   "titan007",
-                  row.titan_id,
+                  fixture.providerMatchId,
                   now,
                 );
                 titanCollected++;

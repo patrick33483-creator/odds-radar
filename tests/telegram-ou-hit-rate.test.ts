@@ -148,16 +148,16 @@ function prealert(): OuSignalPrealert {
 }
 
 describe("formatOuHitRateLine", () => {
-  it("renders X.X% and sample size when >= 20 decided", () => {
-    expect(formatOuHitRateLine({ hits: 15, sample: 30, hitRate: 0.5 })).toBe("命中率：50.0%（30 場歷史）");
+  it("renders hits, decided sample and percentage", () => {
+    expect(formatOuHitRateLine({ hits: 15, sample: 30, hitRate: 0.5 })).toBe("前瞻命中：15/30，50.0%");
   });
 
-  it("renders 樣本不足 when sample below 20", () => {
-    expect(formatOuHitRateLine({ hits: 3, sample: 5, hitRate: 0.6 })).toBe("命中率：樣本不足（5 場）");
+  it("shows the real record even when the sample is small", () => {
+    expect(formatOuHitRateLine({ hits: 3, sample: 5, hitRate: 0.6 })).toBe("前瞻命中：3/5，60.0%");
   });
 
-  it("renders 計算中 on null (compute failure)", () => {
-    expect(formatOuHitRateLine(null)).toBe("命中率：計算中");
+  it("reports a compute failure honestly", () => {
+    expect(formatOuHitRateLine(null)).toBe("前瞻命中：暫時無法計算");
   });
 });
 
@@ -168,16 +168,16 @@ describe("OU Telegram hit rate", () => {
     const rate = computeOuRuleHitRate(RULE_ID, LINE_KEY);
     expect(rate).toEqual({ hits: 15, sample: 25, hitRate: 0.6 });
     const msg = buildOuSignalMessage([observation()]);
-    expect(msg).toContain("命中率：60.0%（25 場歷史）");
-    expect(buildOuPrealertMessage(prealert())).toContain("命中率：60.0%（25 場歷史）");
+    expect(msg).toContain("前瞻命中：15/25，60.0%");
+    expect(buildOuPrealertMessage(prealert())).toContain("前瞻命中：15/25，60.0%");
   });
 
-  it("shows 樣本不足 when fewer than 20 decided", () => {
+  it("shows the actual record when fewer than 20 decided", () => {
     clearHistory();
     seedHistory(10, 3);
     const msg = buildOuSignalMessage([observation()]);
-    expect(msg).toContain("命中率：樣本不足（10 場）");
-    expect(buildOuPrealertMessage(prealert())).toContain("命中率：樣本不足（10 場）");
+    expect(msg).toContain("前瞻命中：3/10，30.0%");
+    expect(buildOuPrealertMessage(prealert())).toContain("前瞻命中：3/10，30.0%");
   });
 
   it("returns 樣本不足（0 場） when no history exists at all", () => {
@@ -186,7 +186,7 @@ describe("OU Telegram hit rate", () => {
     const rate = computeOuRuleHitRate(RULE_ID, LINE_KEY);
     expect(rate).toEqual({ hits: 0, sample: 0, hitRate: null });
     const msg = buildOuSignalMessage([observation()]);
-    expect(msg).toContain("命中率：樣本不足（0 場）");
+    expect(msg).toContain("前瞻命中：0/0，暫無已結算賽事");
   });
 
   it("still emits a hit-rate line for Pinnacle-only observations", () => {
@@ -200,6 +200,6 @@ describe("OU Telegram hit rate", () => {
     const rate = computeOuRuleHitRate(RULE_ID, LINE_KEY);
     expect(rate.sample).toBe(1);
     const msg = buildOuSignalMessage([observation()]);
-    expect(msg).toContain("命中率：樣本不足（1 場）");
+    expect(msg).toContain("前瞻命中：1/1，100.0%");
   });
 });

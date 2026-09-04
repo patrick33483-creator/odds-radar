@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { rmSync } from "node:fs";
 
 const dbPath = `/tmp/odds-radar-research-${process.pid}.db`;
@@ -165,6 +165,77 @@ describe("research data collection", () => {
     expect(researchCsv("results", { days: 7, provider: "all", market: "all" })).toContain(
       "hkjc:123,research-only,hkjc,,123,研究聯賽,主隊,客隊",
     );
+  });
+
+  it("replaces unsafe manual scores with Titan results by exact sId or strict full-fixture matching", async () => {
+    const now = Date.parse("2026-09-04T06:00:00Z");
+    const exactKickoff = Date.parse("2026-09-04T02:00:00Z");
+    const matchedKickoff = Date.parse("2026-09-04T02:05:00Z");
+
+    addMatch("pinnacle:titan-result-exact", exactKickoff, "IH Hafnarfjordur", "KFR");
+    rawDb.prepare(
+      `UPDATE matches
+          SET fixture_source='pinnacle',titan_id='3100001',league='Iceland 4 Deild'
+        WHERE id='pinnacle:titan-result-exact'`,
+    ).run();
+    addMatch("pinnacle:result-strict-match", matchedKickoff, "Deportivo Capiata", "3 De Noviembre");
+    rawDb.prepare(
+      `UPDATE matches
+          SET fixture_source='pinnacle',titan_id=NULL,league='Paraguay Division Intermedia'
+        WHERE id='pinnacle:result-strict-match'`,
+    ).run();
+    rawDb.prepare(
+      `INSERT INTO pinnacle_translations(
+         pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,attempt_count
+       ) VALUES('result-strict-match','Deportivo Capiata','3 De Noviembre',
+                'Paraguay Division Intermedia','titan',?,0)`,
+    ).run(now);
+    const insertManual = rawDb.prepare(
+      `INSERT INTO research_results(
+         match_id,hkjc_id,home_score,away_score,corners_total,source,
+         result_source,source_match_id,fetched_at
+       ) VALUES(?,NULL,?,?,NULL,'manual','manual',NULL,?)`,
+    );
+    insertManual.run("pinnacle:titan-result-exact", 2, 0, now - 1_000);
+    insertManual.run("pinnacle:result-strict-match", 1, 1, now - 1_000);
+
+    const page = [
+      "<table>",
+      "<tr sId='3100001'><td>Iceland 4 Deild</td><td>9-4 10:00</td><td>-1</td><td>IH Hafnarfjordur</td><td>3 - 2</td><td>KFR</td><td>2 - 2</td></tr>",
+      "<tr sId='3100002'><td>Paraguay Division Intermedia</td><td>9-4 10:05</td><td>-1</td><td>Deportivo Capiata</td><td>4 - 3</td><td>3 De Noviembre</td><td>2 - 1</td></tr>",
+      "</table>",
+    ].join("");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(page)));
+    try {
+      await expect(collectResearchResults({ fetchHistoricResults: async () => [] } as never, now))
+        .resolves.toEqual({ candidates: 2, collected: 2 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(rawDb.prepare(
+      `SELECT match_id,home_score,away_score,source,result_source,source_match_id
+         FROM research_results
+        WHERE match_id IN ('pinnacle:titan-result-exact','pinnacle:result-strict-match')
+        ORDER BY match_id`,
+    ).all()).toEqual([
+      {
+        match_id: "pinnacle:result-strict-match",
+        home_score: 4,
+        away_score: 3,
+        source: "titan007",
+        result_source: "titan007",
+        source_match_id: "3100002",
+      },
+      {
+        match_id: "pinnacle:titan-result-exact",
+        home_score: 3,
+        away_score: 2,
+        source: "titan007",
+        result_source: "titan007",
+        source_match_id: "3100001",
+      },
+    ]);
   });
 
   it("locks a complete checkpoint and does not overwrite it on later scans", () => {

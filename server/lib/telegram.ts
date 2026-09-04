@@ -5,6 +5,7 @@ import {
   markOuPrealertNotified,
   markOuSignalNotified,
   ouRuleById,
+  ouRuleT5OddsRange,
   type OuHitRateResult,
 } from "./ou-signals";
 import type { OuSignalObservation, OuSignalPrealert, OuSignalRule } from "@shared/types";
@@ -166,23 +167,14 @@ export async function notifySimulationBets(newBetKeys: string[]): Promise<number
   return sent;
 }
 
-const OU_HIT_RATE_MIN_SAMPLE = 20;
-
 /**
- * Format a hit-rate line for OU Telegram notifications. Rules:
- *   - sample >= 20        → 命中率：X.X%（N 場歷史）
- *   - sample < 20         → 命中率：樣本不足（N 場）
- *   - computation failed  → 命中率：計算中
- * The compute step is wrapped in try/catch by the caller so a DB failure never
- * blocks the message; we log the error and fall back to the neutral phrase.
+ * Format the live prospective record without hiding small samples.
  */
 export function formatOuHitRateLine(result: OuHitRateResult | null): string {
-  if (!result) return "命中率：計算中";
-  if (result.hitRate === null || result.sample < OU_HIT_RATE_MIN_SAMPLE) {
-    return `命中率：樣本不足（${result.sample} 場）`;
-  }
+  if (!result) return "前瞻命中：暫時無法計算";
+  if (result.hitRate === null) return `前瞻命中：${result.hits}/${result.sample}，暫無已結算賽事`;
   const pct = (result.hitRate * 100).toFixed(1);
-  return `命中率：${pct}%（${result.sample} 場歷史）`;
+  return `前瞻命中：${result.hits}/${result.sample}，${pct}%`;
 }
 
 function safeHitRateLine(ruleId: string, lineKey: string, context: string): string {
@@ -205,15 +197,42 @@ function historicalLine(rule: OuSignalRule): string {
     && rule.historicalHits !== undefined
     && rule.historicalHitRate !== undefined
   ) {
-    const sample = rule.historicalDecided === rule.historicalSample
-      ? `${rule.historicalSample} 場`
-      : `${rule.historicalSample} 場（${rule.historicalDecided} 場判定）`;
-    const roi = rule.historicalRoi === undefined
-      ? ""
-      : `｜ROI ${rule.historicalRoi >= 0 ? "+" : ""}${(rule.historicalRoi * 100).toFixed(1)}%`;
-    return `歷史：${sample}｜${rule.historicalHits}/${rule.historicalDecided}｜命中率 ${(rule.historicalHitRate * 100).toFixed(1)}%${roi}`;
+    return `歷史命中：${rule.historicalHits}/${rule.historicalDecided}，${(rule.historicalHitRate * 100).toFixed(1)}%`;
   }
-  return `歷史：${rule.historicalNote}`;
+  return `歷史命中：${rule.historicalNote}`;
+}
+
+function boundary(value: number, inclusive: boolean, lower: boolean): string {
+  if (inclusive) return lower ? `≥ ${value.toFixed(3)}` : `≤ ${value.toFixed(3)}`;
+  return lower ? `> ${value.toFixed(3)}` : `< ${value.toFixed(3)}`;
+}
+
+function t5OddsRangeLine(rule: OuSignalRule, initialSelectedOdds: number): string {
+  const range = ouRuleT5OddsRange(rule, initialSelectedOdds);
+  if (!range) return "T-5 原方向低水賠率：按目前初盤沒有可達成範圍";
+  const lower = boundary(range.min, range.minInclusive, true);
+  const upper = range.max === null
+    ? ""
+    : ` 且 ${boundary(range.max, range.maxInclusive, false)}`;
+  return `T-5 原方向低水賠率：${lower}${upper}`;
+}
+
+function lineCondition(rule: OuSignalRule): string {
+  const parts: string[] = [];
+  if (rule.lineMinInclusive !== undefined) parts.push(`主盤 ≥ ${rule.lineMinInclusive}`);
+  if (rule.lineMinExclusive !== undefined) parts.push(`主盤 > ${rule.lineMinExclusive}`);
+  if (rule.lineMaxInclusive !== undefined) parts.push(`主盤 ≤ ${rule.lineMaxInclusive}`);
+  return parts.join("、");
+}
+
+function ruleConditionLine(rule: OuSignalRule, label = "達成條件"): string {
+  const parts = [
+    rule.providerLabel,
+    `方向 ${rule.directionPath}`,
+    rule.driftBucket,
+    lineCondition(rule),
+  ].filter(Boolean);
+  return `${label}：${parts.join("｜")}`;
 }
 
 function signalLines(signal: OuSignalObservation): string[] {
@@ -222,9 +241,10 @@ function signalLines(signal: OuSignalObservation): string[] {
   const rule = ouRuleById(signal.ruleId);
   return [
     `${mode}｜${signal.providerLabel}｜${buy} ${signal.lineKey} @ ${signal.signalT5Odds.toFixed(3)}`,
-    `規則：${signal.ruleId}`,
+    rule ? ruleConditionLine(rule) : `達成條件：${signal.ruleId}`,
     `盤路：${signal.directionPath}｜${signal.driftBucket}`,
     `原方向 ${signal.originalSelection === "O" ? "大" : "小"}：初盤 ${signal.referenceInitialOdds.toFixed(3)} → T-5 ${signal.referenceT5Odds.toFixed(3)}（差 ${signal.oddsGap >= 0 ? "+" : ""}${signal.oddsGap.toFixed(3)}）`,
+    ...(rule ? [t5OddsRangeLine(rule, signal.referenceInitialOdds)] : []),
     rule ? historicalLine(rule) : "歷史：暫無可核實統計",
     safeHitRateLine(signal.ruleId, signal.lineKey, "observation"),
   ];
@@ -283,6 +303,7 @@ export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<n
 export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
   const possibleBuy = signal.signalSelection === "O" ? "大球" : "小球";
   const mode = signal.mode === "reverse" ? "反向候選" : "正向候選";
+  const rule = ouRuleById(signal.ruleId);
   return [
     "盤路雷達：T-30 OU 候選預警",
     `${mode}｜${signal.providerLabel}`,
@@ -291,8 +312,12 @@ export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
     `目前兩段方向：${signal.directionPath}｜同線 ${signal.lineKey}`,
     `低水方賠率：初盤 ${signal.initialSelectedOdds.toFixed(3)} → T-30 ${signal.t30SelectedOdds.toFixed(3)}`,
     `如果 T-5 完成條件，可能留意：${possibleBuy} ${signal.lineKey}｜目前 T-30 賠率 ${signal.signalT30Odds.toFixed(3)}`,
+    ...(rule ? [
+      ruleConditionLine(rule, "候選條件"),
+      t5OddsRangeLine(rule, signal.initialSelectedOdds),
+      historicalLine(rule),
+    ] : []),
     safeHitRateLine(signal.ruleId, signal.lineKey, "prealert"),
-    "呢個只係心理準備預警，未係正式買入訊號；T-5 會重新核對完整方向同收水幅度。",
   ].join("\n");
 }
 

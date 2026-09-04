@@ -37,9 +37,11 @@ describe("Radar OU Telegram message", () => {
       signal("hkjc-ooo-flat-wide-reverse"),
     ]);
     expect(text).toContain("命中條件：2 條");
-    expect(text).toContain("命中率 73.9%");
-    expect(text).toContain("命中率 70.8%");
+    expect(text).toContain("歷史命中：17/23，73.9%");
+    expect(text).toContain("歷史命中：17/24，70.8%");
     expect(text).toContain("17/23");
     expect(text).toContain("17/24");
+    expect(text).toContain("達成條件：馬會｜方向 O→O→O｜持平或拉闊");
+    expect(text).toContain("T-5 原方向低水賠率：≥ 1.800");
   });
 });

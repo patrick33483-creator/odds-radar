@@ -305,6 +305,68 @@ function matchesSelectedT5Odds(rule: OuSignalRule, selectedT5Odds: number): bool
   return true;
 }
 
+export interface OuRuleT5OddsRange {
+  min: number;
+  minInclusive: boolean;
+  max: number | null;
+  maxInclusive: boolean;
+}
+
+/**
+ * Return the exact T-5 price interval that can satisfy a rule for a given
+ * initial selected-side price. All observations also require the selected
+ * price at every checkpoint to be strictly above 1.70.
+ */
+export function ouRuleT5OddsRange(
+  rule: OuSignalRule,
+  initialSelectedOdds: number,
+): OuRuleT5OddsRange | null {
+  let min = 1.7;
+  let minInclusive = false;
+  let max: number | null = null;
+  let maxInclusive = false;
+
+  const raiseMin = (value: number, inclusive: boolean) => {
+    if (value > min || (value === min && !inclusive)) {
+      min = value;
+      minInclusive = inclusive;
+    } else if (value === min) {
+      minInclusive = minInclusive && inclusive;
+    }
+  };
+  const lowerMax = (value: number, inclusive: boolean) => {
+    if (max === null || value < max || (value === max && !inclusive)) {
+      max = value;
+      maxInclusive = inclusive;
+    } else if (value === max) {
+      maxInclusive = maxInclusive && inclusive;
+    }
+  };
+
+  if (rule.selectedT5OddsMinInclusive !== undefined) {
+    raiseMin(rule.selectedT5OddsMinInclusive, true);
+  }
+  if (rule.selectedT5OddsMaxInclusive !== undefined) {
+    lowerMax(rule.selectedT5OddsMaxInclusive, true);
+  }
+
+  if (rule.driftBucket === "收水 0.05–0.10") {
+    raiseMin(initialSelectedOdds - 0.1, false);
+    lowerMax(initialSelectedOdds - 0.05, true);
+  } else if (rule.driftBucket === "收水 0.10–0.20") {
+    raiseMin(initialSelectedOdds - 0.2, false);
+    lowerMax(initialSelectedOdds - 0.1, true);
+  } else if (rule.driftBucket === "持平或拉闊") {
+    raiseMin(initialSelectedOdds, true);
+  }
+
+  if (
+    max !== null
+    && (min > max || (min === max && (!minInclusive || !maxInclusive)))
+  ) return null;
+  return { min, minInclusive, max, maxInclusive };
+}
+
 function matchingRules(
   provider: Provider,
   path: string,
@@ -377,6 +439,7 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
       const rules = (T30_RULES_BY_PREFIX.get(`${provider}|${path}`) ?? [])
         .filter((rule) =>
           matchesLine(rule, lineKey)
+          && ouRuleT5OddsRange(rule, decisions[0]!.odds) !== null
           && (rule.activatedAt === undefined || detectedAt >= rule.activatedAt)
         );
       for (const rule of rules) {

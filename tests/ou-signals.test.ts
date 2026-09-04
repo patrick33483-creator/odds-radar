@@ -158,8 +158,8 @@ describe("OU signal monitor", () => {
     expect(syncOuSignalObservations(["threshold-fail"])).toBe(0);
   });
 
-  it("keeps active T-30 candidates but suppresses disabled Telegram rules", () => {
-    expect(syncOuSignalPrealerts()).toBe(7);
+  it("keeps feasible T-30 candidates, drops impossible ranges and suppresses disabled Telegram rules", () => {
+    expect(syncOuSignalPrealerts()).toBe(6);
     expect(syncOuSignalPrealerts()).toBe(0);
     const rows = rawDb.prepare(
       "SELECT unique_key,match_id,rule_id,signal_t30_odds,detected_at FROM ou_signal_prealerts ORDER BY match_id",
@@ -170,14 +170,11 @@ describe("OU signal monitor", () => {
       signal_t30_odds: number;
       detected_at: number;
     }>;
-    expect(rows).toHaveLength(7);
+    expect(rows).toHaveLength(6);
     expect(rows.find((row) =>
       row.match_id === "ouu-reverse"
       && row.rule_id === "pinnacle-ouu-short-010-020-reverse",
-    )).toMatchObject({
-      rule_id: "pinnacle-ouu-short-010-020-reverse",
-      signal_t30_odds: 1.96,
-    });
+    )).toBeUndefined();
 
     const earliest = Math.min(...rows.map((row) => row.detected_at));
     rawDb.prepare(
