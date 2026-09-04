@@ -131,7 +131,11 @@ export const MAX_LOOP_MS = 290_000;
  * discard every callback during the five-minute T5 window.
  */
 export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
+/** Keep the primary HKJC checkpoint pass bounded below the 30-second scheduler cadence. */
+export const RESEARCH_TIMELINE_DETAIL_LOOP_MS = 20_000;
+const MAX_RESEARCH_TIMELINE_DETAIL_TARGETS = 100;
 const PINNACLE_OPENING_RECOVERY_LOOKBACK_MS = 6 * 60 * 60_000;
+const STARTED_MATCH_STATUS = /INPLAY|LIVE|FINISHED|ENDED|ABANDON|CANCEL|POSTPONE|RESULT/i;
 
 export type PinnacleResearchTarget = {
   matchId: string;
@@ -2036,6 +2040,60 @@ export class RadarEngine {
     return { detailCalls: res.fetched, newOpportunityKeys: [...new Set(newBetKeys)] };
   }
 
+  /**
+   * HKJC-canonical fixtures whose current pre-kickoff milestone still lacks a
+   * complete Pinnacle AH or OU pair. Missing/partial checkpoints remain
+   * eligible on later ticks; already frozen pairs and post-kickoff fixtures do
+   * not consume detail-call budget.
+   */
+  private researchTimelinePinnacleTargets(now: number): Array<{
+    id: string;
+    pinnacleMatchId: string;
+    kickoffUtc: number;
+  }> {
+    const completePairs = new Set(
+      (rawDb.prepare(
+        `SELECT DISTINCT match_id,stage,market
+           FROM (
+             SELECT match_id,stage,market,line_key
+               FROM research_timeline_snapshots
+              WHERE provider='pinnacle' AND market IN ('AH','OU')
+              GROUP BY match_id,stage,market,line_key
+             HAVING COUNT(DISTINCT selection)>=2
+           )`,
+      ).all() as Array<{ match_id: string; stage: string; market: "AH" | "OU" }>)
+        .map((row) => `${row.match_id}:${row.stage}:${row.market}`),
+    );
+    const priority = { T5: 0, T15: 1, T30: 2 } as const;
+    return db
+      .select()
+      .from(matches)
+      .all()
+      .flatMap((match) => {
+        if (
+          match.fixtureSource !== "hkjc"
+          || !match.pinnacleMatchId
+          || match.inplay
+          || STARTED_MATCH_STATUS.test(match.status ?? "")
+        ) return [];
+        const stage = researchStageFor(match.kickoffUtc, now);
+        if (!stage) return [];
+        const ahComplete = completePairs.has(`${match.id}:${stage}:AH`);
+        const ouComplete = completePairs.has(`${match.id}:${stage}:OU`);
+        return ahComplete && ouComplete
+          ? []
+          : [{
+              id: match.id,
+              pinnacleMatchId: match.pinnacleMatchId,
+              kickoffUtc: match.kickoffUtc,
+              stage,
+            }];
+      })
+      .sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc)
+      .slice(0, MAX_RESEARCH_TIMELINE_DETAIL_TARGETS)
+      .map(({ stage: _stage, ...target }) => target);
+  }
+
   /** Candidate keys that currently pass every pre-bet rule except re-confirmation. */
   private simulationCandidateKeys(
     dash: DashboardResponse,
@@ -2142,6 +2200,26 @@ export class RadarEngine {
   async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
+    // This pass is deliberately independent of the dense execution scanner.
+    // It selects only the current, still-pre-kickoff milestone and bypasses the
+    // normal detail cache so a T30/T15/T5 checkpoint cannot inherit an earlier
+    // observation. INSERT OR IGNORE in captureResearchTimelinePrices preserves
+    // the first genuine quote for every checkpoint key across retries.
+    const checkpointNow = Date.now();
+    const targets = this.researchTimelinePinnacleTargets(checkpointNow);
+    let detailCalls = 0;
+    if (targets.length) {
+      const detail = await this.pollPinnacleDetail(
+        targets,
+        Date.now() + RESEARCH_TIMELINE_DETAIL_LOOP_MS,
+        true,
+      );
+      detailCalls = detail.fetched;
+      log("research_timeline_pinnacle_detail", {
+        selected: targets.length,
+        ...detail,
+      });
+    }
     // The complete same-day Titan feed changes much faster than future-day
     // schedules. Refresh it independently on every research pass instead of
     // leaving a failed boot-time response stuck behind the 10-minute shared
@@ -2175,7 +2253,7 @@ export class RadarEngine {
     } catch (err) {
       log("pinnacle_only_research_error", { error: (err as Error).message });
     }
-    return { selected: 0, detailCalls: 0 };
+    return { selected: targets.length, detailCalls };
   }
 
   private persistPrices(
