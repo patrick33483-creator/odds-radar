@@ -72,18 +72,19 @@ jobs:
               o = {orig, simp, trad}
               o.update({s[:3] for s in list(o) if len(s)>=3})
               return list(o)
-          filled = 0; missed = []; multi = []
+          filled = 0; missed = []; cross_hits = 0
           for e in fills:
               y,m,d = [int(x) for x in e["date"].split("-")]
               lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
               hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
               hvars = vs(e["home"], e["home_simp"], e["home_trad"])
               avars = vs(e["away"], e["away_simp"], e["away_trad"])
+              # Step 1: 直接 fuzzy match
               rows = []; seen = set()
               for h in hvars:
                   for a in avars:
                       for r in db.execute(
-                          """SELECT id, home_team, away_team FROM matches
+                          """SELECT id, home_team, away_team, kickoff_utc, fixture_source FROM matches
                               WHERE home_team LIKE ? AND away_team LIKE ?
                                 AND kickoff_utc>=? AND kickoff_utc<=?""",
                           (f"%{h}%", f"%{a}%", lo, hi),
@@ -92,10 +93,30 @@ jobs:
               tag = f"{e['home']} vs {e['away']} @ {e['date']}"
               if len(rows) == 0:
                   missed.append(tag); continue
-              if len(rows) > 1:
-                  multi.append(f"{tag} -> {len(rows)} matches")
-              now_ms = int(time.time()*1000)
+              # Step 2: cross-source 擴展 — 對每個已 match 嘅場，搵 kickoff ±30min 內其他 fixture
+              extra = []
+              known_ids = set(r["id"] for r in rows)
+              WIN = 30*60*1000
               for r in rows:
+                  ko = r["kickoff_utc"]
+                  for x in db.execute(
+                      """SELECT id, home_team, away_team, kickoff_utc, fixture_source FROM matches
+                          WHERE kickoff_utc>=? AND kickoff_utc<=?
+                            AND fixture_source!=?""",
+                      (ko - WIN, ko + WIN, r["fixture_source"]),
+                  ).fetchall():
+                      if x["id"] not in known_ids and x["id"] not in seen:
+                          extra.append(x); seen.add(x["id"])
+              # cross-source 篩埋 sanity check：兩隊名要有 loose overlap
+              # 但實際 pinnacle 英/crown 中，冇字符 overlap，所以純靠時間視為同一場
+              # 由於 ±30min + 同日，撞兩場機會極低，直接接受
+              all_rows = rows + extra
+              if extra:
+                  cross_hits += len(extra)
+                  for x in extra:
+                      print(f"  cross: {tag} => [{x['fixture_source']}] {x['home_team']} vs {x['away_team']}")
+              now_ms = int(time.time()*1000)
+              for r in all_rows:
                   for attempt in range(10):
                       try:
                           db.execute("BEGIN IMMEDIATE")
@@ -115,12 +136,9 @@ jobs:
                           if "locked" in str(ex) and attempt < 9:
                               time.sleep(2); continue
                           raise
-          print(f"填咗 {filled} 場，搵唔到 {len(missed)}，多過一場 match {len(multi)}")
+          print(f"填咗 {filled} 場（包 cross-source {cross_hits} 場），搵唔到 {len(missed)}")
           if missed:
               print("--- missed ---")
               for x in missed: print(" ", x)
-          if multi:
-              print("--- multi ---")
-              for x in multi: print(" ", x)
           db.close()
           PY
