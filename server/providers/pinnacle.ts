@@ -227,13 +227,10 @@ export function parsePinnacleAsianTriple(html: string): PinnacleRowTriple | null
   return { ...triple, companyId: picked.row.companyId, matchedBy: picked.matchedBy };
 }
 
-/** True when a (possibly masked) titan007 label is Crown / 皇冠. */
-export function isCrownBookmakerName(name: string): boolean {
+function isCrownName(name: string): boolean {
   const normalized = normalizeBookmakerName(name);
   return normalized === "crown" || normalized === "crow" || normalized === "皇冠";
 }
-
-const isCrownName = isCrownBookmakerName;
 
 /** Crown's current full-time Asian-odds triple from titan007. */
 export function parseCrownAsianTriple(
@@ -259,142 +256,6 @@ export interface CrownResearchPrices {
   opening: ProviderPrice[];
   current: ProviderPrice[];
   sourceUrls: { AH: string; OU: string };
-}
-
-/* ------------------- titan007 「變化时间」 history rows ------------------- */
-
-/**
- * One movement tick from a titan007 `changeDetail/*.aspx` page.
- *
- * That page is the ONLY place where titan exposes *when* a bookmaker changed
- * its quote, which is what makes an after-the-fact stage backfill possible:
- * the AsianOdds_n / OverDown_n pages only ever show opening + current.
- * Prices stay in the page's native HONG KONG format — the caller converts.
- */
-export interface TitanHistoryRow {
-  /** UTC ms of the 「變化时间」 cell (titan renders it in UTC+8). */
-  timestamp: number;
-  /** Quarter-snapped OU total. */
-  line: number;
-  /** Over price in Hong Kong odds, exactly as quoted. */
-  overHk: number;
-  /** Under price in Hong Kong odds, exactly as quoted. */
-  underHk: number;
-  /** 早 / 即 = pre-match, 滚 = in-play. Only pre-match ticks are usable. */
-  status: string;
-  /** True for 早 / 即 rows: the quote was still a pre-match price. */
-  prematch: boolean;
-}
-
-export interface TitanHistoryPage {
-  /** Visible (usually masked) bookmaker label carried by the page, e.g. "平*". */
-  company: string;
-  rows: TitanHistoryRow[];
-  sourceUrl: string;
-}
-
-/** 早 = early pre-match, 即 = near kickoff. Everything else is in-play/void. */
-const TITAN_PREMATCH_STATUSES = new Set(["\u65e9", "\u5373"]);
-const TITAN_HISTORY_TIME_RE = /(?<!\d)(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?!\d)/;
-
-/**
- * titan007 omits the year on history rows, so it is inferred from a reference
- * instant (the fixture kickoff): the nearest calendar instance wins, which is
- * the only defensible choice across a new-year boundary.
- */
-export function inferTitanHistoryTimestamp(
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  referenceUtc: number,
-): number | null {
-  const referenceHk = new Date(referenceUtc + HK_TZ_OFFSET_MS);
-  const year = referenceHk.getUTCFullYear();
-  let best: number | null = null;
-  for (const candidateYear of [year - 1, year, year + 1]) {
-    const utc = Date.UTC(candidateYear, month - 1, day, hour, minute) - HK_TZ_OFFSET_MS;
-    if (new Date(utc + HK_TZ_OFFSET_MS).getUTCMonth() !== month - 1) continue;
-    if (best === null || Math.abs(utc - referenceUtc) < Math.abs(best - referenceUtc)) best = utc;
-  }
-  return best;
-}
-
-/** "2.5/3" -> 2.75, "4.5" -> 4.5. Non-numeric cells (封) return null. */
-export function parseTitanTotalCell(text: string): number | null {
-  const parts = text.replace(/\s+/g, "").split("/").filter(Boolean);
-  if (!parts.length || parts.length > 2) return null;
-  const values = parts.map(Number);
-  if (!values.every((value) => Number.isFinite(value) && value >= 0)) return null;
-  const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-  return parsePinnacleTotal(average);
-}
-
-/**
- * Parse the OU 「變化时间」 table of a titan007 `changeDetail/overunder.aspx`
- * page. Row shape (right-to-left, because the leading 时间/比分 cells only
- * exist once a match is running):
- *
- *   … | 大球 | 进球数 | 小球 | 变化时间 | 状态
- *
- * Rows are returned oldest-first. Closed (封) ticks and header rows are
- * dropped; in-play (滚) ticks are kept but flagged `prematch: false` so a
- * caller can never mistake a live price for a pre-match checkpoint.
- */
-export function parseTitanOuHistoryRows(html: string, referenceUtc: number): TitanHistoryRow[] {
-  const out: TitanHistoryRow[] = [];
-  const rowRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = rowRe.exec(html))) {
-    const cells = (match[1].match(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi) ?? []).map(stripTags);
-    const timeIndex = cells.findIndex((cell) => TITAN_HISTORY_TIME_RE.test(cell));
-    if (timeIndex < 3 || timeIndex + 1 >= cells.length) continue;
-    const parts = cells[timeIndex].match(TITAN_HISTORY_TIME_RE);
-    if (!parts) continue;
-    const timestamp = inferTitanHistoryTimestamp(
-      Number(parts[1]),
-      Number(parts[2]),
-      Number(parts[3]),
-      Number(parts[4]),
-      referenceUtc,
-    );
-    if (timestamp === null) continue;
-    const overHk = Number(cells[timeIndex - 3]);
-    const underHk = Number(cells[timeIndex - 1]);
-    if (!Number.isFinite(overHk) || !Number.isFinite(underHk)) continue;
-    // A closed (封) tick renders as one colspan cell, so the neighbouring cells
-    // are the match minute / score instead of a price triple. Requiring a
-    // parsable line is what keeps those rows out.
-    const line = parseTitanTotalCell(cells[timeIndex - 2]);
-    if (line === null) continue;
-    const status = cells[timeIndex + 1].trim();
-    out.push({
-      timestamp,
-      line,
-      overHk,
-      underHk,
-      status,
-      prematch: TITAN_PREMATCH_STATUSES.has(status),
-    });
-  }
-  return out.sort((a, b) => a.timestamp - b.timestamp);
-}
-
-/**
- * The bookmaker label a changeDetail page belongs to. titan carries it in the
- * chart iframe (`company=平*`), which lets the caller VERIFY by name that the
- * numeric company id it requested really is Pinnacle / Crown instead of
- * trusting the id blindly.
- */
-export function parseTitanHistoryCompany(html: string): string {
-  const iframe = html.match(/chartFlash\.aspx\?[^"']*company=([^&"']*)/i);
-  if (!iframe) return "";
-  try {
-    return stripTags(decodeURIComponent(iframe[1].replace(/\+/g, " ")));
-  } catch {
-    // titan does not percent-encode the Chinese label, so a stray % is possible.
-    return stripTags(iframe[1]);
-  }
 }
 
 /**
@@ -647,33 +508,6 @@ export class PinnacleProvider {
       append(current, "OU", parseCrownAsianTriple(ou.value), now);
     }
     return { opening, current, sourceUrls };
-  }
-
-  /**
-   * OU 「變化时间」 history for ONE bookmaker on ONE fixture.
-   *
-   * `companyId` is only a request hint: the returned `company` label lets the
-   * caller verify by NAME that it really got the book it asked for, keeping the
-   * "never identify Pinnacle by company id" rule intact. An unknown / absent
-   * bookmaker simply yields an empty row list instead of throwing.
-   */
-  async fetchTitanOuHistory(
-    sId: string,
-    companyId: string,
-    referenceUtc: number,
-  ): Promise<TitanHistoryPage> {
-    const sourceUrl = `${VIP}/changeDetail/overunder.aspx?id=${sId}&companyid=${companyId}&l=0`;
-    const html = await fetchText(sourceUrl, {
-      charset: "gb18030",
-      timeoutMs: 20_000,
-      retries: 0,
-      headers: { Referer: `${VIP}/OverDown_n.aspx?id=${sId}&l=0` },
-    });
-    return {
-      company: parseTitanHistoryCompany(html),
-      rows: parseTitanOuHistoryRows(html, referenceUtc),
-      sourceUrl,
-    };
   }
 
   private async fetchTitanPrices(sId: string): Promise<ProviderPrice[]> {

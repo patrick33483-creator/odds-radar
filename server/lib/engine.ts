@@ -23,13 +23,12 @@
  * bookmaker for Pinnacle.
  */
 
-import { isCrownBookmakerName, PinnacleProvider, type TitanHistoryRow } from "../providers/pinnacle";
-import { idHint as pinnacleTitanIdHint, isPinnacleName } from "../providers/pinnacle-names";
+import { PinnacleProvider } from "../providers/pinnacle";
 import { OpticOddsProvider } from "../providers/opticodds";
 import { PinnapiProvider, type PinnapiFixture } from "../providers/pinnapi";
 import { HkjcProvider } from "../providers/hkjc";
 import type { ProviderPrice } from "../providers/types";
-import { formatLine, hkToDecimal, isSameHandicapRoad, lineKeyOf } from "./lines";
+import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb, isArbitrageTotal } from "./arb";
 import { evaluateEv, EV_THRESHOLD, HKJC_FIXED_STAKE, isSafe, MIN_MAPPING_CONFIDENCE, selectBestEv, STALE_MS } from "./ev";
@@ -43,25 +42,14 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
-import {
-  BACKFILL_STAGES,
-  captureResearchTimelinePrices,
-  researchStageFor,
-  researchStageWindow,
-  saveCrownResearchInitialSnapshots,
-  saveResearchStageBackfill,
-  selectStageHistoryRow,
-  type BackfillStage,
-} from "./research";
+import { captureResearchTimelinePrices, researchStageFor, saveCrownResearchInitialSnapshots } from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
-import { notifyOuSignalCoverageGap } from "./ou-coverage-monitor";
 import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
   createWikidataEntityLookup,
   WikidataLookupBudgetExhaustedError,
 } from "./wikidataTranslation";
 import {
-  AUTO_SCAN_CHECK_MS,
   isSimulationPurchaseWindow,
   isPrewarmWindow,
   autoScanEnabled,
@@ -147,38 +135,6 @@ export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
  * during the T5 window.
  */
 export const CROWN_RESEARCH_LOOP_MS = 10_000;
-/**
- * The rescue pass reads history pages that stay available for hours, so it is
- * the one part of the tick that is safe to cut short. It is therefore given a
- * small slice and, more importantly, is additionally clamped to whatever time
- * is actually left in the 30-second tick (see runResearchTimelineTick): live
- * capture never waits behind a backfill.
- */
-export const CROWN_RESCUE_LOOP_MS = 6_000;
-/** Below this, one fixture cannot finish — skip instead of starting a fetch. */
-export const CROWN_RESCUE_MIN_BUDGET_MS = 1_500;
-
-/**
- * Books worth rescuing, each identified by NAME on the returned page.
- * Pinnacle is mandatory (the OU signal is defined on `provider='pinnacle'`
- * rows); Crown is best-effort and simply yields nothing when it has no board.
- */
-const CROWN_RESCUE_PROVIDERS: ReadonlyArray<{
-  name: "pinnacle" | "crown";
-  companyId: string;
-  matches: (company: string) => boolean;
-}> = [
-  { name: "pinnacle", companyId: pinnacleTitanIdHint(), matches: isPinnacleName },
-  { name: "crown", companyId: "3", matches: isCrownBookmakerName },
-];
-
-/** One rescued history tick -> the O/U price pair the signal path consumes. */
-function crownRescuePrices(row: TitanHistoryRow): ProviderPrice[] {
-  return [
-    { market: "OU", selection: "O", lineValue: row.line, decimalOdds: hkToDecimal(row.overHk), isMain: true },
-    { market: "OU", selection: "U", lineValue: row.line, decimalOdds: hkToDecimal(row.underHk), isMain: true },
-  ];
-}
 
 export type PinnacleResearchTarget = {
   matchId: string;
@@ -236,13 +192,6 @@ export type PendingCrownResearchTarget = CrownResearchTarget & {
  * target list can be thousands of rows. Only fixtures that still owe work are
  * worth a provider call, and a due milestone always outranks an opening: the
  * opening page stays available long after kickoff, a T5 checkpoint does not.
- *
- * Within the milestone group the checkpoint nearest kickoff is served first —
- * T5 > T15 > T30 — exactly like prioritizePendingPinnacleResearchTargets. A
- * kickoff-only sort was merely an approximation of that: it broke down as soon
- * as a fixture's own stage clock and its kickoff order disagreed (a T5 target
- * kicking off later than an untouched T30 target), and a missed T5 window can
- * never be re-observed live while a T30 one still has minutes of slack.
  */
 export function prioritizeCrownResearchTargets(
   targets: CrownResearchTarget[],
@@ -266,17 +215,8 @@ export function prioritizeCrownResearchTargets(
     })
     .sort((a, b) =>
       (a.reason === b.reason ? 0 : a.reason === "milestone" ? -1 : 1)
-      || CROWN_STAGE_PRIORITY[a.stage ?? "none"] - CROWN_STAGE_PRIORITY[b.stage ?? "none"]
       || a.kickoffUtc - b.kickoffUtc);
 }
-
-/** Nearest-kickoff checkpoint first; "none" is an opening-only target. */
-const CROWN_STAGE_PRIORITY: Record<"T5" | "T15" | "T30" | "none", number> = {
-  T5: 0,
-  T15: 1,
-  T30: 2,
-  none: 3,
-};
 
 /** Merge a Crown-first alias into the later HKJC canonical fixture atomically. */
 export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): boolean {
@@ -459,13 +399,6 @@ export class RadarEngine {
   private scanning = false;
   private matchRefreshes = new Map<string, Promise<MatchRefreshResponse>>();
   private pinnacleTranslationRefreshRunning = false;
-  /**
-   * `matchId|provider` pairs whose titan history page held no usable pre-match
-   * tick (or belonged to another bookmaker). Re-asking is pure waste, and the
-   * set stays small because the rescue pass only ever looks at a three-hour
-   * kickoff window.
-   */
-  private rescueExhausted = new Set<string>();
   // The board is a read-only projection.  Build it after a refresh and reuse
   // that immutable object for API polls so a busy provider/scan cannot make a
   // client request synchronously rebuild every market calculation.
@@ -1251,167 +1184,6 @@ export class RadarEngine {
   }
 
   /**
-   * Rescue path: rebuild missed T30/T15/T5 OU checkpoints from titan007 history.
-   *
-   * WHY this exists. Crown-only ingestion is throughput-bound: one fixture costs
-   * two sequential titan round trips (~5 s), so a 10-second slice clears about
-   * two fixtures per 30-second tick. A slate of a few hundred pending Crown-only
-   * fixtures therefore needs far longer to sweep once than the 15-minute T-30
-   * window lasts, and a missed checkpoint kills the whole OU signal for that
-   * fixture (三段缺一段就健局).
-   *
-   * WHY it can work after the fact. `changeDetail/overunder.aspx` keeps the
-   * 「變化时间」 table — every quote change with its timestamp — long after
-   * kickoff. Re-reading it lets a stage be reconstructed from the tick that was
-   * actually standing during that stage window, so real-time capture stops being
-   * the only chance.
-   *
-   * Safety: additive only (`INSERT OR IGNORE`, `origin='backfill'`), Crown-only
-   * fixtures only (HKJC fixtures keep their untouched code path), pre-match ticks
-   * only, bounded by its own deadline, and every failure is swallowed so a
-   * rescue problem can never break the tick.
-   */
-  async rescueCrownStageBackfill(
-    now = Date.now(),
-    deadlineAt = Date.now() + CROWN_RESCUE_LOOP_MS,
-  ): Promise<{ fixtures: number; fetched: number; failed: number; stages: number; rows: number }> {
-    const empty = { fixtures: 0, fetched: 0, failed: 0, stages: 0, rows: 0 };
-    if (deadlineAt - Date.now() < CROWN_RESCUE_MIN_BUDGET_MS) return empty;
-    const from = now - 60 * 60_000;
-    const to = now + 120 * 60_000;
-    const fixtures = rawDb.prepare(
-      `SELECT id,titan_id,kickoff_utc FROM matches
-        WHERE fixture_source='crown' AND titan_id IS NOT NULL
-          AND kickoff_utc BETWEEN ? AND ?
-        ORDER BY kickoff_utc`,
-    ).all(from, to) as Array<{ id: string; titan_id: string; kickoff_utc: number }>;
-    if (!fixtures.length) return empty;
-
-    // One range-scoped query instead of a per-fixture lookup: a stage counts as
-    // held when the same provider already has BOTH sides of one OU line.
-    const held = new Set(
-      (rawDb.prepare(
-        `SELECT s.match_id,s.provider,s.stage
-           FROM research_timeline_snapshots s
-           JOIN matches m ON m.id=s.match_id
-          WHERE m.fixture_source='crown' AND m.kickoff_utc BETWEEN ? AND ?
-            AND s.market='OU' AND s.stage IN ('T30','T15','T5')
-            AND s.selection IN ('O','U')
-          GROUP BY s.match_id,s.provider,s.stage,s.line_key
-         HAVING COUNT(DISTINCT s.selection)>=2`,
-      ).all(from, to) as Array<{ match_id: string; provider: string; stage: string }>)
-        .map((row) => `${row.match_id}|${row.provider}|${row.stage}`),
-    );
-
-    let fetched = 0;
-    let failed = 0;
-    let stages = 0;
-    let rows = 0;
-    let considered = 0;
-    const touched: string[] = [];
-    for (const fixture of fixtures) {
-      if (Date.now() > deadlineAt) break;
-      // Only a CLOSED window is rescuable: a still-open one is the live
-      // collector's job and must not be frozen from history early.
-      const pending = BACKFILL_STAGES.filter(
-        (stage) => now >= researchStageWindow(stage, fixture.kickoff_utc).to,
-      );
-      const needed = CROWN_RESCUE_PROVIDERS
-        .map((provider) => ({
-          provider,
-          stages: pending.filter((stage) => !held.has(`${fixture.id}|${provider.name}|${stage}`)),
-        }))
-        // A book that answered with nothing usable will keep answering with
-        // nothing (Crown simply has no board on many fixtures). Without this
-        // the same dead lookup would burn the budget on every single tick and
-        // starve fixtures that are still recoverable.
-        .filter((entry) => entry.stages.length && !this.rescueExhausted.has(`${fixture.id}|${entry.provider.name}`));
-      if (!needed.length) continue;
-      considered++;
-      let recovered = 0;
-      // Both books' history pages are independent GETs: run them together so a
-      // fixture costs one round trip, not one per bookmaker.
-      const pages = await Promise.allSettled(needed.map((entry) =>
-        this.pinnacle.fetchTitanOuHistory(fixture.titan_id, entry.provider.companyId, fixture.kickoff_utc)));
-      for (const [index, page] of pages.entries()) {
-        const entry = needed[index];
-        if (page.status === "rejected") {
-          failed++;
-          log("crown_stage_rescue_fetch_error", {
-            titanId: fixture.titan_id,
-            provider: entry.provider.name,
-            error: (page.reason as Error)?.message ?? "unknown",
-          });
-          continue;
-        }
-        fetched++;
-        // Identify the bookmaker by NAME. The company id is only the request
-        // hint, so a titan re-numbering can never silently substitute a book.
-        if (!entry.provider.matches(page.value.company)) {
-          this.rescueExhausted.add(`${fixture.id}|${entry.provider.name}`);
-          log("crown_stage_rescue_company_mismatch", {
-            titanId: fixture.titan_id,
-            provider: entry.provider.name,
-            company: page.value.company,
-          });
-          continue;
-        }
-        if (!page.value.rows.some((row) => row.prematch)) {
-          this.rescueExhausted.add(`${fixture.id}|${entry.provider.name}`);
-          continue;
-        }
-        for (const stage of entry.stages) {
-          const pick = selectStageHistoryRow(page.value.rows, fixture.kickoff_utc, stage);
-          if (!pick) continue;
-          const inserted = saveResearchStageBackfill(
-            fixture.id,
-            entry.provider.name,
-            stage,
-            crownRescuePrices(pick.row),
-            fixture.kickoff_utc,
-            pick.row.timestamp,
-            { name: `titan007-history-${entry.provider.name}`, matchId: fixture.titan_id, url: page.value.sourceUrl },
-          );
-          if (!inserted) continue;
-          rows += inserted;
-          stages++;
-          recovered++;
-          log("crown_stage_rescued", {
-            matchId: fixture.id,
-            provider: entry.provider.name,
-            stage,
-            inWindow: pick.inWindow,
-            capturedAt: pick.row.timestamp,
-          });
-        }
-      }
-      if (recovered) touched.push(fixture.id);
-    }
-
-    // A rescued T5 is worthless if nobody is told: re-run the OU notify path for
-    // exactly the fixtures this pass repaired.
-    if (touched.length) {
-      try {
-        const prealerts = unsentOuPrealerts(touched);
-        const sent = await notifyOuPrealerts(prealerts);
-        if (sent) log("telegram_ou_t30_prealerts_crown_rescue", { detected: prealerts.length, sent });
-      } catch (err) {
-        log("telegram_ou_t30_prealert_crown_rescue_error", { error: (err as Error).message });
-      }
-      try {
-        const signals = unsentOuSignals(touched);
-        const sent = await notifyOuSignals(signals);
-        if (sent) log("telegram_ou_signals_crown_rescue", { detected: signals.length, sent });
-      } catch (err) {
-        log("telegram_ou_signal_crown_rescue_error", { error: (err as Error).message });
-      }
-    }
-
-    log("crown_stage_rescue", { fixtures: considered, fetched, failed, stages, rows });
-    return { fixtures: considered, fetched, failed, stages, rows };
-  }
-
-  /**
    * Run one bounded translation backfill batch against the given fixtures.
    * Intended to be invoked from an independent low-frequency scheduler — NOT
    * from the research timeline. Respects a per-run `maxFixtures` cap so a
@@ -2116,7 +1888,6 @@ export class RadarEngine {
    * scanner must never wait behind a separate provider's research backlog.
    */
   async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
-    const tickStartedAt = Date.now();
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
     // Pinnacle-only research runs after the shared fixture cache is warm.
@@ -2134,25 +1905,6 @@ export class RadarEngine {
       await this.refreshCrownOnlyResearch();
     } catch (err) {
       log("crown_only_research_error", { error: (err as Error).message });
-    }
-    // Rescue runs last and only on the tick's leftover time: live capture has
-    // absolute priority, and a skipped rescue costs nothing because history
-    // pages survive for hours.
-    try {
-      const leftover = tickStartedAt + AUTO_SCAN_CHECK_MS - Date.now();
-      await this.rescueCrownStageBackfill(
-        Date.now(),
-        Date.now() + Math.min(CROWN_RESCUE_LOOP_MS, Math.max(0, leftover)),
-      );
-    } catch (err) {
-      log("crown_stage_rescue_error", { error: (err as Error).message });
-    }
-    // Coverage watchdog: report fixtures whose OU signal is dead because a
-    // stage is missing, so a silent gap becomes a visible alert.
-    try {
-      await notifyOuSignalCoverageGap(Date.now());
-    } catch (err) {
-      log("ou_coverage_monitor_error", { error: (err as Error).message });
     }
     return { selected: 0, detailCalls: 0 };
   }
