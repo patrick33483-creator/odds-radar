@@ -1,0 +1,65 @@
+name: 列已完場但無賽果
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 由幾多小時前起計
+        required: false
+        default: "72"
+
+jobs:
+  list:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 列
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          HOURS_BACK: ${{ github.event.inputs.hours_back }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "HOURS_BACK='$HOURS_BACK' sudo -E python3 -" <<'PY'
+          import datetime, os, sqlite3
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          hb = int(os.environ.get("HOURS_BACK", "72"))
+          now_ms = int(datetime.datetime.now(hkt).timestamp() * 1000)
+          # 假設一場最多 3 小時完場：kickoff + 3h < now
+          finished_before = now_ms - 3 * 3600 * 1000
+          window_start = now_ms - hb * 3600 * 1000
+          rows = db.execute(
+              """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc, m.fixture_source,
+                        r.home_score IS NULL AS no_res
+                   FROM matches m
+                   LEFT JOIN research_results r ON r.match_id = m.id
+                  WHERE m.kickoff_utc >= ? AND m.kickoff_utc <= ?
+                    AND (r.match_id IS NULL OR r.home_score IS NULL)
+                  ORDER BY m.kickoff_utc DESC""",
+              (window_start, finished_before),
+          ).fetchall()
+          print(f"共 {len(rows)} 場已完場但無賽果 (過去 {hb}h)：")
+          # 按日分組
+          from collections import defaultdict
+          by_day = defaultdict(list)
+          for r in rows:
+              t = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt)
+              by_day[t.strftime("%m-%d %a")].append(
+                  f"  {t.strftime('%H:%M')}HKT  [{r['home_team']}] vs [{r['away_team']}]  ({r['fixture_source']})"
+              )
+          for day in sorted(by_day.keys(), reverse=True):
+              print(f"\n== {day} ({len(by_day[day])} 場) ==")
+              for line in by_day[day]:
+                  print(line)
+          db.close()
+          PY
