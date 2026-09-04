@@ -39,8 +39,7 @@ jobs:
           finished_before = now_ms - 3 * 3600 * 1000
           window_start = now_ms - hb * 3600 * 1000
           rows = db.execute(
-              """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc, m.fixture_source,
-                        r.home_score IS NULL AS no_res
+              """SELECT m.id, m.home_team, m.away_team, m.kickoff_utc, m.fixture_source
                    FROM matches m
                    LEFT JOIN research_results r ON r.match_id = m.id
                   WHERE m.kickoff_utc >= ? AND m.kickoff_utc <= ?
@@ -48,6 +47,9 @@ jobs:
                   ORDER BY m.kickoff_utc DESC""",
               (window_start, finished_before),
           ).fetchall()
+          # 只留中文名（至少一邊含中文字）
+          def has_cjk(s): return any('\u4e00' <= c <= '\u9fff' for c in s)
+          rows = [r for r in rows if has_cjk(r["home_team"]) or has_cjk(r["away_team"])]
           print(f"共 {len(rows)} 場已完場但無賽果 (過去 {hb}h)：")
           # 按日分組
           from collections import defaultdict
