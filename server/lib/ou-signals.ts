@@ -79,6 +79,7 @@ interface StoredPrealertRow {
   direction_path: string;
   initial_selected_odds: number;
   t30_selected_odds: number;
+  initial_signal_odds: number | null;
   signal_t30_odds: number;
   detected_at: number;
   notified_at: number | null;
@@ -316,6 +317,11 @@ function matchesSelectedT5Odds(rule: OuSignalRule, selectedT5Odds: number): bool
   return true;
 }
 
+function ruleDriftSide(rule: OuSignalRule): Side {
+  const side = rule.directionPath.split("→").at(-1);
+  return side === "O" || side === "U" ? side : rule.signalSelection;
+}
+
 export interface OuRuleT5OddsRange {
   min: number;
   minInclusive: boolean;
@@ -325,12 +331,12 @@ export interface OuRuleT5OddsRange {
 
 /**
  * Return the exact T-5 price interval that can satisfy a rule for a given
- * initial selected-side price. All observations also require the selected
+ * initial signal-side price. All observations also require the selected
  * price at every checkpoint to be strictly above 1.70.
  */
 export function ouRuleT5OddsRange(
   rule: OuSignalRule,
-  initialSelectedOdds: number,
+  initialSignalOdds: number,
 ): OuRuleT5OddsRange | null {
   let min = 1.7;
   let minInclusive = false;
@@ -362,13 +368,13 @@ export function ouRuleT5OddsRange(
   }
 
   if (rule.driftBucket === "收水 0.05–0.10") {
-    raiseMin(initialSelectedOdds - 0.1, false);
-    lowerMax(initialSelectedOdds - 0.05, true);
+    raiseMin(initialSignalOdds - 0.1, false);
+    lowerMax(initialSignalOdds - 0.05, true);
   } else if (rule.driftBucket === "收水 0.10–0.20") {
-    raiseMin(initialSelectedOdds - 0.2, false);
-    lowerMax(initialSelectedOdds - 0.1, true);
+    raiseMin(initialSignalOdds - 0.2, false);
+    lowerMax(initialSignalOdds - 0.1, true);
   } else if (rule.driftBucket === "持平或拉闊") {
-    raiseMin(initialSelectedOdds, true);
+    raiseMin(initialSignalOdds, true);
   }
 
   if (
@@ -494,8 +500,14 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
     `INSERT OR IGNORE INTO ou_signal_prealerts(
        unique_key,match_id,provider,rule_id,line_key,direction_path,
        initial_line_key,t30_line_key,line_path,evaluator_version,
-       initial_selected_odds,t30_selected_odds,signal_t30_odds,detected_at,notified_at
-     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+       initial_selected_odds,t30_selected_odds,initial_signal_odds,
+       signal_t30_odds,detected_at,notified_at
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+  );
+  const backfillSignalOdds = rawDb.prepare(
+    `UPDATE ou_signal_prealerts
+        SET initial_signal_odds=?
+      WHERE unique_key=? AND initial_signal_odds IS NULL`,
   );
   let inserted = 0;
   const tx = rawDb.transaction(() => {
@@ -515,19 +527,25 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
       const version = evaluatorVersion([initial.lineKey, t30.lineKey]);
       const detectedAt = Math.max(...[...t30.rows.values()].map((row) => row.captured_at));
       const rules = (T30_RULES_BY_PREFIX.get(`${provider}|${path}`) ?? [])
-        .filter((rule) =>
-          matchesLine(rule, t30.lineKey)
-          && (version === "same-line-v1" || rule.driftBucket === "任何水位走勢")
-          && ouRuleT5OddsRange(rule, decisions[0]!.odds) !== null
-          && (rule.activatedAt === undefined || detectedAt >= rule.activatedAt)
-        );
+        .filter((rule) => {
+          // Final evaluation measures drift on the eventual T-5 selected side
+          // (the last direction in the rule), which differs from the buy side
+          // for reverse rules.
+          const initialSignalOdds = initial.rows.get(ruleDriftSide(rule))?.decimal_odds;
+          return initialSignalOdds !== undefined
+            && matchesLine(rule, t30.lineKey)
+            && (version === "same-line-v1" || rule.driftBucket === "任何水位走勢")
+            && ouRuleT5OddsRange(rule, initialSignalOdds) !== null
+            && (rule.activatedAt === undefined || detectedAt >= rule.activatedAt);
+        });
       for (const rule of rules) {
+        const initialSignalOdds = initial.rows.get(ruleDriftSide(rule))?.decimal_odds;
         const signalT30Odds = t30.rows.get(rule.signalSelection)?.decimal_odds;
-        if (signalT30Odds === undefined) continue;
+        if (initialSignalOdds === undefined || signalT30Odds === undefined) continue;
         const uniqueKey = uniqueSignalKey(
           matchId, provider, t30.lineKey, rule.id, version, linePath, "T30",
         );
-        inserted += insert.run(
+        const changes = insert.run(
           uniqueKey,
           matchId,
           provider,
@@ -540,9 +558,14 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
           version,
           decisions[0]!.odds,
           decisions[1]!.odds,
+          initialSignalOdds,
           signalT30Odds,
           detectedAt,
         ).changes;
+        inserted += changes;
+        // A prealert created by the former formula may already own this key.
+        // Fill it only after the corrected rule feasibility check succeeds.
+        if (changes === 0) backfillSignalOdds.run(initialSignalOdds, uniqueKey);
       }
     }
   });
@@ -729,6 +752,7 @@ function toPrealert(row: StoredPrealertRow): OuSignalPrealert {
     mode: rule.mode,
     initialSelectedOdds: row.initial_selected_odds,
     t30SelectedOdds: row.t30_selected_odds,
+    initialSignalOdds: row.initial_signal_odds,
     signalT30Odds: row.signal_t30_odds,
     detectedAt: row.detected_at,
     notifiedAt: row.notified_at,
@@ -838,6 +862,9 @@ export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
   ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
   return rows
     .map(toPrealert)
+    // A legacy row stays null when it cannot be revalidated from its immutable
+    // initial snapshot. Never send that potentially false-positive candidate.
+    .filter((row) => row.initialSignalOdds !== null)
     .filter((row) => !OU_T30_TG_DISABLED_RULE_IDS.has(row.ruleId));
 }
 

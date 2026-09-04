@@ -77,6 +77,7 @@ describe("Radar OU Telegram message", () => {
       mode: "reverse",
       initialSelectedOdds: 1.8,
       t30SelectedOdds: 1.82,
+      initialSignalOdds: 1.8,
       signalT30Odds: 1.96,
       detectedAt: Date.now(),
       notifiedAt: null,
@@ -89,5 +90,40 @@ describe("Radar OU Telegram message", () => {
     expect(text).toContain("前瞻命中：");
     expect(text).not.toContain("同線 3.5");
     expect(text).not.toContain("心理準備");
+  });
+
+  it("renders the signal-side initial price and exact drift formula for U→O", () => {
+    const prealert: OuSignalPrealert = {
+      uniqueKey: "prealert:signal-side",
+      matchId: "signal-side",
+      league: "測試聯賽",
+      homeTeam: "主隊",
+      awayTeam: "客隊",
+      kickoffUtc: Date.UTC(2026, 8, 2, 13),
+      provider: "pinnacle",
+      providerLabel: "Pinnacle／平博",
+      ruleId: "pinnacle-uoo-short-005-010",
+      lineKey: "2.5",
+      initialLineKey: "2.5",
+      t30LineKey: "2.5",
+      linePath: "2.5→2.5",
+      evaluatorVersion: "same-line-v1",
+      directionPath: "U→O",
+      signalSelection: "O",
+      mode: "direct",
+      initialSelectedOdds: 1.710,
+      t30SelectedOdds: 1.780,
+      initialSignalOdds: 1.840,
+      signalT30Odds: 1.780,
+      detectedAt: Date.now(),
+      notifiedAt: null,
+    };
+
+    const text = buildOuPrealertMessage(prealert);
+    expect(text).toContain("低水方賠率：初盤 1.710 → T-30 1.780");
+    expect(text).toContain("訊號邊初盤：大球 2.5 @ 1.840");
+    expect(text).toContain("條件公式：初盤大球 1.840 − T-5 大球；差值 ≥ 0.050 且 < 0.100");
+    expect(text).toContain("條件 T-5 大球賠率範圍：> 1.740 且 ≤ 1.790");
+    expect(text).not.toContain("條件 T-5 大球賠率範圍：> 1.700");
   });
 });

@@ -7,6 +7,7 @@ process.env.RADAR_DB = dbPath;
 let rawDb: typeof import("../server/lib/store").rawDb;
 let markOuPrealertNotified: typeof import("../server/lib/ou-signals").markOuPrealertNotified;
 let markOuSignalNotified: typeof import("../server/lib/ou-signals").markOuSignalNotified;
+let ouRuleT5OddsRange: typeof import("../server/lib/ou-signals").ouRuleT5OddsRange;
 let ouSignalDataset: typeof import("../server/lib/ou-signals").ouSignalDataset;
 let syncOuSignalObservations: typeof import("../server/lib/ou-signals").syncOuSignalObservations;
 let syncOuSignalPrealerts: typeof import("../server/lib/ou-signals").syncOuSignalPrealerts;
@@ -20,6 +21,7 @@ beforeAll(async () => {
   rawDb = store.rawDb;
   markOuPrealertNotified = signals.markOuPrealertNotified;
   markOuSignalNotified = signals.markOuSignalNotified;
+  ouRuleT5OddsRange = signals.ouRuleT5OddsRange;
   ouSignalDataset = signals.ouSignalDataset;
   syncOuSignalObservations = signals.syncOuSignalObservations;
   syncOuSignalPrealerts = signals.syncOuSignalPrealerts;
@@ -159,23 +161,32 @@ describe("OU signal monitor", () => {
     expect(syncOuSignalObservations(["threshold-fail"])).toBe(0);
   });
 
-  it("keeps feasible T-30 candidates, drops impossible ranges and suppresses disabled Telegram rules", () => {
-    expect(syncOuSignalPrealerts()).toBe(6);
+  it("keeps feasible T-30 candidates and suppresses disabled Telegram rules", () => {
+    expect(syncOuSignalPrealerts()).toBe(7);
     expect(syncOuSignalPrealerts()).toBe(0);
     const rows = rawDb.prepare(
-      "SELECT unique_key,match_id,rule_id,signal_t30_odds,detected_at FROM ou_signal_prealerts ORDER BY match_id",
+      `SELECT unique_key,match_id,rule_id,initial_signal_odds,
+              signal_t30_odds,detected_at
+         FROM ou_signal_prealerts ORDER BY match_id`,
     ).all() as Array<{
       unique_key: string;
       match_id: string;
       rule_id: string;
+      initial_signal_odds: number;
       signal_t30_odds: number;
       detected_at: number;
     }>;
-    expect(rows).toHaveLength(6);
+    expect(rows).toHaveLength(7);
     expect(rows.find((row) =>
       row.match_id === "ouu-reverse"
       && row.rule_id === "pinnacle-ouu-short-010-020-reverse",
-    )).toBeUndefined();
+    )).toMatchObject({ initial_signal_odds: 1.95 });
+    // Reverse buy side is U, but final drift is evaluated on the path's T-5
+    // selected side O. Prealert must use that same initial O price.
+    expect(rows.find((row) =>
+      row.match_id === "ooo-reverse"
+      && row.rule_id === "hkjc-ooo-flat-wide-reverse",
+    )?.initial_signal_odds).toBe(1.8);
 
     const earliest = Math.min(...rows.map((row) => row.detected_at));
     rawDb.prepare(
@@ -193,6 +204,82 @@ describe("OU signal monitor", () => {
     );
     markOuPrealertNotified(pending[0].uniqueKey, Date.now());
     expect(unsentOuPrealerts()).toHaveLength(1);
+  });
+
+  it("uses the rule signal-side initial odds for a U→O prealert range", () => {
+    const now = afterWatchActivation + 45 * 60_000;
+    addMatch("prealert-signal-side", now + 30 * 60_000);
+    // Initial U is the low side, but this rule's signal and drift side is O.
+    // Using 1.710 (the former bug) makes the range impossible after the global
+    // >1.70 floor; using initial O 1.840 yields (>1.740, <=1.790).
+    addStage("prealert-signal-side", "pinnacle", "initial", "2.5", 1.840, 1.710, now - 25 * 60_000);
+    addStage("prealert-signal-side", "pinnacle", "T30", "2.5", 1.780, 1.950, now - 20 * 60_000);
+
+    expect(syncOuSignalPrealerts(["prealert-signal-side"])).toBe(1);
+    expect(
+      rawDb.prepare(
+        `SELECT rule_id,initial_selected_odds,initial_signal_odds,signal_t30_odds
+           FROM ou_signal_prealerts WHERE match_id=?`,
+      ).get("prealert-signal-side"),
+    ).toMatchObject({
+      rule_id: "pinnacle-uoo-short-005-010",
+      initial_selected_odds: 1.710,
+      initial_signal_odds: 1.840,
+      signal_t30_odds: 1.780,
+    });
+    rawDb.prepare(
+      "UPDATE ou_signal_prealerts SET initial_signal_odds=NULL WHERE match_id=?",
+    ).run("prealert-signal-side");
+    expect(syncOuSignalPrealerts(["prealert-signal-side"])).toBe(0);
+    expect(
+      (rawDb.prepare(
+        "SELECT initial_signal_odds FROM ou_signal_prealerts WHERE match_id=?",
+      ).get("prealert-signal-side") as { initial_signal_odds: number }).initial_signal_odds,
+    ).toBe(1.840);
+  });
+
+  it("matches the 0.05–0.10 final gap endpoints exactly", () => {
+    const rule = OU_SIGNAL_RULES.find((row) => row.id === "pinnacle-uoo-short-005-010")!;
+    const range = ouRuleT5OddsRange(rule, 1.840);
+    expect(range).not.toBeNull();
+    expect(range!.min).toBeCloseTo(1.740, 12);
+    expect(range!.minInclusive).toBe(false);
+    expect(range!.max).toBeCloseTo(1.790, 12);
+    expect(range!.maxInclusive).toBe(true);
+
+    // Keep the shared-suite activation fixture timestamp aligned with the
+    // original observation cohort; this test is about price endpoints.
+    const now = afterWatchActivation;
+    addPath("prealert-lower-excluded", "pinnacle", {
+      initial: [1.840, 1.710],
+      T30: [1.780, 1.950],
+      T5: [1.740, 1.950],
+    }, now);
+    addPath("prealert-upper-included", "pinnacle", {
+      initial: [1.840, 1.710],
+      T30: [1.780, 1.950],
+      T5: [1.790, 1.950],
+    }, now);
+
+    expect(syncOuSignalObservations(["prealert-lower-excluded"])).toBe(0);
+    expect(syncOuSignalObservations(["prealert-upper-included"])).toBe(1);
+    expect(
+      rawDb.prepare(
+        "SELECT rule_id,odds_gap FROM ou_signal_observations WHERE match_id=?",
+      ).get("prealert-upper-included"),
+    ).toMatchObject({
+      rule_id: "pinnacle-uoo-short-005-010",
+      odds_gap: 0.05,
+    });
+    rawDb.prepare(
+      "DELETE FROM ou_signal_observations WHERE match_id IN ('prealert-lower-excluded','prealert-upper-included')",
+    ).run();
+    rawDb.prepare(
+      "DELETE FROM research_timeline_snapshots WHERE match_id IN ('prealert-lower-excluded','prealert-upper-included')",
+    ).run();
+    rawDb.prepare(
+      "DELETE FROM matches WHERE id IN ('prealert-lower-excluded','prealert-upper-included')",
+    ).run();
   });
 
   it("does not back-notify observations before activation and marks new sends idempotently", () => {

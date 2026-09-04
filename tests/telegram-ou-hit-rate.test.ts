@@ -141,6 +141,7 @@ function prealert(): OuSignalPrealert {
     mode: "reverse",
     initialSelectedOdds: 1.9,
     t30SelectedOdds: 1.8,
+    initialSignalOdds: 1.9,
     signalT30Odds: 2.05,
     detectedAt: Date.now(),
     notifiedAt: null,

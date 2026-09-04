@@ -510,6 +510,8 @@ export interface OuSignalPrealert {
   mode: OuSignalMode;
   initialSelectedOdds: number;
   t30SelectedOdds: number;
+  /** Initial price on the rule's eventual T-5 selected/drift side; null only for legacy prealerts. */
+  initialSignalOdds: number | null;
   signalT30Odds: number;
   detectedAt: number;
   notifiedAt: number | null;

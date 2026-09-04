@@ -168,7 +168,8 @@ CREATE TABLE IF NOT EXISTS ou_signal_prealerts (
   initial_line_key TEXT, t30_line_key TEXT, line_path TEXT,
   evaluator_version TEXT NOT NULL DEFAULT 'same-line-v1',
   initial_selected_odds REAL NOT NULL, t30_selected_odds REAL NOT NULL,
-  signal_t30_odds REAL NOT NULL, detected_at INTEGER NOT NULL, notified_at INTEGER);
+  initial_signal_odds REAL, signal_t30_odds REAL NOT NULL,
+  detected_at INTEGER NOT NULL, notified_at INTEGER);
 CREATE INDEX IF NOT EXISTS ou_signal_prealert_match_idx
   ON ou_signal_prealerts(match_id,detected_at);
 CREATE INDEX IF NOT EXISTS ou_signal_prealert_rule_idx
@@ -287,6 +288,11 @@ CREATE INDEX IF NOT EXISTS pinnacle_translation_entities_updated_idx
   if (!ouPrealertNames.has("line_path")) sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN line_path TEXT");
   if (!ouPrealertNames.has("evaluator_version")) {
     sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN evaluator_version TEXT NOT NULL DEFAULT 'same-line-v1'");
+  }
+  if (!ouPrealertNames.has("initial_signal_odds")) {
+    // Nullable by design: old prealerts did not retain enough information to
+    // distinguish the initial low side from the rule's T-5 drift side safely.
+    sqlite.exec("ALTER TABLE ou_signal_prealerts ADD COLUMN initial_signal_odds REAL");
   }
   sqlite.exec(`
     UPDATE ou_signal_prealerts

@@ -207,14 +207,30 @@ function boundary(value: number, inclusive: boolean, lower: boolean): string {
   return lower ? `> ${value.toFixed(3)}` : `< ${value.toFixed(3)}`;
 }
 
-function t5OddsRangeLine(rule: OuSignalRule, initialSelectedOdds: number): string {
-  const range = ouRuleT5OddsRange(rule, initialSelectedOdds);
-  if (!range) return "條件 T-5 原方向賠率範圍：按目前初盤沒有可達成範圍";
+function t5OddsRangeLine(
+  rule: OuSignalRule,
+  initialSignalOdds: number,
+  sideLabel = "原方向",
+): string {
+  const range = ouRuleT5OddsRange(rule, initialSignalOdds);
+  if (!range) return `條件 T-5 ${sideLabel}賠率範圍：按目前初盤沒有可達成範圍`;
   const lower = boundary(range.min, range.minInclusive, true);
   const upper = range.max === null
     ? ""
     : ` 且 ${boundary(range.max, range.maxInclusive, false)}`;
-  return `條件 T-5 原方向賠率範圍：${lower}${upper}`;
+  return `條件 T-5 ${sideLabel}賠率範圍：${lower}${upper}`;
+}
+
+function prealertFormulaLine(
+  rule: OuSignalRule,
+  sideLabel: string,
+  initialSignalOdds: number,
+): string {
+  const prefix = `條件公式：初盤${sideLabel} ${initialSignalOdds.toFixed(3)} − T-5 ${sideLabel}`;
+  if (rule.driftBucket === "收水 0.05–0.10") return `${prefix}；差值 ≥ 0.050 且 < 0.100`;
+  if (rule.driftBucket === "收水 0.10–0.20") return `${prefix}；差值 ≥ 0.100 且 < 0.200`;
+  if (rule.driftBucket === "持平或拉闊") return `${prefix}；差值 ≤ 0.000`;
+  return `${prefix}；水位差不限`;
 }
 
 function lineCondition(rule: OuSignalRule): string {
@@ -315,6 +331,9 @@ export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
   const initialLineKey = signal.initialLineKey ?? signal.lineKey;
   const t30LineKey = signal.t30LineKey ?? signal.lineKey;
   const linePath = signal.linePath ?? `${initialLineKey}→${t30LineKey}`;
+  const initialSignalOdds = signal.initialSignalOdds ?? null;
+  const driftSide = rule?.directionPath.split("→").at(-1) ?? signal.signalSelection;
+  const driftSideLabel = driftSide === "O" ? "大球" : "小球";
   return [
     "盤路雷達：T-30 OU 候選預警",
     `${mode}｜${signal.providerLabel}`,
@@ -323,10 +342,18 @@ export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
     `目前兩段方向：${signal.directionPath}`,
     `主盤線路：${linePath}`,
     `低水方賠率：初盤 ${signal.initialSelectedOdds.toFixed(3)} → T-30 ${signal.t30SelectedOdds.toFixed(3)}`,
+    initialSignalOdds === null
+      ? `訊號邊初盤：${driftSideLabel} ${initialLineKey}｜舊紀錄未儲存賠率`
+      : `訊號邊初盤：${driftSideLabel} ${initialLineKey} @ ${initialSignalOdds.toFixed(3)}`,
     `如果 T-5 完成條件，可能留意：${possibleBuy}｜目前 T-30 ${t30LineKey} @ ${signal.signalT30Odds.toFixed(3)}`,
     ...(rule ? [
       ruleConditionLine(rule, "候選條件"),
-      t5OddsRangeLine(rule, signal.initialSelectedOdds),
+      ...(initialSignalOdds === null
+        ? ["條件公式：舊紀錄未儲存訊號邊初盤賠率，無法重算"]
+        : [
+          prealertFormulaLine(rule, driftSideLabel, initialSignalOdds),
+          t5OddsRangeLine(rule, initialSignalOdds, driftSideLabel),
+        ]),
       historicalLine(rule),
     ] : []),
     safeHitRateLine(signal.ruleId, signal.lineKey, "prealert"),
