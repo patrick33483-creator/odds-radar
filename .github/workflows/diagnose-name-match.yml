@@ -1,0 +1,114 @@
+name: Diagnose 隊名 fuzzy match 可行性
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 對比 Crown 隊名 vs titan007 頁隊名
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo python3 -" <<'PY'
+          import datetime, sqlite3, time, urllib.request, re
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db.row_factory = sqlite3.Row
+
+          now_ms = int(time.time() * 1000)
+          cutoff = now_ms - 105 * 60 * 1000
+          lo = now_ms - 3 * 24 * 3600 * 1000
+
+          cands = db.execute(
+              """SELECT m.id, m.kickoff_utc, m.home_team, m.away_team
+                   FROM matches m
+                   LEFT JOIN research_results rr ON rr.match_id=m.id
+                  WHERE rr.match_id IS NULL AND m.kickoff_utc<=? AND m.kickoff_utc>=?
+                    AND m.fixture_source='crown'
+                  ORDER BY m.kickoff_utc DESC""",
+              (cutoff, lo),
+          ).fetchall()
+          print(f"Crown candidates (past 3d): {len(cands)}")
+
+          def strip_tags(s): return re.sub(r"<[^>]+>", "", s or "").strip()
+
+          def parse_titan_page(html):
+              rows = []
+              row_re = re.compile(r"<tr[^>]*sId=['\"]?(\d+)['\"]?[^>]*>([\s\S]*?)</tr>")
+              for m in row_re.finditer(html):
+                  sid = m.group(1)
+                  raw_cells = re.findall(r"<td[^>]*>[\s\S]*?</td>", m.group(2))
+                  if len(raw_cells) < 7: continue
+                  cells = [strip_tags(c) for c in raw_cells]
+                  time_txt = cells[1]  # e.g. "3日11:40" or "9-4 11:00"
+                  home = cells[3]
+                  away = cells[5]
+                  score_txt = cells[4]
+                  score = re.search(r"(\d+)\s*-\s*(\d+)", score_txt)
+                  # 去除 [xxx联赛第N] 尾標記
+                  home = re.sub(r"\[[^\]]*\]", "", home).strip()
+                  away = re.sub(r"\[[^\]]*\]", "", away).strip()
+                  rows.append({
+                      "sid": sid, "time": time_txt,
+                      "home": home, "away": away,
+                      "score": (int(score.group(1)), int(score.group(2))) if score else None,
+                  })
+              return rows
+
+          # 攞近 3 日嘅頁
+          all_titan = []
+          for offset in (0, 1, 2, 3):
+              d = datetime.datetime.now(hkt) - datetime.timedelta(days=offset)
+              day = d.strftime("%Y%m%d")
+              for kind in ("Over", "Next"):
+                  try:
+                      req = urllib.request.Request(
+                          f"http://bf.titan007.com/football/{kind}_{day}.htm",
+                          headers={"User-Agent":"Mozilla/5.0","Referer":"http://bf.titan007.com/"})
+                      raw = urllib.request.urlopen(req, timeout=25).read()
+                      html = raw.decode("gb18030","ignore")
+                      rows = parse_titan_page(html)
+                      scored = sum(1 for r in rows if r["score"])
+                      print(f"  {kind}_{day}: total={len(rows)} scored={scored}")
+                      for r in rows:
+                          r["src_day"] = day
+                          r["src_kind"] = kind
+                      all_titan.extend(rows)
+                  except Exception as e:
+                      print(f"  {kind}_{day}: ERR {e}")
+
+          # 建立 titan 隊名 index
+          titan_teams = {}
+          for r in all_titan:
+              titan_teams[r["home"]] = r
+              titan_teams[r["away"]] = r
+          print(f"\ntitan007 total rows: {len(all_titan)}, unique teams: {len(titan_teams)}")
+
+          # 隨機取 15 個 Crown candidate 睇隊名對唔對
+          print("\n=== Crown vs titan007 隊名對照 ===")
+          for r in cands[:15]:
+              h_hit = r["home_team"] in titan_teams
+              a_hit = r["away_team"] in titan_teams
+              day = datetime.datetime.fromtimestamp(r["kickoff_utc"]/1000, tz=hkt).strftime("%m-%d %H:%M")
+              print(f"  {day}HKT  Crown: [{r['home_team']}] vs [{r['away_team']}]  home_hit={h_hit} away_hit={a_hit}")
+
+          # 隨機幾個 titan 樣
+          print("\n=== 樣本 titan007 隊名 ===")
+          for r in all_titan[:15]:
+              sc = f"{r['score'][0]}-{r['score'][1]}" if r["score"] else "N/A"
+              print(f"  {r['src_kind']}_{r['src_day']} {r['time']}  [{r['home']}] vs [{r['away']}]  score={sc}")
+          db.close()
+          PY
