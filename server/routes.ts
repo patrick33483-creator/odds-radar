@@ -475,6 +475,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ...result, simulations: buildSimulations() });
   });
 
+  app.post("/api/research/results/collect", async (_req, res) => {
+    try {
+      if (researchResultsInFlight) {
+        const outcome = await researchResultsInFlight;
+        return res.json({ ok: true, reused_in_flight: true, ...outcome });
+      }
+      researchResultsInFlight = collectResearchResults(researchHkjc);
+      const outcome = await researchResultsInFlight;
+      researchResultsInFlight = null;
+      return res.json({ ok: true, ...outcome });
+    } catch (err) {
+      researchResultsInFlight = null;
+      return res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  });
+
   app.post("/api/simulations/clear", (req, res) => {
     const parsed = clearSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: "invalid category" });
