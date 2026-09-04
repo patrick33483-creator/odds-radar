@@ -51,6 +51,7 @@ import type { FinalResult, ProviderEvent, ProviderPrice } from "./types";
 const BF = process.env.TITAN_BF_BASE ?? "http://bf.titan007.com/football";
 const VIP = process.env.TITAN_VIP_BASE ?? "http://vip.titan007.com";
 const X2 = process.env.TITAN_1X2_BASE ?? "http://1x2d.titan007.com";
+const LIVE_DATA = process.env.TITAN_LIVE_DATA_URL ?? "https://livestatic.titan007.com/vbsxml/bfdata_ut.js";
 const HK_TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
 
 export type PinnacleStrategy = "official-api" | "titan007";
@@ -142,6 +143,55 @@ export function parseSchedulePage(html: string, yyyymmdd: string): PinnacleFixtu
       halfAway: half ? Number(half[2]) : null,
       handicapVal: hdpVal ? Number(hdpVal) : null,
       totalVal: ouVal ? Number(ouVal) : null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Parse Titan's complete live fixture feed. Unlike the static Next_ page this
+ * feed includes youth and smaller-league fixtures, while still carrying both
+ * Simplified and Traditional Chinese labels plus the stable odds-page sId.
+ *
+ * Record fields used here:
+ *  0 sId, 2/3 league SC/TC, 5/6 home SC/TC, 8/9 away SC/TC,
+ *  12 local UTC+8 kickoff tuple with a zero-based month.
+ */
+export function parseTitanLiveData(jsText: string): PinnacleFixture[] {
+  const out: PinnacleFixture[] = [];
+  const recordRe = /A\[\d+\]\s*=\s*"((?:\\.|[^"])*)"\.split\(['"]\^['"]\);/g;
+  let match: RegExpExecArray | null;
+  while ((match = recordRe.exec(jsText))) {
+    let decoded = match[1];
+    try {
+      decoded = JSON.parse(`"${match[1]}"`) as string;
+    } catch {
+      // Most records contain no escapes. Keep the raw value rather than
+      // discarding a usable fixture because one optional label is malformed.
+    }
+    const fields = decoded.split("^");
+    const providerMatchId = fields[0]?.trim();
+    const tuple = fields[12]?.split(",").map(Number) ?? [];
+    if (!providerMatchId || tuple.length < 5 || !tuple.slice(0, 5).every(Number.isFinite)) continue;
+    const [year, zeroBasedMonth, day, hour, minute, second = 0] = tuple;
+    const kickoffUtc = Date.UTC(year, zeroBasedMonth, day, hour, minute, second) - HK_TZ_OFFSET_MS;
+    const league = (fields[3] || fields[2] || "").trim();
+    const homeTeam = (fields[6] || fields[5] || "").trim();
+    const awayTeam = (fields[9] || fields[8] || "").trim();
+    if (!league || !homeTeam || !awayTeam || !Number.isFinite(kickoffUtc)) continue;
+    out.push({
+      providerMatchId,
+      league,
+      homeTeam,
+      awayTeam,
+      kickoffUtc,
+      statusText: "PREEVENT",
+      homeScore: null,
+      awayScore: null,
+      halfHome: null,
+      halfAway: null,
+      handicapVal: null,
+      totalVal: null,
     });
   }
   return out;
@@ -371,6 +421,22 @@ export class PinnacleProvider {
   private async fetchTitanFixtures(dayOffsets: number[]): Promise<PinnacleFixture[]> {
     const out: PinnacleFixture[] = [];
     const now = Date.now();
+    const requestedKeys = new Set(dayOffsets.map((off) => ymd(new Date(now + off * 86_400_000))));
+
+    // The live feed is the complete same-day universe. It includes fixtures
+    // omitted from Next_ pages (notably youth and smaller leagues), so let it
+    // win deduplication and use the static pages as future-day/backup coverage.
+    try {
+      const liveJs = await fetchText(`${LIVE_DATA}?r=007${now}`, {
+        headers: { referer: "https://live.titan007.com/" },
+        timeoutMs: 15_000,
+        retries: 1,
+      });
+      out.push(...parseTitanLiveData(liveJs).filter((fixture) => requestedKeys.has(ymd(new Date(fixture.kickoffUtc)))));
+    } catch (err) {
+      this.warn(`Titan 即時完整賽程暫時不可用 (${(err as Error).message}); 已改用靜態賽程後備`);
+    }
+
     for (const off of dayOffsets) {
       const key = ymd(new Date(now + off * 86_400_000));
       // Upcoming days live under Next_, elapsed days under Over_. Today can be

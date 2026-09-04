@@ -171,6 +171,52 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
     ).toEqual({ c: 0 });
   });
 
+  it("does not drop a Titan fixture when PinnAPI has no matching kickoff time", async () => {
+    const { RadarEngine } = await import("../server/lib/engine");
+    const kickoff = NOW + 25 * 60_000;
+    const radar = new RadarEngine();
+    (radar as any).fixtureCache = {
+      at: NOW,
+      pinnapi: [{
+        providerMatchId: "different-event",
+        league: "Different league",
+        homeTeam: "Different home",
+        awayTeam: "Different away",
+        kickoffUtc: kickoff + 4 * 60 * 60_000,
+      }],
+      optic: [],
+      titan: [{
+        providerMatchId: "3085657",
+        league: "土U19聯",
+        homeTeam: "伊斯坦堡U19",
+        awayTeam: "加拉塔沙雷U19",
+        kickoffUtc: kickoff,
+        statusText: "PREEVENT",
+        homeScore: null,
+        awayScore: null,
+        halfHome: null,
+        halfAway: null,
+        handicapVal: null,
+        totalVal: null,
+      }],
+    };
+    (radar as any).pinnacle.fetchMatchPrices = vi.fn().mockResolvedValue([
+      { market: "OU", lineValue: 3.25, isMain: true, selection: "O", decimalOdds: 1.92 },
+      { market: "OU", lineValue: 3.25, isMain: true, selection: "U", decimalOdds: 1.83 },
+    ]);
+
+    const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
+    expect(outcome.fetched).toBe(1);
+    expect((radar as any).pinnacle.fetchMatchPrices).toHaveBeenCalledWith("3085657");
+    expect(rawDb.prepare(
+      "SELECT league,home_team,away_team FROM matches WHERE id='pinnacle:titan:3085657'",
+    ).get()).toEqual({
+      league: "土U19聯",
+      home_team: "伊斯坦堡U19",
+      away_team: "加拉塔沙雷U19",
+    });
+  });
+
   it("creates a Pinnacle-only match row and captures live snapshots into T30/T15/T5 without touching execution tables", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-100", kickoff);

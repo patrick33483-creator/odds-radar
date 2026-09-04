@@ -42,6 +42,7 @@ import {
   parseCrownOpeningAsianTriple,
   parsePinnacle1X2,
   parsePinnacleAsianTriple,
+  parseTitanLiveData,
 } from "../server/providers/pinnacle";
 import { parseOpticPrices } from "../server/providers/opticodds";
 
@@ -352,6 +353,7 @@ const ASIAN_PAGE = `
 describe("Pinnacle bookmaker-row identification", () => {
   it("normalizes masked bookmaker labels", () => {
     expect(normalizeBookmakerName("平*")).toBe("平");
+    expect(normalizeBookmakerName("平*封")).toBe("平");
     expect(normalizeBookmakerName(" Pinnacle Sports ")).toBe("pinnaclesports");
   });
 
@@ -359,6 +361,7 @@ describe("Pinnacle bookmaker-row identification", () => {
     expect(isPinnacleName("Pinnacle")).toBe(true);
     expect(isPinnacleName("平博")).toBe(true);
     expect(isPinnacleName("平*")).toBe(true);
+    expect(isPinnacleName("平*封")).toBe(true);
     expect(isPinnacleName("Crow*")).toBe(false);
     expect(isPinnacleName("皇冠")).toBe(false);
     expect(isPinnacleName("36*")).toBe(false);
@@ -423,6 +426,24 @@ describe("Pinnacle bookmaker-row identification", () => {
   it("selects Crown by name in the 1X2 feed", () => {
     const js = 'var game = Array("545|1|Crown|1.83|4.05|3.45|50|22|26|92|1.56|4.65|4.50|59|20|20","177|2|Pinnacle|1.78|3.93|3.95|52|23|23|93|1.61|4.63|4.81|59|20|19");';
     expect(parseCrown1X2(js)).toEqual({ h: 1.56, d: 4.65, a: 4.5, companyId: "545" });
+  });
+});
+
+describe("Titan complete live fixture feed", () => {
+  it("keeps direct Traditional Chinese names for fixtures omitted from static schedules", () => {
+    const liveJs = [
+      'A[38]="2933131^#64ba1e^乌兹超^烏茲超^^本尤德科^賓約哥^^特尔梅兹^特爾梅茲^^21:00^2026,8,4,21,00,00^0".split(\'^\');',
+      'A[40]="3085657^#99CC00^土U19联^土U19聯^^伊斯坦布尔BBU19^伊斯坦堡U19^^加拉塔沙雷U19^加拉塔沙雷U19^^21:00^2026,8,4,21,00,00^0".split(\'^\');',
+    ].join("\n");
+    const fixtures = parseTitanLiveData(liveJs);
+    expect(fixtures).toHaveLength(2);
+    expect(fixtures[1]).toMatchObject({
+      providerMatchId: "3085657",
+      league: "土U19聯",
+      homeTeam: "伊斯坦堡U19",
+      awayTeam: "加拉塔沙雷U19",
+      kickoffUtc: Date.UTC(2026, 8, 4, 13, 0, 0),
+    });
   });
 });
 

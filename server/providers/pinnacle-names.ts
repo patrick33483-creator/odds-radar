@@ -28,6 +28,7 @@ export const BLOCKED_COMPANY_IDS = new Set(["3", "1", "545", "80"]);
 export function normalizeBookmakerName(raw: string): string {
   return raw
     .replace(/&nbsp;/g, " ")
+    .replace(/\s*封\s*$/g, "") // Titan appends 封 after the masking star when closed
     .replace(/[\uFF0A*]+$/g, "") // trailing masking star (half or full width)
     .replace(/[\s\u3000._-]+/g, "")
     .toLowerCase()
@@ -36,7 +37,7 @@ export function normalizeBookmakerName(raw: string): string {
 
 /** True when `raw` is (a prefix of) a Pinnacle alias. */
 export function isPinnacleName(raw: string): boolean {
-  const masked = /[\uFF0A*]\s*$/.test(raw);
+  const masked = /[\uFF0A*](?:\s*封)?\s*$/.test(raw);
   const n = normalizeBookmakerName(raw);
   if (!n) return false;
   if (PINNACLE_ALIASES.some((a) => a === n)) return true;

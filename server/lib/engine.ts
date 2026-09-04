@@ -787,8 +787,8 @@ export class RadarEngine {
   /**
    * Isolated Pinnacle-only research ingestion. Titan007's Chinese schedule is
    * the fixture/name source and its stable sId is used to fetch the Pinnacle
-   * row from Titan's odds pages. PinnAPI is only a coarse availability/time
-   * index here; none of its English labels are persisted.
+   * row from Titan's odds pages. PinnAPI is not allowed to gate Titan fixtures;
+   * none of its English labels are persisted.
    *
    * This method NEVER touches `odds_latest`, `market_lines`, `opportunities`,
    * `simulation_bets`, Crown detail, HKJC execution, or the T-30 window
@@ -802,7 +802,6 @@ export class RadarEngine {
     // mock refreshPinnacleFixtures can still assert exact call counts, and so
     // the runResearchTimelineTick order-of-operations stays deterministic.
     const titan = this.fixtureCache?.titan ?? [];
-    const pinnapi = this.fixtureCache?.pinnapi ?? [];
     if (!titan.length) return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
 
     // Skip Titan ids already mapped to an HKJC-linked match, so we do not
@@ -824,18 +823,10 @@ export class RadarEngine {
          WHERE matches.fixture_source='pinnacle'`,
     );
 
-    // PinnAPI times reduce needless Titan detail calls, but its English names
-    // are intentionally ignored. The Titan detail page remains authoritative
-    // for whether a Pinnacle quote actually exists.
-    const coarseTimes = pinnapi.map((fixture) => fixture.kickoffUtc);
     const targets: PinnacleResearchTarget[] = [];
     const upsertTx = rawDb.transaction(() => {
       for (const fixture of titan) {
         if (mapped.has(fixture.providerMatchId)) continue;
-        if (
-          coarseTimes.length &&
-          !coarseTimes.some((kickoff) => Math.abs(kickoff - fixture.kickoffUtc) <= 35 * 60_000)
-        ) continue;
         // Only fixtures still in the future or just kicked off are useful for
         // research; historical rows may still be settled later by a separate job.
         if (fixture.kickoffUtc < now - 5 * 60_000) continue;
@@ -879,31 +870,37 @@ export class RadarEngine {
     let fetched = 0;
     let failed = 0;
     let rows = 0;
-    // First pass: capture normal markets for every pending milestone. Never
-    // wait for a slower corner request before writing the main OU snapshot.
-    for (const target of eligible) {
-      if (Date.now() > deadline) break;
-      try {
-        let normalPrices: ProviderPrice[] = [];
-        normalPrices = DEMO
-          ? DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? []
-          : await this.pinnacle.fetchMatchPrices(target.eventId);
-        fetched++;
-        if (normalPrices.length) {
-          const inserted = captureResearchTimelinePrices(
-            target.matchId,
-            "pinnacle",
-            normalPrices,
-            target.kickoffUtc,
-            Date.now(),
-          );
-          if (inserted) rows++;
+    // Fetch a bounded number in parallel. The old sequential loop let one slow
+    // detail page consume the whole 20-second budget and starve later fixtures
+    // in a busy kickoff slate. Priority order is still T5, T15, T30, initial.
+    let nextTarget = 0;
+    const worker = async (): Promise<void> => {
+      while (Date.now() <= deadline) {
+        const target = eligible[nextTarget++];
+        if (!target) return;
+        try {
+          const normalPrices = DEMO
+            ? DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? []
+            : await this.pinnacle.fetchMatchPrices(target.eventId);
+          fetched++;
+          if (normalPrices.length) {
+            const inserted = captureResearchTimelinePrices(
+              target.matchId,
+              "pinnacle",
+              normalPrices,
+              target.kickoffUtc,
+              Date.now(),
+            );
+            if (inserted) rows++;
+          }
+        } catch (err) {
+          failed++;
+          log("pinnacle_only_detail_error", { eventId: target.eventId, error: (err as Error).message });
         }
-      } catch (err) {
-        failed++;
-        log("pinnacle_only_detail_error", { eventId: target.eventId, error: (err as Error).message });
       }
-    }
+    };
+    const workerCount = Math.min(6, eligible.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     // Pinnacle-only fixtures can qualify for the OU signal path via the
     // existing prealert/observation sync (rule provider='pinnacle' only).
