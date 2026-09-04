@@ -345,6 +345,172 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
     ).get(matchId)).toEqual({ c: 0 });
   });
 
+  it("reconciles a Crown Chinese canonical row with a standalone PinnAPI row without split ownership", async () => {
+    const { RadarEngine } = await import("../server/lib/engine");
+    const kickoff = NOW + 25 * 60_000;
+    const titanId = "crown-chinese-88001";
+    const canonicalId = "crown:crown-chinese-88001";
+    const pinnapiId = "pinnapi-english-99001";
+    const standaloneId = `pinnacle:${pinnapiId}`;
+
+    rawDb.prepare(
+      `INSERT INTO matches(
+        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,
+        league,league_en,home_team,away_team,home_team_en,away_team_en,
+        kickoff_utc,status,inplay,updated_at
+      ) VALUES(?,NULL,'crown',?,NULL,
+        '以色列甲組聯賽',NULL,'卡法沙巴1928','耶路撒冷體育會',NULL,NULL,
+        ?,'PREEVENT',0,?)`,
+    ).run(canonicalId, titanId, kickoff, NOW);
+    rawDb.prepare(
+      `INSERT INTO matches(
+        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,
+        league,league_en,home_team,away_team,home_team_en,away_team_en,
+        kickoff_utc,status,inplay,updated_at
+      ) VALUES(?,NULL,'pinnacle',NULL,?,
+        'Israel Liga Alef',NULL,'Kfar Saba 1928','MS Jerusalem',NULL,NULL,
+        ?,'PREEVENT',0,?)`,
+    ).run(standaloneId, `pinnapi:${pinnapiId}`, kickoff, NOW);
+    rawDb.prepare(
+      `INSERT INTO pinnacle_source_map(
+        match_id,pinnapi_id,pinnapi_reversed,optic_id,optic_reversed,
+        titan_id,titan_reversed,active_source,updated_at
+      ) VALUES(?,?,0,NULL,0,NULL,0,'pinnapi',?)`,
+    ).run(standaloneId, pinnapiId, NOW);
+    rawDb.prepare(
+      `INSERT INTO pinnacle_translations(
+        pinnapi_id,zh_home,zh_away,zh_league,source,updated_at,
+        attempted_at,attempt_count,last_error
+      ) VALUES(?,?,?,?, 'titan',?,?,1,NULL)`,
+    ).run(
+      pinnapiId,
+      "卡法沙巴1928",
+      "耶路撒冷體育會",
+      "以色列甲組聯賽",
+      NOW,
+      NOW,
+    );
+    addStage(standaloneId, "pinnacle", "initial", "2.5", 1.90, 1.94, NOW - 60 * 60_000);
+    rawDb.prepare(
+      `UPDATE research_timeline_snapshots
+          SET origin='external_opening',source_name='pinnapi-history',
+              source_match_id=?
+        WHERE match_id=? AND stage='initial'`,
+    ).run(pinnapiId, standaloneId);
+
+    const titanFixture = {
+      providerMatchId: titanId,
+      league: "以色列甲組聯賽",
+      homeTeam: "卡法沙巴1928",
+      awayTeam: "耶路撒冷體育會",
+      kickoffUtc: kickoff,
+      statusText: "未開賽",
+      homeScore: null,
+      awayScore: null,
+      halfHome: null,
+      halfAway: null,
+      handicapVal: 0.25,
+      totalVal: 2.5,
+    };
+    const radar = new RadarEngine();
+    (radar as any).fixtureCache = {
+      at: NOW,
+      titan: [titanFixture],
+      optic: [],
+      pinnapi: [{
+        providerMatchId: pinnapiId,
+        league: "Israel Liga Alef",
+        homeTeam: "Kfar Saba 1928",
+        awayTeam: "MS Jerusalem",
+        kickoffUtc: kickoff,
+        inplay: false,
+        status: "scheduled",
+        parentId: null,
+      }],
+    };
+    (radar as any).pinnacle.fetchPinnacleResearchPrices = vi.fn().mockResolvedValue({
+      opening: [],
+      current: [],
+      sourceUrls: { AH: "", OU: "" },
+    });
+    const fetchPinnapi = vi.fn().mockResolvedValue([
+      { market: "OU", lineValue: 2.5, isMain: true, selection: "O", decimalOdds: 1.86 },
+      { market: "OU", lineValue: 2.5, isMain: true, selection: "U", decimalOdds: 2.02 },
+    ]);
+    (radar as any).pinnapi.fetchMatchPrices = fetchPinnapi;
+
+    const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
+    expect(outcome).toMatchObject({ fixtures: 1, fetched: 1, failed: 0, rows: 1 });
+    expect(fetchPinnapi).toHaveBeenCalledWith(pinnapiId);
+    expect(rawDb.prepare(
+      `SELECT fixture_source,titan_id,league,home_team,away_team
+         FROM matches WHERE id=?`,
+    ).get(canonicalId)).toEqual({
+      fixture_source: "pinnacle",
+      titan_id: titanId,
+      league: "以色列甲組聯賽",
+      home_team: "卡法沙巴1928",
+      away_team: "耶路撒冷體育會",
+    });
+    expect(rawDb.prepare("SELECT COUNT(*) c FROM matches WHERE id=?").get(standaloneId))
+      .toEqual({ c: 0 });
+    expect(rawDb.prepare(
+      `SELECT match_id,pinnapi_id,titan_id FROM pinnacle_source_map
+        WHERE pinnapi_id=?`,
+    ).all(pinnapiId)).toEqual([{
+      match_id: canonicalId,
+      pinnapi_id: pinnapiId,
+      titan_id: titanId,
+    }]);
+    expect(rawDb.prepare(
+      `SELECT DISTINCT stage,origin,source_name,source_match_id
+         FROM research_timeline_snapshots
+        WHERE match_id=? ORDER BY stage`,
+    ).all(canonicalId)).toEqual([
+      {
+        stage: "T30",
+        origin: "live_observation",
+        source_name: "pinnapi",
+        source_match_id: pinnapiId,
+      },
+      {
+        stage: "initial",
+        origin: "external_opening",
+        source_name: "pinnapi-history",
+        source_match_id: pinnapiId,
+      },
+    ]);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE match_id=?",
+    ).get(standaloneId)).toEqual({ c: 0 });
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE provider='crown'",
+    ).get()).toEqual({ c: 0 });
+
+    // Later collectors reuse the transferred provider id even when the
+    // PinnAPI fixture index has rotated out of cache.
+    (radar as any).fixtureCache = {
+      at: NOW + 15 * 60_000,
+      titan: [titanFixture],
+      optic: [],
+      pinnapi: [],
+    };
+    await radar.refreshPinnacleOnlyResearch(NOW + 15 * 60_000);
+    expect(fetchPinnapi).toHaveBeenCalledTimes(2);
+    expect(fetchPinnapi).toHaveBeenLastCalledWith(pinnapiId);
+    expect(rawDb.prepare(
+      `SELECT DISTINCT stage FROM research_timeline_snapshots
+        WHERE match_id=? ORDER BY stage`,
+    ).all(canonicalId)).toEqual([
+      { stage: "T15" },
+      { stage: "T30" },
+      { stage: "initial" },
+    ]);
+    expect(rawDb.prepare(
+      `SELECT COUNT(*) c FROM pinnacle_source_map WHERE pinnapi_id=?`,
+    ).get(pinnapiId)).toEqual({ c: 1 });
+  });
+
   it("shows a discovered Titan fixture as pending before its first quote arrives", () => {
     const kickoff = NOW + 20 * 60_000;
     addPinnacleOnlyFixture("pinnacle:titan:pending-3085657", kickoff);

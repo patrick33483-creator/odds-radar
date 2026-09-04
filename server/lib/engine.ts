@@ -325,6 +325,195 @@ export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): 
   })();
 }
 
+export type PinnapiResearchReconciliation = "none" | "merged" | "unsafe";
+
+/**
+ * Relink a legacy standalone `pinnacle:<eventId>` research row to the
+ * Titan-canonical fixture.
+ *
+ * Identity must already have been established by either the persisted
+ * Titan/PinnAPI source map or the ordinary name/alias/translation matcher.
+ * This function deliberately does not infer identity from kickoff alone.
+ */
+export function reconcileStandalonePinnapiResearch(
+  canonicalMatchId: string,
+  titanId: string,
+  pinnapiId: string,
+  reversed: boolean,
+  now = Date.now(),
+): PinnapiResearchReconciliation {
+  return rawDb.transaction(() => {
+    const canonical = rawDb.prepare(
+      `SELECT id,fixture_source,titan_id,kickoff_utc
+         FROM matches WHERE id=?`,
+    ).get(canonicalMatchId) as {
+      id: string;
+      fixture_source: "hkjc" | "pinnacle" | "crown";
+      titan_id: string | null;
+      kickoff_utc: number;
+    } | undefined;
+    if (
+      !canonical
+      || canonical.fixture_source !== "pinnacle"
+      || canonical.titan_id !== titanId
+    ) return "unsafe";
+
+    const ownerRows = rawDb.prepare(
+      `SELECT DISTINCT match_id
+         FROM pinnacle_source_map
+        WHERE pinnapi_id=? AND match_id<>?`,
+    ).all(pinnapiId, canonicalMatchId) as Array<{ match_id: string }>;
+    const directId = `pinnacle:${pinnapiId}`;
+    const direct = rawDb.prepare(
+      "SELECT id FROM matches WHERE id=? AND id<>?",
+    ).get(directId, canonicalMatchId) as { id: string } | undefined;
+    const donorIds = new Set(ownerRows.map((row) => row.match_id));
+    if (direct) donorIds.add(direct.id);
+    if (!donorIds.size) return "none";
+    // More than one existing owner is itself an ambiguity. Do not guess which
+    // row contains the authoritative history.
+    if (donorIds.size !== 1) return "unsafe";
+
+    const donorId = [...donorIds][0];
+    const donor = rawDb.prepare(
+      `SELECT id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,kickoff_utc
+         FROM matches WHERE id=?`,
+    ).get(donorId) as {
+      id: string;
+      hkjc_id: string | null;
+      fixture_source: "hkjc" | "pinnacle" | "crown";
+      titan_id: string | null;
+      pinnacle_match_id: string | null;
+      kickoff_utc: number;
+    } | undefined;
+    const providerIdCompatible = !donor?.pinnacle_match_id
+      || donor.pinnacle_match_id === `pinnapi:${pinnapiId}`;
+    if (
+      !donor
+      || donor.fixture_source !== "pinnacle"
+      || donor.hkjc_id !== null
+      || donor.titan_id !== null
+      || !providerIdCompatible
+      || Math.abs(donor.kickoff_utc - canonical.kickoff_utc) > 35 * 60_000
+    ) return "unsafe";
+
+    // Research-only rows must never have execution ownership. Refuse to merge
+    // if a legacy row somehow escaped that invariant.
+    const executionOwned = rawDb.prepare(
+      `SELECT EXISTS(SELECT 1 FROM simulation_bets WHERE match_id=?)
+           OR EXISTS(SELECT 1 FROM opportunities WHERE match_id=?) owned`,
+    ).get(donorId, donorId) as { owned: number };
+    if (executionOwned.owned) return "unsafe";
+
+    // Preserve already-frozen canonical cells. Missing cells are relinked with
+    // their original stage, timestamp and provenance; nothing is backdated or
+    // promoted to an opening during reconciliation.
+    rawDb.prepare(
+      `INSERT OR IGNORE INTO research_timeline_snapshots(
+         match_id,provider,market,stage,line_key,selection,decimal_odds,is_main,
+         source_updated_at,captured_at,target_at,status,origin,source_name,
+         source_match_id,source_url
+       )
+       SELECT ?,provider,market,stage,line_key,selection,decimal_odds,is_main,
+              source_updated_at,captured_at,target_at,status,origin,source_name,
+              source_match_id,source_url
+         FROM research_timeline_snapshots
+        WHERE match_id=? AND provider='pinnacle'`,
+    ).run(canonicalMatchId, donorId);
+    rawDb.prepare(
+      `INSERT OR IGNORE INTO research_timeline_points(
+         match_id,stage,target_at,first_captured_at,last_retry_at,captured_at,
+         status,note,created_at,updated_at
+       )
+       SELECT ?,stage,target_at,first_captured_at,last_retry_at,captured_at,
+              status,note,created_at,updated_at
+         FROM research_timeline_points WHERE match_id=?`,
+    ).run(canonicalMatchId, donorId);
+    rawDb.prepare(
+      `INSERT OR IGNORE INTO research_results(
+         match_id,hkjc_id,home_score,away_score,corners_total,source,
+         result_source,source_match_id,fetched_at
+       )
+       SELECT ?,NULL,home_score,away_score,corners_total,source,
+              result_source,source_match_id,fetched_at
+         FROM research_results WHERE match_id=?`,
+    ).run(canonicalMatchId, donorId);
+    rawDb.prepare(
+      `INSERT OR IGNORE INTO results(
+         match_id,pinnacle_match_id,home_score,away_score,corners_total,
+         half_home,half_away,source,fetched_at
+       )
+       SELECT ?,pinnacle_match_id,home_score,away_score,corners_total,
+              half_home,half_away,source,fetched_at
+         FROM results WHERE match_id=?`,
+    ).run(canonicalMatchId, donorId);
+    rawDb.prepare(
+      "UPDATE pinnapi_live_scores SET match_id=? WHERE match_id=?",
+    ).run(canonicalMatchId, donorId);
+
+    // Derived alerts are safe to regenerate from the canonical snapshots.
+    for (const table of [
+      "ou_signal_observations",
+      "ou_signal_prealerts",
+      "quote_direction_watch_observations",
+    ]) {
+      rawDb.prepare(`DELETE FROM ${table} WHERE match_id=?`).run(donorId);
+    }
+    for (const table of [
+      "research_timeline_snapshots",
+      "research_timeline_points",
+      "research_results",
+      "results",
+      "market_lines",
+      "odds_snapshots",
+      "odds_latest",
+    ]) {
+      rawDb.prepare(`DELETE FROM ${table} WHERE match_id=?`).run(donorId);
+    }
+    rawDb.prepare("DELETE FROM match_mapping WHERE match_id=?").run(donorId);
+    rawDb.prepare("DELETE FROM pinnacle_source_map WHERE match_id=?").run(donorId);
+    rawDb.prepare("DELETE FROM matches WHERE id=?").run(donorId);
+
+    rawDb.prepare(
+      `INSERT INTO pinnacle_source_map(
+         match_id,pinnapi_id,pinnapi_reversed,titan_id,titan_reversed,
+         active_source,updated_at
+       ) VALUES(?,?,?,?,0,'titan007',?)
+       ON CONFLICT(match_id) DO UPDATE SET
+         pinnapi_id=excluded.pinnapi_id,
+         pinnapi_reversed=excluded.pinnapi_reversed,
+         titan_id=excluded.titan_id,
+         updated_at=excluded.updated_at`,
+    ).run(canonicalMatchId, pinnapiId, reversed ? 1 : 0, titanId, now);
+
+    // Recompute point completeness from real relinked rows only.
+    const stages = rawDb.prepare(
+      "SELECT stage FROM research_timeline_points WHERE match_id=?",
+    ).all(canonicalMatchId) as Array<{ stage: string }>;
+    for (const { stage } of stages) {
+      const complete = (rawDb.prepare(
+        `SELECT COUNT(*) count FROM (
+           SELECT provider,market FROM research_timeline_snapshots
+            WHERE match_id=? AND stage=? AND provider IN ('hkjc','pinnacle')
+            GROUP BY provider,market HAVING COUNT(DISTINCT selection)>=2
+         )`,
+      ).get(canonicalMatchId, stage) as { count: number }).count;
+      rawDb.prepare(
+        `UPDATE research_timeline_points
+            SET status=?,note=?,updated_at=MAX(updated_at,?)
+          WHERE match_id=? AND stage=?`,
+      ).run(
+        complete >= 2 ? "captured" : complete > 0 ? "partial" : "pending",
+        complete >= 2 ? null : complete > 0 ? `${complete}/2 provider-market pairs complete` : "等待平博收集",
+        now,
+        canonicalMatchId,
+        stage,
+      );
+    }
+    return "merged";
+  })();
+}
+
 export function executionVerificationNote(verifiedAt: number): string {
   return [
     "execution_recheck=two_pass",
@@ -946,6 +1135,25 @@ export class RadarEngine {
         "SELECT match_id,pinnapi_id FROM pinnacle_source_map WHERE pinnapi_id IS NOT NULL ORDER BY updated_at DESC",
       ).all() as Array<{ match_id: string; pinnapi_id: string }>).map((row) => [row.pinnapi_id, row.match_id]),
     );
+    const stablePinnapiByTitan = new Map<string, Array<{ matchId: string; eventId: string; reversed: boolean }>>();
+    for (const row of rawDb.prepare(
+      `SELECT match_id,titan_id,pinnapi_id,pinnapi_reversed
+         FROM pinnacle_source_map
+        WHERE titan_id IS NOT NULL AND pinnapi_id IS NOT NULL`,
+    ).all() as Array<{
+      match_id: string;
+      titan_id: string;
+      pinnapi_id: string;
+      pinnapi_reversed: number;
+    }>) {
+      const entries = stablePinnapiByTitan.get(row.titan_id) ?? [];
+      entries.push({
+        matchId: row.match_id,
+        eventId: row.pinnapi_id,
+        reversed: !!row.pinnapi_reversed,
+      });
+      stablePinnapiByTitan.set(row.titan_id, entries);
+    }
     const saveResearchSource = rawDb.prepare(
       `INSERT INTO pinnacle_source_map(
          match_id,pinnapi_id,pinnapi_reversed,titan_id,titan_reversed,active_source,updated_at
@@ -969,8 +1177,55 @@ export class RadarEngine {
         });
         continue;
       }
+      // A legacy standalone PinnAPI row may already carry the exact Titan sId
+      // in the provider source map. That persisted cross-provider identity is
+      // stronger than another name pass and safely migrates collected history.
+      const stable = stablePinnapiByTitan.get(target.eventId) ?? [];
+      const stableIds = new Set(stable.map((entry) => entry.eventId));
+      if (stableIds.size === 1) {
+        const entry = stable.find((candidate) => candidate.eventId === [...stableIds][0])!;
+        const reconciled = reconcileStandalonePinnapiResearch(
+          target.matchId,
+          target.eventId,
+          entry.eventId,
+          entry.reversed,
+          now,
+        );
+        if (reconciled !== "unsafe") {
+          claimedPinnapi.set(entry.eventId, target.matchId);
+          mappedPinnapi.set(target.matchId, {
+            eventId: entry.eventId,
+            reversed: entry.reversed,
+          });
+          if (reconciled === "none") {
+            saveResearchSource.run(
+              target.matchId,
+              entry.eventId,
+              entry.reversed ? 1 : 0,
+              target.eventId,
+              now,
+            );
+          }
+          continue;
+        }
+      }
       const available = pinnapiCandidates.filter(
-        (candidate) => !claimedPinnapi.has(candidate.id) || claimedPinnapi.get(candidate.id) === target.matchId,
+        (candidate) => {
+          const ownerId = claimedPinnapi.get(candidate.id);
+          if (!ownerId || ownerId === target.matchId) return true;
+          const owner = rawDb.prepare(
+            `SELECT fixture_source,hkjc_id,titan_id FROM matches WHERE id=?`,
+          ).get(ownerId) as {
+            fixture_source: "hkjc" | "pinnacle" | "crown";
+            hkjc_id: string | null;
+            titan_id: string | null;
+          } | undefined;
+          // Let the normal identity matcher consider a research-only legacy
+          // owner. It is transferred atomically after a successful match.
+          return owner?.fixture_source === "pinnacle"
+            && owner.hkjc_id === null
+            && owner.titan_id === null;
+        },
       );
       if (!available.length) continue;
       const canonicalTarget: CandidateEvent = {
@@ -1005,18 +1260,28 @@ export class RadarEngine {
         decision = matchWithVerifiedTimeFallback(canonicalTarget, translated, aliases);
       }
       if (!decision.pinnacleMatchId) continue;
+      const reconciled = reconcileStandalonePinnapiResearch(
+        target.matchId,
+        target.eventId,
+        decision.pinnacleMatchId,
+        decision.reversed,
+        now,
+      );
+      if (reconciled === "unsafe") continue;
       claimedPinnapi.set(decision.pinnacleMatchId, target.matchId);
       mappedPinnapi.set(target.matchId, {
         eventId: decision.pinnacleMatchId,
         reversed: decision.reversed,
       });
-      saveResearchSource.run(
-        target.matchId,
-        decision.pinnacleMatchId,
-        decision.reversed ? 1 : 0,
-        target.eventId,
-        now,
-      );
+      if (reconciled === "none") {
+        saveResearchSource.run(
+          target.matchId,
+          decision.pinnacleMatchId,
+          decision.reversed ? 1 : 0,
+          target.eventId,
+          now,
+        );
+      }
     }
 
     // Do not spend provider calls on an OU checkpoint already frozen in the
