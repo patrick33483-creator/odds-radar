@@ -248,41 +248,24 @@ describe("Pinnacle-only in OU signal engine", () => {
     addStage(id, provider, "T5", lineKey, ...prices.T5, NOW - 60_000);
   }
 
-  it("no longer emits a prealert or observation for a qualifying Pinnacle-only triple", () => {
-    // Flipped by Crown-driven ingestion: Pinnacle-only fixtures are hidden from
-    // the dashboard/CSV/TG fixture list, so their triples must not reach
-    // Telegram either. Prices are still collected (snapshots below).
+  it("produces a T-30 prealert and T-5 observation for a qualifying Pinnacle-only triple", () => {
     seedTriple("pinnacle:evt-uoo", {
       initial: [1.90, 1.80],
       T30: [1.78, 1.96],
       T5: [1.84, 2.00],
     });
 
-    expect(syncOuSignalPrealerts(["pinnacle:evt-uoo"])).toBe(0);
-    expect(syncOuSignalObservations(["pinnacle:evt-uoo"])).toBe(0);
-    expect(unsentOuPrealerts(["pinnacle:evt-uoo"])).toHaveLength(0);
-    expect(unsentOuSignals(["pinnacle:evt-uoo"], NOW)).toHaveLength(0);
-    const snapshots = rawDb.prepare(
-      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE match_id=?",
-    ).get("pinnacle:evt-uoo") as { c: number };
-    expect(snapshots.c).toBe(6);
-  });
-
-  it("still emits a pinnacle-rule prealert and observation for an HKJC-linked triple", () => {
-    seedTriple("hkjc:evt-uoo", {
-      initial: [1.90, 1.80],
-      T30: [1.78, 1.96],
-      T5: [1.84, 2.00],
-    }, "2.5", "pinnacle", "hkjc");
-
-    expect(syncOuSignalPrealerts(["hkjc:evt-uoo"])).toBeGreaterThanOrEqual(1);
-    expect(syncOuSignalObservations(["hkjc:evt-uoo"])).toBeGreaterThanOrEqual(1);
+    const prealertsInserted = syncOuSignalPrealerts(["pinnacle:evt-uoo"]);
+    expect(prealertsInserted).toBeGreaterThanOrEqual(1);
+    const observationsInserted = syncOuSignalObservations(["pinnacle:evt-uoo"]);
+    expect(observationsInserted).toBeGreaterThanOrEqual(1);
 
     const stored = rawDb.prepare(
       "SELECT provider,rule_id FROM ou_signal_observations WHERE match_id=?",
-    ).all("hkjc:evt-uoo") as Array<{ provider: string; rule_id: string }>;
+    ).all("pinnacle:evt-uoo") as Array<{ provider: string; rule_id: string }>;
     expect(stored.length).toBeGreaterThanOrEqual(1);
     expect(stored.every((row) => row.provider === "pinnacle")).toBe(true);
+    // Every triggered rule for a Pinnacle-only fixture must be a pinnacle rule.
     for (const row of stored) {
       const rule = OU_SIGNAL_RULES.find((r) => r.id === row.rule_id);
       expect(rule?.provider).toBe("pinnacle");
@@ -291,59 +274,58 @@ describe("Pinnacle-only in OU signal engine", () => {
   });
 
   it("dedupes prealert and observation writes when sync runs twice", () => {
-    // Visible fixture (HKJC-linked) so the dedupe path is genuinely exercised.
-    seedTriple("hkjc:evt-dedupe", {
+    seedTriple("pinnacle:evt-dedupe", {
       initial: [1.90, 1.80],
       T30: [1.78, 1.96],
       T5: [1.84, 2.00],
-    }, "2.5", "pinnacle", "hkjc");
-    expect(syncOuSignalPrealerts(["hkjc:evt-dedupe"])).toBeGreaterThanOrEqual(1);
-    expect(syncOuSignalObservations(["hkjc:evt-dedupe"])).toBeGreaterThanOrEqual(1);
+    });
+    syncOuSignalPrealerts(["pinnacle:evt-dedupe"]);
+    syncOuSignalObservations(["pinnacle:evt-dedupe"]);
     // Second pass must not create new rows (INSERT OR IGNORE unique_key).
-    expect(syncOuSignalPrealerts(["hkjc:evt-dedupe"])).toBe(0);
-    expect(syncOuSignalObservations(["hkjc:evt-dedupe"])).toBe(0);
+    expect(syncOuSignalPrealerts(["pinnacle:evt-dedupe"])).toBe(0);
+    expect(syncOuSignalObservations(["pinnacle:evt-dedupe"])).toBe(0);
   });
 
   it("marks a Telegram-once notification and never returns it again", () => {
-    seedTriple("hkjc:evt-once", {
+    seedTriple("pinnacle:evt-once", {
       initial: [1.90, 1.80],
       T30: [1.78, 1.96],
       T5: [1.84, 2.00],
-    }, "2.5", "pinnacle", "hkjc");
-    syncOuSignalObservations(["hkjc:evt-once"]);
-    const first = unsentOuSignals(["hkjc:evt-once"], NOW);
+    });
+    syncOuSignalObservations(["pinnacle:evt-once"]);
+    const first = unsentOuSignals(["pinnacle:evt-once"], NOW);
     expect(first.length).toBeGreaterThanOrEqual(1);
     for (const row of first) markOuSignalNotified(row.uniqueKey, NOW);
-    const second = unsentOuSignals(["hkjc:evt-once"], NOW);
+    const second = unsentOuSignals(["pinnacle:evt-once"], NOW);
     expect(second).toHaveLength(0);
   });
 
-  it("skips a triple where any selected checkpoint price is ≤ 1.70", () => {
-    seedTriple("hkjc:evt-thresh", {
+  it("skips a Pinnacle-only triple where any selected checkpoint price is ≤ 1.70", () => {
+    seedTriple("pinnacle:evt-thresh", {
       initial: [1.70, 1.90], // selected side hits the exclusion boundary
       T30: [1.78, 1.96],
       T5: [1.84, 2.00],
-    }, "2.5", "pinnacle", "hkjc");
-    expect(syncOuSignalObservations(["hkjc:evt-thresh"])).toBe(0);
+    });
+    expect(syncOuSignalObservations(["pinnacle:evt-thresh"])).toBe(0);
   });
 
   it("skips when the qualifying triple has a mismatched line", () => {
     const kickoff = NOW + 30 * 60_000;
-    addHkjcFixture("hkjc:evt-mixed", kickoff);
-    addStage("hkjc:evt-mixed", "pinnacle", "initial", "2.5", 1.90, 1.80, NOW - 25 * 60_000);
-    addStage("hkjc:evt-mixed", "pinnacle", "T30", "2.75", 1.78, 1.96, NOW - 20 * 60_000);
-    addStage("hkjc:evt-mixed", "pinnacle", "T5", "2.5", 1.84, 2.00, NOW - 60_000);
-    expect(syncOuSignalObservations(["hkjc:evt-mixed"])).toBe(0);
+    addPinnacleOnlyFixture("pinnacle:evt-mixed", kickoff);
+    addStage("pinnacle:evt-mixed", "pinnacle", "initial", "2.5", 1.90, 1.80, NOW - 25 * 60_000);
+    addStage("pinnacle:evt-mixed", "pinnacle", "T30", "2.75", 1.78, 1.96, NOW - 20 * 60_000);
+    addStage("pinnacle:evt-mixed", "pinnacle", "T5", "2.5", 1.84, 2.00, NOW - 60_000);
+    expect(syncOuSignalObservations(["pinnacle:evt-mixed"])).toBe(0);
   });
 
   it("skips when the T-5 snapshot is missing", () => {
     const kickoff = NOW + 30 * 60_000;
-    addHkjcFixture("hkjc:evt-nostage", kickoff);
-    addStage("hkjc:evt-nostage", "pinnacle", "initial", "2.5", 1.90, 1.80, NOW - 25 * 60_000);
-    addStage("hkjc:evt-nostage", "pinnacle", "T30", "2.5", 1.78, 1.96, NOW - 20 * 60_000);
-    expect(syncOuSignalObservations(["hkjc:evt-nostage"])).toBe(0);
+    addPinnacleOnlyFixture("pinnacle:evt-nostage", kickoff);
+    addStage("pinnacle:evt-nostage", "pinnacle", "initial", "2.5", 1.90, 1.80, NOW - 25 * 60_000);
+    addStage("pinnacle:evt-nostage", "pinnacle", "T30", "2.5", 1.78, 1.96, NOW - 20 * 60_000);
+    expect(syncOuSignalObservations(["pinnacle:evt-nostage"])).toBe(0);
     // Prealert still fires because it only needs initial + T30.
-    expect(syncOuSignalPrealerts(["hkjc:evt-nostage"])).toBeGreaterThanOrEqual(1);
+    expect(syncOuSignalPrealerts(["pinnacle:evt-nostage"])).toBeGreaterThanOrEqual(1);
   });
 
   it("does NOT trigger a pinnacle rule from HKJC-provider rows on a Pinnacle-only fixture", () => {
@@ -370,29 +352,25 @@ describe("Pinnacle-only in OU signal engine", () => {
   });
 });
 
-/**
- * Crown-driven ingestion flipped the dashboard/CSV/TG fixture list to
- * "HKJC + Crown" (研究清單 = 馬會有盤 + 皇冠有盤而馬會無盤). Pinnacle-only fixtures
- * such as the Fiji Cup are deliberately HIDDEN from the研究 view, while their
- * prices keep being collected by refreshPinnacleOnlyResearch and stay usable
- * for the OU signal path (see the suites above, which still pass).
- */
-describe("Pinnacle-only fixtures are hidden from the research dataset + CSV", () => {
-  it("does not return a Pinnacle-only match row", () => {
+describe("Pinnacle-only fixtures appear in the research dataset + CSV", () => {
+  it("returns a Pinnacle-only match row and hides HKJC/Crown cells as source_unavailable", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-dataset", kickoff);
     addStage("pinnacle:evt-dataset", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
 
     const ds = researchDataset({ days: 7, provider: "all", market: "all" }, NOW);
-    expect(ds.matches.find((m) => m.matchId === "pinnacle:evt-dataset")).toBeUndefined();
-    // The snapshots themselves are still stored for the signal path.
-    const stored = rawDb.prepare(
-      "SELECT COUNT(*) c FROM research_timeline_snapshots WHERE match_id=?",
-    ).get("pinnacle:evt-dataset") as { c: number };
-    expect(stored.c).toBe(2);
+    const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-dataset");
+    expect(row).toBeDefined();
+    expect(row!.fixtureSource).toBe("pinnacle");
+    const t30 = row!.timeline.T30;
+    expect(t30.cells.pinnacle.OU).toBe("captured");
+    // Pinnacle-only fixtures must mark every non-pinnacle cell as source_unavailable
+    expect(t30.cells.hkjc.OU).toBe("source_unavailable");
+    expect(t30.cells.hkjc.AH).toBe("source_unavailable");
+    expect(t30.cells.hkjc.COU).toBe("source_unavailable");
   });
 
-  it("returns only the HKJC-linked row when provider='pinnacle' is requested", () => {
+  it("filters to Pinnacle-only rows when provider='pinnacle' is requested", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-filter-a", kickoff);
     addHkjcFixture("hkjc:evt-filter-b", kickoff);
@@ -401,18 +379,23 @@ describe("Pinnacle-only fixtures are hidden from the research dataset + CSV", ()
 
     const ds = researchDataset({ days: 7, provider: "pinnacle", market: "OU" }, NOW);
     const ids = ds.matches.map((m) => m.matchId);
-    expect(ids).not.toContain("pinnacle:evt-filter-a");
+    expect(ids).toContain("pinnacle:evt-filter-a");
     expect(ids).toContain("hkjc:evt-filter-b");
   });
 
-  it("omits Pinnacle-only fixtures from the CSV export", () => {
+  it("emits fixture_source column with 'pinnacle' in the CSV export", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-csv", kickoff);
     addStage("pinnacle:evt-csv", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
 
     const csv = researchCsv("timeline", { days: 7, provider: "all", market: "OU" }, NOW);
+    // Header includes fixture_source; body has at least one row with 'pinnacle'.
     expect(csv).toContain("fixture_source");
-    expect(csv).not.toContain("pinnacle:evt-csv");
+    const bodyLines = csv.split(/\r?\n/).slice(1).filter(Boolean);
+    const hasPinnacleOnly = bodyLines.some((line) =>
+      line.includes(",pinnacle,") && line.includes("pinnacle:evt-csv"),
+    );
+    expect(hasPinnacleOnly).toBe(true);
   });
 });
 
@@ -424,31 +407,34 @@ describe("pinnacle_translations join into research dataset", () => {
     ).run(pinnapiId, zhHome, zhAway, zhLeague, "titan", Date.now(), Date.now(), 1);
   }
 
-  it("keeps a translated Pinnacle-only fixture hidden from the dataset", () => {
-    // The pinnacle_translations join still exists (OU Telegram notifications
-    // render Pinnacle-only fixtures in Chinese from it), but the research
-    // dataset no longer surfaces Pinnacle-only fixtures at all.
+  it("returns Chinese team + league from pinnacle_translations when present", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-trans-a", kickoff);
     addStage("pinnacle:evt-trans-a", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
     insertTranslation("evt-trans-a", "阿仙奴", "利物浦", "英超");
 
     const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
-    expect(ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-a")).toBeUndefined();
-    const cached = rawDb.prepare(
-      "SELECT zh_home,zh_away,zh_league FROM pinnacle_translations WHERE pinnapi_id=?",
-    ).get("evt-trans-a") as { zh_home: string; zh_away: string; zh_league: string };
-    expect(cached).toEqual({ zh_home: "阿仙奴", zh_away: "利物浦", zh_league: "英超" });
+    const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-a");
+    expect(row).toBeDefined();
+    expect(row!.homeTeam).toBe("阿仙奴");
+    expect(row!.awayTeam).toBe("利物浦");
+    expect(row!.league).toBe("英超");
   });
 
-  it("keeps an untranslated Pinnacle-only fixture hidden as well", () => {
+  it("falls back to English fields on the matches row when no translation exists", () => {
     const kickoff = NOW + 60 * 60_000;
     addPinnacleOnlyFixture("pinnacle:evt-trans-b", kickoff);
     addStage("pinnacle:evt-trans-b", "pinnacle", "T30", "2.5", 1.85, 2.00, kickoff - 25 * 60_000);
     // no insertTranslation call
 
     const ds = researchDataset({ days: 7, provider: "all", market: "OU" }, NOW);
-    expect(ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-b")).toBeUndefined();
+    const row = ds.matches.find((m) => m.matchId === "pinnacle:evt-trans-b");
+    expect(row).toBeDefined();
+    // addPinnacleOnlyFixture writes "<id>主" / "<id>客" as English placeholders and
+    // "Pinn聯" as league; these must survive when no translation row exists.
+    expect(row!.homeTeam).toBe("pinnacle:evt-trans-b主");
+    expect(row!.awayTeam).toBe("pinnacle:evt-trans-b客");
+    expect(row!.league).toBe("Pinn聯");
   });
 
   it("does not touch HKJC-linked fixture display fields even when a stray translation row exists", () => {

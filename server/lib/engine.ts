@@ -42,7 +42,7 @@ import { buildSynthetic, EV_SYNTHETIC_TARGETS, SYNTHETIC_TARGETS, syntheticCover
 import { mergeOpportunityState, type DedupeEntry } from "./dedupe";
 import { teamAliasSeedRows } from "./team-alias-seeds";
 import { notifyOuPrealerts, notifyOuSignals, notifySimulationBets } from "./telegram";
-import { captureResearchTimelinePrices, researchStageFor, saveCrownResearchInitialSnapshots } from "./research";
+import { captureResearchTimelinePrices, researchStageFor } from "./research";
 import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
 import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
@@ -127,14 +127,6 @@ export const MAX_LOOP_MS = 290_000;
  * discard every callback during the five-minute T5 window.
  */
 export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
-/**
- * Crown-driven ingestion shares the very same 30-second scheduler tick as the
- * Pinnacle-only collector, so its budget has to fit in whatever is left after
- * PINNACLE_RESEARCH_LOOP_MS. 20 s + 10 s = one full AUTO_SCAN_CHECK_MS tick,
- * which is the hard ceiling before the overlap gate starts dropping callbacks
- * during the T5 window.
- */
-export const CROWN_RESEARCH_LOOP_MS = 10_000;
 
 export type PinnacleResearchTarget = {
   matchId: string;
@@ -170,52 +162,6 @@ export function prioritizePendingPinnacleResearchTargets(
       return [{ ...target, stage }];
     })
     .sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc);
-}
-
-export type CrownResearchTarget = {
-  matchId: string;
-  titanId: string;
-  kickoffUtc: number;
-  league: string;
-  homeTeam: string;
-  awayTeam: string;
-};
-
-export type PendingCrownResearchTarget = CrownResearchTarget & {
-  /** "milestone" = a T30/T15/T5 checkpoint is due; "opening" = no Crown opening yet. */
-  reason: "milestone" | "opening";
-  stage: "T30" | "T15" | "T5" | null;
-};
-
-/**
- * Crown schedule is the fixture universe (馬會有盤，Crown 一定有盤), so the raw
- * target list can be thousands of rows. Only fixtures that still owe work are
- * worth a provider call, and a due milestone always outranks an opening: the
- * opening page stays available long after kickoff, a T5 checkpoint does not.
- */
-export function prioritizeCrownResearchTargets(
-  targets: CrownResearchTarget[],
-  openingCaptured: ReadonlySet<string>,
-  capturedStages: ReadonlySet<string>,
-  now: number,
-): PendingCrownResearchTarget[] {
-  return targets
-    .flatMap((target): PendingCrownResearchTarget[] => {
-      const untilKickoff = target.kickoffUtc - now;
-      if (untilKickoff <= 0 || untilKickoff > 24 * 60 * 60_000) return [];
-      const stage = researchStageFor(target.kickoffUtc, now);
-      const needsMilestone = stage !== null && !capturedStages.has(`${target.matchId}:${stage}`);
-      const needsOpening = !openingCaptured.has(target.matchId);
-      if (!needsMilestone && !needsOpening) return [];
-      return [{
-        ...target,
-        reason: needsMilestone ? "milestone" : "opening",
-        stage: needsMilestone ? stage : null,
-      }];
-    })
-    .sort((a, b) =>
-      (a.reason === b.reason ? 0 : a.reason === "milestone" ? -1 : 1)
-      || a.kickoffUtc - b.kickoffUtc);
 }
 
 /** Merge a Crown-first alias into the later HKJC canonical fixture atomically. */
@@ -1015,175 +961,6 @@ export class RadarEngine {
   }
 
   /**
-   * Crown-driven research ingestion.
-   *
-   * The titan007 schedule is the fixture universe for the research dashboard:
-   * the user's rule is 馬會有盤，Crown 一定有盤, so Crown is a superset of the
-   * HKJC slate. Every Crown fixture that is NOT already owned by an
-   * HKJC-linked match becomes a `fixture_source='crown'` row
-   * (`id='crown:<sId>'`, `titan_id=<sId>`) carrying the Chinese league / team
-   * labels straight from titan007 — no translation round-trip is needed.
-   *
-   * Prices: Crown opening + current are captured through the existing research
-   * helpers, and Pinnacle prices for the same titan id are collected as well so
-   * the OU signal rules (provider='pinnacle') keep working on Crown-only
-   * fixtures. Pinnacle-ONLY fixtures remain hidden from the dashboard/CSV/TG by
-   * the `fixture_source IN ('hkjc','crown')` filter in research.ts; their prices
-   * continue to be collected by refreshPinnacleOnlyResearch.
-   */
-  async refreshCrownOnlyResearch(now = Date.now()): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
-    const deadline = Date.now() + CROWN_RESEARCH_LOOP_MS;
-    const empty = { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
-    // Same contract as refreshPinnacleOnlyResearch: the caller must already
-    // have warmed fixtureCache through refreshPinnacleFixtures(). Never
-    // re-fetch here, so call counts stay deterministic for the tick tests.
-    const titan = this.fixtureCache?.titan ?? [];
-    if (!titan.length) return empty;
-
-    // Titan ids already reconciled onto an HKJC row must never get a shadow
-    // Crown fixture; the HKJC row stays the single canonical entry.
-    const hkjcLinked = new Set(
-      (rawDb.prepare(
-        "SELECT titan_id FROM matches WHERE fixture_source='hkjc' AND titan_id IS NOT NULL",
-      ).all() as Array<{ titan_id: string | null }>)
-        .map((row) => row.titan_id)
-        .filter((value): value is string => !!value),
-    );
-    const upsertFixture = rawDb.prepare(
-      `INSERT INTO matches(
-        id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,league,league_en,
-        home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at
-      ) VALUES(?,NULL,'crown',?,?,?,NULL,?,?,NULL,NULL,?,?,0,?)
-       ON CONFLICT(id) DO UPDATE SET league=excluded.league,home_team=excluded.home_team,
-         away_team=excluded.away_team,kickoff_utc=excluded.kickoff_utc,
-         status=excluded.status,titan_id=excluded.titan_id,updated_at=excluded.updated_at
-         WHERE matches.fixture_source='crown'`,
-    );
-
-    const targets: CrownResearchTarget[] = [];
-    const upsertTx = rawDb.transaction(() => {
-      for (const fixture of titan) {
-        const titanId = fixture.providerMatchId;
-        if (hkjcLinked.has(titanId)) continue;
-        if (fixture.kickoffUtc < now - 5 * 60_000) continue;
-        const matchId = `crown:${titanId}`;
-        upsertFixture.run(
-          matchId,
-          titanId,
-          `titan:${titanId}`,
-          fixture.league,
-          fixture.homeTeam,
-          fixture.awayTeam,
-          fixture.kickoffUtc,
-          fixture.statusText || "PREEVENT",
-          now,
-        );
-        targets.push({
-          matchId,
-          titanId,
-          kickoffUtc: fixture.kickoffUtc,
-          league: fixture.league,
-          homeTeam: fixture.homeTeam,
-          awayTeam: fixture.awayTeam,
-        });
-      }
-    });
-    upsertTx();
-    if (!targets.length) return empty;
-
-    // Two single queries instead of one lookup per fixture: the Crown slate is
-    // thousands of rows and this loop runs on the 30-second tick.
-    const openingCaptured = new Set(
-      (rawDb.prepare(
-        `SELECT DISTINCT match_id FROM research_timeline_snapshots
-          WHERE provider='crown' AND stage='initial' AND match_id LIKE 'crown:%'`,
-      ).all() as Array<{ match_id: string }>).map((row) => row.match_id),
-    );
-    const capturedStages = new Set(
-      (rawDb.prepare(
-        `SELECT DISTINCT match_id,stage FROM research_timeline_snapshots
-          WHERE provider='crown' AND match_id LIKE 'crown:%'`,
-      ).all() as Array<{ match_id: string; stage: string }>).map((row) => `${row.match_id}:${row.stage}`),
-    );
-    const eligible = prioritizeCrownResearchTargets(targets, openingCaptured, capturedStages, now);
-
-    let fetched = 0;
-    let failed = 0;
-    let rows = 0;
-    const touched: string[] = [];
-    for (const target of eligible) {
-      if (Date.now() > deadline) break;
-      let crownSeen = false;
-      try {
-        const prices = await this.pinnacle.fetchCrownResearchPrices(target.titanId);
-        fetched++;
-        crownSeen = true;
-        if (prices.opening.length) {
-          rows += saveCrownResearchInitialSnapshots(
-            target.matchId,
-            target.titanId,
-            prices.opening,
-            prices.sourceUrls,
-            Date.now(),
-          );
-        }
-        if (prices.current.length) {
-          this.persistPrices(target.matchId, "crown", prices.current, Date.now(), target.kickoffUtc);
-          rows += prices.current.length;
-        }
-      } catch (err) {
-        failed++;
-        log("crown_only_detail_error", { titanId: target.titanId, error: (err as Error).message });
-      }
-      if (Date.now() > deadline) {
-        if (crownSeen) touched.push(target.matchId);
-        break;
-      }
-      // Pinnacle prices ride along on the same titan id. They are what the OU
-      // signal rules evaluate, and a Pinnacle failure must never discard the
-      // Crown rows already written above.
-      try {
-        const pinnaclePrices = await this.pinnacle.fetchMatchPrices(target.titanId);
-        if (pinnaclePrices.length) {
-          this.persistPrices(target.matchId, "pinnacle", pinnaclePrices, Date.now(), target.kickoffUtc);
-          rows += pinnaclePrices.length;
-        }
-      } catch (err) {
-        log("crown_only_pinnacle_detail_error", { titanId: target.titanId, error: (err as Error).message });
-      }
-      touched.push(target.matchId);
-    }
-
-    // Only notify for fixtures actually refreshed this pass: the full Crown
-    // slate would blow past SQLite's bound-parameter budget.
-    if (touched.length) {
-      try {
-        const prealerts = unsentOuPrealerts(touched);
-        const sent = await notifyOuPrealerts(prealerts);
-        if (sent) log("telegram_ou_t30_prealerts_crown_only", { detected: prealerts.length, sent });
-      } catch (err) {
-        log("telegram_ou_t30_prealert_crown_only_error", { error: (err as Error).message });
-      }
-      try {
-        const signals = unsentOuSignals(touched);
-        const sent = await notifyOuSignals(signals);
-        if (sent) log("telegram_ou_signals_crown_only", { detected: signals.length, sent });
-      } catch (err) {
-        log("telegram_ou_signal_crown_only_error", { error: (err as Error).message });
-      }
-    }
-
-    log("crown_only_research", {
-      fixtures: targets.length,
-      pending: eligible.length,
-      fetched,
-      failed,
-      rows,
-    });
-    return { fixtures: targets.length, fetched, failed, rows };
-  }
-
-  /**
    * Run one bounded translation backfill batch against the given fixtures.
    * Intended to be invoked from an independent low-frequency scheduler — NOT
    * from the research timeline. Respects a per-run `maxFixtures` cap so a
@@ -1897,14 +1674,6 @@ export class RadarEngine {
       await this.refreshPinnacleOnlyResearch();
     } catch (err) {
       log("pinnacle_only_research_error", { error: (err as Error).message });
-    }
-    // Crown-driven ingestion runs last, after the HKJC schedule + reconciliation
-    // of refreshPinnacleFixtures has claimed every titan id it owns, so a Crown
-    // row can never shadow an HKJC-linked fixture.
-    try {
-      await this.refreshCrownOnlyResearch();
-    } catch (err) {
-      log("crown_only_research_error", { error: (err as Error).message });
     }
     return { selected: 0, detailCalls: 0 };
   }

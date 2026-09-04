@@ -335,7 +335,7 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
        FROM research_timeline_snapshots s
        JOIN matches m ON m.id=s.match_id
       WHERE s.market='OU'
-        AND m.fixture_source IN ('hkjc','crown')
+        AND m.fixture_source IN ('hkjc','pinnacle')
         AND s.provider IN ('hkjc','pinnacle')
         AND (m.fixture_source='hkjc' OR s.provider='pinnacle')
         AND s.stage IN ('initial','T30')
@@ -418,7 +418,7 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
        FROM research_timeline_snapshots s
        JOIN matches m ON m.id=s.match_id
       WHERE s.market='OU'
-        AND m.fixture_source IN ('hkjc','crown')
+        AND m.fixture_source IN ('hkjc','pinnacle')
         AND s.provider IN ('hkjc','pinnacle')
         AND (m.fixture_source='hkjc' OR s.provider='pinnacle')
         AND s.stage IN ('initial','T30','T5')
@@ -602,7 +602,7 @@ export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
-      WHERE m.fixture_source IN ('hkjc','crown')
+      WHERE m.fixture_source IN ('hkjc','pinnacle')
       ORDER BY CASE
         WHEN r.match_id IS NULL AND m.kickoff_utc<=? AND m.kickoff_utc>=? THEN 0
         WHEN m.kickoff_utc>? THEN 1
@@ -643,7 +643,7 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
-      WHERE m.fixture_source IN ('hkjc','crown') AND o.notified_at IS NULL AND o.detected_at>=? ${filter}
+      WHERE m.fixture_source IN ('hkjc','pinnacle') AND o.notified_at IS NULL AND o.detected_at>=? ${filter}
       ORDER BY o.detected_at`,
   ).all(activatedAt, ...matchIds) as StoredSignalRow[];
   return rows
@@ -667,7 +667,7 @@ export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
        JOIN matches m ON m.id=p.match_id
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
-      WHERE m.fixture_source IN ('hkjc','crown') AND p.notified_at IS NULL AND p.detected_at>=? ${filter}
+      WHERE m.fixture_source IN ('hkjc','pinnacle') AND p.notified_at IS NULL AND p.detected_at>=? ${filter}
       ORDER BY p.detected_at`,
   ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
   return rows
