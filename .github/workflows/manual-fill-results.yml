@@ -47,7 +47,8 @@ jobs:
             "HOME='$HOME' AWAY='$AWAY' HOME_SCORE='$HOME_SCORE' AWAY_SCORE='$AWAY_SCORE' DATE_HKT='$DATE_HKT' sudo -E python3 -" <<'PY'
           import datetime, os, sqlite3, time
           hkt = datetime.timezone(datetime.timedelta(hours=8))
-          db = sqlite3.connect("/opt/odds-radar/data/data.db")
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.execute("PRAGMA busy_timeout=30000")
           db.row_factory = sqlite3.Row
           home = os.environ["HOME"]
           away = os.environ["AWAY"]
