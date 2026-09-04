@@ -505,7 +505,7 @@ export async function collectResearchInitialSnapshots(
        LEFT JOIN research_timeline_points p
          ON p.match_id=m.id AND p.stage='initial'
       WHERE m.kickoff_utc BETWEEN ? AND ?
-        AND m.fixture_source='hkjc'
+        AND m.fixture_source IN ('hkjc','crown')
         AND COALESCE(p.status,'pending')<>'captured'
       ORDER BY m.kickoff_utc
       LIMIT 500`,
