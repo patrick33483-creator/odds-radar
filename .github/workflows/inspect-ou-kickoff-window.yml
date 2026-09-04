@@ -98,3 +98,74 @@ jobs:
           db.rollback()
           db.close()
           PY
+
+      - name: 查詢收集器紀錄及 Pinnacle 來源 mapping
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          KICKOFF_MIN: ${{ github.event.inputs.kickoff_min_ms }}
+          KICKOFF_MAX: ${{ github.event.inputs.kickoff_max_ms }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<REMOTE
+          set -euo pipefail
+          cd /opt/odds-radar
+
+          echo "=== collector logs (last 120 minutes) ==="
+          sudo docker compose logs --since 120m radar 2>&1 |
+            grep -E 'auto_research_timeline|pinnacle_detail|pinnapi|titan|research' |
+            tail -600 || true
+
+          echo "=== Pinnacle mappings and checkpoint summary ==="
+          sudo KICKOFF_MIN='$KICKOFF_MIN' KICKOFF_MAX='$KICKOFF_MAX' python3 - <<'PY'
+          import json
+          import os
+          import sqlite3
+
+          lo = int(os.environ["KICKOFF_MIN"])
+          hi = int(os.environ["KICKOFF_MAX"])
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+          rows = db.execute(
+              """
+              SELECT m.id,m.fixture_source,m.titan_id,m.pinnacle_match_id,
+                     m.league,m.home_team,m.away_team,m.kickoff_utc,
+                     p.pinnapi_id,p.pinnapi_reversed,p.titan_id map_titan_id,
+                     p.titan_reversed,p.active_source
+                FROM matches m
+                LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+               WHERE m.kickoff_utc BETWEEN ? AND ?
+               ORDER BY m.kickoff_utc,m.id
+              """,
+              (lo, hi),
+          ).fetchall()
+          for row in rows:
+              item = dict(row)
+              item["points"] = [
+                  dict(x) for x in db.execute(
+                      """
+                      SELECT stage,target_at,first_captured_at,last_retry_at,status,note
+                        FROM research_timeline_points
+                       WHERE match_id=? ORDER BY target_at
+                      """,
+                      (row["id"],),
+                  ).fetchall()
+              ]
+              item["ou_snapshots"] = [
+                  dict(x) for x in db.execute(
+                      """
+                      SELECT provider,stage,COUNT(*) rows,MIN(captured_at) first_at,
+                             MAX(captured_at) last_at,
+                             GROUP_CONCAT(DISTINCT COALESCE(source_name,'')) source_names,
+                             GROUP_CONCAT(DISTINCT COALESCE(source_match_id,'')) source_ids
+                        FROM research_timeline_snapshots
+                       WHERE match_id=? AND market='OU'
+                       GROUP BY provider,stage ORDER BY provider,stage
+                      """,
+                      (row["id"],),
+                  ).fetchall()
+              ]
+              print(json.dumps(item, ensure_ascii=False))
+          db.close()
+          PY
+          REMOTE
