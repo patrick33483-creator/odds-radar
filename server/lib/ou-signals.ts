@@ -427,11 +427,17 @@ function groupByMatchProvider(rows: SnapshotRow[]): Map<string, StageRows> {
  *
  * Provider main flags win only when exactly one line has both sides marked
  * main and no other row claims main. If the source supplied no main flags at
- * all, a sole complete line is unambiguous and may be inferred. Multiple
- * complete unmarked lines, conflicting mains and incomplete explicit mains
- * all fail closed.
+ * all, a sole complete line is unambiguous and may be inferred. HKJC initial
+ * snapshots occasionally omit every main flag while still supplying one
+ * clearly balanced O/U pair; in that narrow case the unique closest pair may
+ * be inferred. Multiple ambiguous unmarked lines, conflicting mains and
+ * incomplete explicit mains all fail closed.
  */
-function selectStageMain(lines: StageLineRows | undefined): SelectedStageMain | null {
+function selectStageMain(
+  lines: StageLineRows | undefined,
+  provider: Provider,
+  stage: Stage,
+): SelectedStageMain | null {
   if (!lines) return null;
   const complete = [...lines.entries()].filter(([, rows]) => rows.has("O") && rows.has("U"));
   const flaggedLineKeys = new Set(
@@ -447,8 +453,19 @@ function selectStageMain(lines: StageLineRows | undefined): SelectedStageMain | 
     if ([...rows.values()].some((row) => row.is_main !== 1)) return null;
     return { lineKey, rows };
   }
-  if (complete.length !== 1) return null;
-  return { lineKey: complete[0][0], rows: complete[0][1] };
+  if (complete.length === 1) return { lineKey: complete[0][0], rows: complete[0][1] };
+  if (provider !== "hkjc" || stage !== "initial" || complete.length < 2) return null;
+
+  const ranked = complete
+    .map(([lineKey, rows]) => ({
+      lineKey,
+      rows,
+      balanceGap: Math.abs(rows.get("O")!.decimal_odds - rows.get("U")!.decimal_odds),
+    }))
+    .sort((a, b) => a.balanceGap - b.balanceGap);
+  const [best, runnerUp] = ranked;
+  if (best.balanceGap > 0.1 || runnerUp.balanceGap - best.balanceGap < 0.1) return null;
+  return { lineKey: best.lineKey, rows: best.rows };
 }
 
 function evaluatorVersion(lineKeys: string[]): "same-line-v1" | "stage-main-v2" {
@@ -508,8 +525,9 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
   let inserted = 0;
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
-      const initial = selectStageMain(stages.get("initial"));
-      const t30 = selectStageMain(stages.get("T30"));
+      const [, provider] = groupKey.split("|") as [string, Provider];
+      const initial = selectStageMain(stages.get("initial"), provider, "initial");
+      const t30 = selectStageMain(stages.get("T30"), provider, "T30");
       if (!initial || !t30) continue;
       const stageMains = [initial, t30];
       const decisions = stageMains.map((stage) =>
@@ -518,7 +536,7 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
       if (decisions.some((decision) => !decision || decision.side === "D")) continue;
       if (decisions.some((decision) => decision!.odds <= 1.7)) continue;
       const path = decisions.map((decision) => decision!.side).join("→");
-      const [matchId, provider] = groupKey.split("|") as [string, Provider];
+      const [matchId] = groupKey.split("|");
       const linePath = `${initial.lineKey}→${t30.lineKey}`;
       const version = evaluatorVersion([initial.lineKey, t30.lineKey]);
       const detectedAt = Math.max(...[...t30.rows.values()].map((row) => row.captured_at));
@@ -609,9 +627,10 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
   let inserted = 0;
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
-      const initial = selectStageMain(stages.get("initial"));
-      const t30 = selectStageMain(stages.get("T30"));
-      const t5 = selectStageMain(stages.get("T5"));
+      const [, provider] = groupKey.split("|") as [string, Provider];
+      const initial = selectStageMain(stages.get("initial"), provider, "initial");
+      const t30 = selectStageMain(stages.get("T30"), provider, "T30");
+      const t5 = selectStageMain(stages.get("T5"), provider, "T5");
       if (!initial || !t30 || !t5) continue;
       const stageMains = [initial, t30, t5];
       const decisions = stageMains.map((stage) =>
@@ -628,7 +647,7 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
       const gap = driftComparable
         ? Math.round((initialSignalOdds - t5SignalOdds) * 10_000) / 10_000
         : null;
-      const [matchId, provider] = groupKey.split("|") as [string, Provider];
+      const [matchId] = groupKey.split("|");
       const linePath = [initial.lineKey, t30.lineKey, t5.lineKey].join("→");
       const version = evaluatorVersion([initial.lineKey, t30.lineKey, t5.lineKey]);
       const detectedAt = Math.max(...[...t5.rows.values()].map((row) => row.captured_at));
