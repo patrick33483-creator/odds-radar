@@ -1,0 +1,47 @@
+name: find-teams
+on:
+  workflow_dispatch:
+    inputs:
+      names:
+        description: "team names comma-separated"
+        required: true
+jobs:
+  f:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          NAMES: ${{ inputs.names }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          cat > /tmp/f.py <<'PYEOF'
+          import sqlite3, os, datetime
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          names = [n.strip() for n in os.environ["NAMES"].split(",") if n.strip()]
+          for n in names:
+              rows = db.execute("""
+                SELECT m.id, m.fixture_source, m.home_team, m.away_team, m.kickoff_utc,
+                       CASE WHEN r.match_id IS NULL THEN 'AWAITING' ELSE r.home_score||'-'||r.away_score END result
+                  FROM matches m LEFT JOIN research_results r ON r.match_id=m.id
+                 WHERE (m.home_team LIKE ? OR m.away_team LIKE ?)
+                   AND m.kickoff_utc >= ? AND m.kickoff_utc <= ?
+                 ORDER BY m.kickoff_utc DESC LIMIT 10
+              """,(f"%{n}%",f"%{n}%",
+                   int(datetime.datetime(2026,9,3,0,0,tzinfo=hkt).timestamp()*1000),
+                   int(datetime.datetime(2026,9,6,0,0,tzinfo=hkt).timestamp()*1000))).fetchall()
+              print(f"== {n} ==")
+              for r in rows:
+                  t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
+                  print(f"  [{r['fixture_source']}] {r['id']} {t} {r['home_team']} vs {r['away_team']} => {r['result']}")
+              if not rows: print("  (none)")
+          PYEOF
+          scp /tmp/f.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/f.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/f.py'
