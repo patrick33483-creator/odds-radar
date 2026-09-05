@@ -8,6 +8,10 @@ let RadarEngine: typeof import("../server/lib/engine").RadarEngine;
 let rawDb: typeof import("../server/lib/store").rawDb;
 let researchMilestoneCapacity: typeof import("../server/lib/engine").researchMilestoneCapacity;
 let allocateMilestoneTargets: typeof import("../server/lib/engine").allocateMilestoneTargets;
+let allocateMilestoneTargetsBySource:
+  typeof import("../server/lib/engine").allocateMilestoneTargetsBySource;
+let orderMilestoneTargetsForDispatch:
+  typeof import("../server/lib/engine").orderMilestoneTargetsForDispatch;
 let researchMilestoneConcurrency: typeof import("../server/lib/engine").researchMilestoneConcurrency;
 let MIN_RESEARCH_MILESTONE_TARGETS: number;
 let MAX_RESEARCH_MILESTONE_TARGETS: number;
@@ -22,6 +26,8 @@ beforeAll(async () => {
     researchMilestoneCapacity,
     researchMilestoneConcurrency,
     allocateMilestoneTargets,
+    allocateMilestoneTargetsBySource,
+    orderMilestoneTargetsForDispatch,
     MIN_RESEARCH_MILESTONE_TARGETS,
     MAX_RESEARCH_MILESTONE_TARGETS,
     RESEARCH_MILESTONE_CONCURRENCY,
@@ -126,6 +132,42 @@ function capturedMarkets(matchId: string): Array<{ market: string; rows: number 
 }
 
 describe("runResearchTimelineTick Pinnacle checkpoints", () => {
+  it("aborts an in-flight Titan fixture refresh when the core milestone starts", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const engine = new RadarEngine();
+    vi.spyOn(engine as any, "refreshHkjc").mockResolvedValue(true);
+    (engine as any).pinnapi.status = vi.fn().mockReturnValue({ configured: false });
+    (engine as any).optic.fetchFixtures = vi.fn().mockResolvedValue([]);
+    const fetchTitanLiveFixtures = vi.fn();
+    (engine as any).pinnacle.fetchTitanLiveFixtures = fetchTitanLiveFixtures;
+    let fixtureSignal: AbortSignal | undefined;
+    let fixtureStarted!: () => void;
+    const started = new Promise<void>((resolve) => { fixtureStarted = resolve; });
+    (engine as any).pinnacle.fetchTitanResearchFixtures = vi.fn(
+      (_days: number[], options: { signal: AbortSignal }) => {
+        fixtureSignal = options.signal;
+        fixtureStarted();
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    );
+    const timelineRun = engine.runResearchTimelineTick({ captureMilestones: false });
+    await started;
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 0,
+      attempted: 0,
+    });
+    await expect(timelineRun).resolves.toEqual({ selected: 0, detailCalls: 0 });
+    expect(fixtureSignal?.aborted).toBe(true);
+    expect(fetchTitanLiveFixtures).not.toHaveBeenCalled();
+  });
+
   it("captures a mapped PinnAPI T5 checkpoint without relying on the dense scan", async () => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     const matchId = "hkjc:pinnapi-t5";
@@ -263,6 +305,162 @@ describe("runResearchTimelineTick Pinnacle checkpoints", () => {
 });
 
 describe("runResearchMilestoneTick fast checkpoint collector", () => {
+  it("finishes HKJC + Pinnacle before starting a Pinnacle + Crown fixture", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    addHkjcFixture("hkjc:priority-t30", NOW + 20 * 60_000, "pinnapi:priority-t30", {
+      pinnapiId: "priority-t30",
+    });
+    addPinnacleFixture("pinnacle:crown-t5", NOW + 4 * 60_000, "crown-t5");
+    const engine = new RadarEngine();
+    const requested: string[] = [];
+    (engine as any).pinnapi.fetchMatchPrices = vi.fn(async (id: string) => {
+      requested.push(`hkjc:${id}`);
+      return currentAhOu();
+    });
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn(async (id: string) => {
+      requested.push(`crown:${id}`);
+      return {
+        opening: [],
+        current: currentAhOu(),
+        sourceUrls: { AH: "ah", OU: "ou" },
+      };
+    });
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 2,
+      selectedHkjcPinnacle: 1,
+      selectedPinnacleCrown: 1,
+      attempted: 2,
+      fetched: 2,
+    });
+    expect(requested).toEqual(["hkjc:priority-t30", "crown:crown-t5"]);
+  });
+
+  it("aborts an in-flight lower-tier Titan request when the core milestone starts", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const crownMatchId = "pinnacle:interruptible";
+    addPinnacleFixture(crownMatchId, NOW + 4 * 60_000, "interruptible");
+    addHkjcFixture("hkjc:interrupt-priority", NOW + 20 * 60_000, "pinnapi:interrupt-priority", {
+      pinnapiId: "interrupt-priority",
+    });
+    const engine = new RadarEngine();
+    (engine as any).fixtureCache = {
+      at: NOW,
+      pinnapi: [],
+      optic: [],
+      titan: [{
+        providerMatchId: "interruptible",
+        league: "Test League",
+        homeTeam: "Home",
+        awayTeam: "Away",
+        kickoffUtc: NOW + 4 * 60_000,
+        statusText: "PREEVENT",
+        homeScore: null,
+        awayScore: null,
+        halfHome: null,
+        halfAway: null,
+        handicapVal: 0.25,
+        totalVal: 2.5,
+      }],
+    };
+    let lowerSignal: AbortSignal | undefined;
+    let lowerStarted!: () => void;
+    const started = new Promise<void>((resolve) => { lowerStarted = resolve; });
+    const fetchTitan = vi.fn()
+      .mockImplementationOnce((_id: string, options: { signal: AbortSignal }) => {
+        lowerSignal = options.signal;
+        lowerStarted();
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      })
+      .mockResolvedValue({
+        opening: [],
+        current: currentAhOu(),
+        sourceUrls: { AH: "ah", OU: "ou" },
+      });
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = fetchTitan;
+    (engine as any).pinnapi.fetchMatchPrices = vi.fn().mockResolvedValue(currentAhOu());
+
+    const lowerTierRun = engine.refreshPinnacleOnlyResearch(NOW);
+    await started;
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selectedHkjcPinnacle: 1,
+      fetched: 2,
+    });
+    await expect(lowerTierRun).resolves.toMatchObject({ fetched: 0 });
+    expect(lowerSignal?.aborted).toBe(true);
+  });
+
+  it("aborts an in-flight lower-tier PinnAPI fallback when the core milestone starts", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const crownMatchId = "pinnacle:interruptible-fallback";
+    addPinnacleFixture(crownMatchId, NOW + 4 * 60_000, "interruptible-fallback");
+    rawDb.prepare(
+      "UPDATE pinnacle_source_map SET pinnapi_id=?,active_source='titan007' WHERE match_id=?",
+    ).run("fallback-event", crownMatchId);
+    addHkjcFixture("hkjc:fallback-priority", NOW + 20 * 60_000, "pinnapi:fallback-priority", {
+      pinnapiId: "fallback-priority",
+    });
+    const engine = new RadarEngine();
+    (engine as any).fixtureCache = {
+      at: NOW,
+      pinnapi: [],
+      optic: [],
+      titan: [{
+        providerMatchId: "interruptible-fallback",
+        league: "Test League",
+        homeTeam: "Home",
+        awayTeam: "Away",
+        kickoffUtc: NOW + 4 * 60_000,
+        statusText: "PREEVENT",
+        homeScore: null,
+        awayScore: null,
+        halfHome: null,
+        halfAway: null,
+        handicapVal: 0.25,
+        totalVal: 2.5,
+      }],
+    };
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn().mockResolvedValue({
+      opening: [],
+      current: [],
+      sourceUrls: { AH: "ah", OU: "ou" },
+    });
+    let fallbackSignal: AbortSignal | undefined;
+    let fallbackStarted!: () => void;
+    const started = new Promise<void>((resolve) => { fallbackStarted = resolve; });
+    let firstFallback = true;
+    (engine as any).pinnapi.fetchMatchPrices = vi.fn(
+      (id: string, options: { signal?: AbortSignal } = {}) => {
+        if (id !== "fallback-event" || !firstFallback) return Promise.resolve(currentAhOu());
+        firstFallback = false;
+        fallbackSignal = options.signal;
+        fallbackStarted();
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    );
+
+    const lowerTierRun = engine.refreshPinnacleOnlyResearch(NOW);
+    await started;
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selectedHkjcPinnacle: 1,
+      fetched: 2,
+    });
+    await expect(lowerTierRun).resolves.toMatchObject({ fetched: 0 });
+    expect(fallbackSignal?.aborted).toBe(true);
+  });
+
   it("captures a persisted Pinnacle-only fixture without running discovery", async () => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     const matchId = "pinnacle:fast-t5";
@@ -382,9 +580,11 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
       attempted: 15,
       fetched: 15,
     });
-    // T5 keeps absolute priority, but T15/T30 in the same window are served in
-    // the same tick instead of being starved by a fixed 12-fixture slice.
-    expect(requested.slice(0, 13).every((id) => id.startsWith("t5-"))).toBe(true);
+    // T5 keeps the largest dispatch share, while T15/T30 are interleaved into
+    // the first worker wave so an upstream slowdown cannot strand them.
+    expect(requested.slice(0, 4).filter((id) => id.startsWith("t5-"))).toHaveLength(2);
+    expect(requested.slice(0, 4)).toContain("t15");
+    expect(requested.slice(0, 4)).toContain("t30");
     expect(requested).toContain("t15");
     expect(requested).toContain("t30");
   });
@@ -460,6 +660,60 @@ describe("per-stage fair allocation", () => {
 
   it("handles an empty budget", () => {
     expect(allocateMilestoneTargets(make("T5", 5), 0)).toEqual([]);
+  });
+});
+
+describe("source-tier allocation", () => {
+  const make = (
+    sourceTier: "hkjc-pinnacle" | "pinnacle-crown",
+    stage: "T30" | "T15" | "T5",
+    n: number,
+  ) => Array.from({ length: n }, (_, i) => ({
+    sourceTier,
+    stage,
+    id: `${sourceTier}-${stage}-${i}`,
+  }));
+
+  it("fills capacity with HKJC + Pinnacle before Pinnacle + Crown", () => {
+    const targets = [
+      ...make("pinnacle-crown", "T5", 20),
+      ...make("hkjc-pinnacle", "T30", 10),
+    ];
+    const picked = allocateMilestoneTargetsBySource(targets, 10);
+    expect(picked).toHaveLength(10);
+    expect(picked.every((target) => target.sourceTier === "hkjc-pinnacle")).toBe(true);
+  });
+
+  it("uses Pinnacle + Crown only for capacity left by HKJC + Pinnacle", () => {
+    const targets = [
+      ...make("pinnacle-crown", "T5", 20),
+      ...make("hkjc-pinnacle", "T30", 3),
+    ];
+    const picked = allocateMilestoneTargetsBySource(targets, 10);
+    expect(picked.map((target) => target.sourceTier)).toEqual([
+      "hkjc-pinnacle",
+      "hkjc-pinnacle",
+      "hkjc-pinnacle",
+      "pinnacle-crown",
+      "pinnacle-crown",
+      "pinnacle-crown",
+      "pinnacle-crown",
+      "pinnacle-crown",
+      "pinnacle-crown",
+      "pinnacle-crown",
+    ]);
+  });
+
+  it("dispatches T15 and T30 in the first worker wave", () => {
+    const ordered = orderMilestoneTargetsForDispatch([
+      ...make("hkjc-pinnacle", "T5", 20),
+      ...make("hkjc-pinnacle", "T15", 5),
+      ...make("hkjc-pinnacle", "T30", 5),
+    ]);
+    const firstWave = ordered.slice(0, 16);
+    expect(firstWave.some((target) => target.stage === "T15")).toBe(true);
+    expect(firstWave.some((target) => target.stage === "T30")).toBe(true);
+    expect(firstWave.filter((target) => target.stage === "T5")).toHaveLength(8);
   });
 });
 

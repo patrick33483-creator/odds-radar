@@ -633,12 +633,13 @@ export class PinnapiProvider {
   /** Raw, read-only event line payload for capability validation. */
   async fetchEventLinePayload(
     eventId: string,
-    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
   ): Promise<unknown> {
     this.requireConfigured();
     const safeId = encodeURIComponent(eventId);
     return fetchJson<unknown>(this.endpoint(`/kit/v1/prematch/lines?event_id=${safeId}`), {
       headers: pinnapiHeaders(),
+      signal: request.signal,
       timeoutMs: request.timeoutMs ?? 25_000,
       retries: request.retries ?? 1,
     });
@@ -657,7 +658,7 @@ export class PinnapiProvider {
 
   async fetchEventLines(
     eventId: string,
-    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
   ): Promise<PinnapiLines> {
     this.requireConfigured();
     try {
@@ -686,7 +687,7 @@ export class PinnapiProvider {
 
   async fetchMatchPrices(
     eventId: string,
-    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
   ): Promise<ProviderPrice[]> {
     return (await this.fetchEventLines(eventId, request)).prices;
   }

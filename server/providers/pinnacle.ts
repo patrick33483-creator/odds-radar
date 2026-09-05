@@ -459,7 +459,10 @@ export class PinnacleProvider {
    * same-day universe on every pass without invalidating the 10-minute cache
    * used by PinnAPI, OpticOdds and future-day static pages.
    */
-  async fetchTitanLiveFixtures(dayOffsets: number[] = [0, 1]): Promise<PinnacleFixture[]> {
+  async fetchTitanLiveFixtures(
+    dayOffsets: number[] = [0, 1],
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
+  ): Promise<PinnacleFixture[]> {
     const now = Date.now();
     const requestedKeys = new Set(dayOffsets.map((off) => ymd(new Date(now + off * 86_400_000))));
     const candidates = [LIVE_DATA];
@@ -477,21 +480,26 @@ export class PinnacleProvider {
             "sec-fetch-mode": "no-cors",
             "sec-fetch-site": "same-site",
           },
-          timeoutMs: 8_000,
-          retries: 0,
+          signal: request.signal,
+          timeoutMs: request.timeoutMs ?? 8_000,
+          retries: request.retries ?? 0,
         });
         if (!liveJs.trim()) throw new Error("HTTP 200 但回傳空內容");
         const parsed = parseTitanLiveData(liveJs);
         if (!parsed.length) throw new Error(`回傳 ${liveJs.length} bytes 但解析到 0 場`);
         return parsed.filter((fixture) => requestedKeys.has(ymd(new Date(fixture.kickoffUtc))));
       } catch (err) {
+        if (request.signal?.aborted) throw err;
         lastError = err instanceof Error ? err : new Error(String(err));
       }
     }
     throw lastError ?? new Error("Titan 即時完整賽程沒有可用回應");
   }
 
-  private async fetchTitanFixtures(dayOffsets: number[]): Promise<PinnacleFixture[]> {
+  private async fetchTitanFixtures(
+    dayOffsets: number[],
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
+  ): Promise<PinnacleFixture[]> {
     const out: PinnacleFixture[] = [];
     const now = Date.now();
 
@@ -499,8 +507,9 @@ export class PinnacleProvider {
     // omitted from Next_ pages (notably youth and smaller leagues), so let it
     // win deduplication and use the static pages as future-day/backup coverage.
     try {
-      out.push(...await this.fetchTitanLiveFixtures(dayOffsets));
+      out.push(...await this.fetchTitanLiveFixtures(dayOffsets, request));
     } catch (err) {
+      if (request.signal?.aborted) throw err;
       this.warn(`Titan 即時完整賽程暫時不可用 (${(err as Error).message}); 已改用靜態賽程後備`);
     }
 
@@ -518,16 +527,19 @@ export class PinnacleProvider {
           try {
             html = await fetchText(`${BF}/big/${kind}_${key}.htm`, {
               charset: "gb18030",
-              timeoutMs: 25_000,
-              retries: 1,
+              signal: request.signal,
+              timeoutMs: request.timeoutMs ?? 25_000,
+              retries: request.retries ?? 1,
             });
-          } catch {
+          } catch (err) {
+            if (request.signal?.aborted) throw err;
             // The Simplified-Chinese schedule is still an acceptable direct
             // Chinese source if the Traditional page is temporarily absent.
             html = await fetchText(`${BF}/${kind}_${key}.htm`, {
               charset: "gb18030",
-              timeoutMs: 25_000,
-              retries: 1,
+              signal: request.signal,
+              timeoutMs: request.timeoutMs ?? 25_000,
+              retries: request.retries ?? 1,
             });
           }
           const rows = parseSchedulePage(html, key);
@@ -535,7 +547,8 @@ export class PinnacleProvider {
             out.push(...rows);
             break;
           }
-        } catch {
+        } catch (err) {
+          if (request.signal?.aborted) throw err;
           /* try the other kind */
         }
       }
@@ -545,8 +558,11 @@ export class PinnacleProvider {
   }
 
   /** Titan schedule is the authoritative fixture universe for Crown research. */
-  async fetchTitanResearchFixtures(dayOffsets: number[] = [0, 1]): Promise<PinnacleFixture[]> {
-    return this.fetchTitanFixtures(dayOffsets);
+  async fetchTitanResearchFixtures(
+    dayOffsets: number[] = [0, 1],
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
+  ): Promise<PinnacleFixture[]> {
+    return this.fetchTitanFixtures(dayOffsets, request);
   }
 
   /** Pinnacle prices for one provider match id. Missing markets are simply absent. */
@@ -661,7 +677,7 @@ export class PinnacleProvider {
   /** Research-only Pinnacle AH/OU with explicit opening and current values. */
   async fetchPinnacleResearchPrices(
     sId: string,
-    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+    request: Pick<FetchOpts, "signal" | "timeoutMs" | "retries"> = {},
   ): Promise<CrownResearchPrices> {
     const now = Date.now();
     const timeoutMs = request.timeoutMs ?? 30_000;
@@ -671,8 +687,8 @@ export class PinnacleProvider {
       OU: `${VIP}/OverDown_n.aspx?id=${sId}`,
     };
     const [ah, ou] = await Promise.allSettled([
-      fetchText(sourceUrls.AH, { timeoutMs, retries }),
-      fetchText(sourceUrls.OU, { timeoutMs, retries }),
+      fetchText(sourceUrls.AH, { signal: request.signal, timeoutMs, retries }),
+      fetchText(sourceUrls.OU, { signal: request.signal, timeoutMs, retries }),
     ]);
     if (ah.status === "rejected" && ou.status === "rejected") {
       throw new Error(`Pinnacle research detail unavailable for ${sId}: ${(ah.reason as Error)?.message ?? "unknown"}`);

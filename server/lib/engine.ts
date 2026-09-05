@@ -225,6 +225,67 @@ export function allocateMilestoneTargets<T extends { stage: "T30" | "T15" | "T5"
   return (["T5", "T15", "T30"] as const).flatMap((stage) => byStage[stage].slice(0, taken[stage]));
 }
 
+export type ResearchMilestoneSourceTier = "hkjc-pinnacle" | "pinnacle-crown";
+
+/**
+ * Core source order is stronger than checkpoint urgency:
+ *   1. HKJC + Pinnacle common fixtures
+ *   2. Pinnacle + Crown common fixtures
+ *
+ * Stage fairness is still preserved inside each source tier. A lower tier can
+ * only consume capacity left after the higher tier has been fully allocated.
+ */
+export function allocateMilestoneTargetsBySource<
+  T extends {
+    stage: "T30" | "T15" | "T5";
+    sourceTier: ResearchMilestoneSourceTier;
+  },
+>(
+  targets: readonly T[],
+  capacity: number,
+): T[] {
+  if (capacity <= 0) return [];
+  const selected: T[] = [];
+  for (const sourceTier of ["hkjc-pinnacle", "pinnacle-crown"] as const) {
+    const remaining = capacity - selected.length;
+    if (remaining <= 0) break;
+    selected.push(...allocateMilestoneTargets(
+      targets.filter((target) => target.sourceTier === sourceTier),
+      remaining,
+    ));
+  }
+  return selected;
+}
+
+/**
+ * Dispatch reserved stages throughout the worker waves instead of placing
+ * every T5 first. The 2:1:1 cycle keeps T5 urgent while guaranteeing T15 and
+ * T30 work reaches the first wave when those stages are present.
+ */
+export function orderMilestoneTargetsForDispatch<
+  T extends { stage: "T30" | "T15" | "T5" },
+>(targets: readonly T[]): T[] {
+  const byStage = {
+    T5: targets.filter((target) => target.stage === "T5"),
+    T15: targets.filter((target) => target.stage === "T15"),
+    T30: targets.filter((target) => target.stage === "T30"),
+  };
+  const cursor = { T5: 0, T15: 0, T30: 0 };
+  const ordered: T[] = [];
+  const cycle = ["T5", "T5", "T15", "T30"] as const;
+  while (ordered.length < targets.length) {
+    let added = false;
+    for (const stage of cycle) {
+      const target = byStage[stage][cursor[stage]++];
+      if (!target) continue;
+      ordered.push(target);
+      added = true;
+    }
+    if (!added) break;
+  }
+  return ordered;
+}
+
 /** Worker fan-out for one tick, never more than the work available. */
 export function researchMilestoneConcurrency(
   targetCount: number,
@@ -691,6 +752,8 @@ export class RadarEngine {
   private scanning = false;
   private matchRefreshes = new Map<string, Promise<MatchRefreshResponse>>();
   private pinnacleTranslationRefreshRunning = false;
+  private researchMilestoneRunning = false;
+  private lowerTierResearchController: AbortController | null = null;
   // The board is a read-only projection.  Build it after a refresh and reuse
   // that immutable object for API polls so a busy provider/scan cannot make a
   // client request synchronously rebuild every market calculation.
@@ -971,7 +1034,7 @@ export class RadarEngine {
    * OpticOdds and titan007 stay fallback candidates for events PinnAPI does not
    * map; titan007 is also retained independently for Crown lock-price lookups.
    */
-  private async refreshPinnacleFixtures(): Promise<number> {
+  private async refreshPinnacleFixtures(lowerTierSignal?: AbortSignal): Promise<number> {
     const now = Date.now();
     if (!this.fixtureCache || Date.now() - this.fixtureCache.at > FIXTURE_CACHE_MS) {
       if (DEMO) {
@@ -1005,13 +1068,22 @@ export class RadarEngine {
         } catch (err) {
           log("optic_fixtures_error", { error: (err as Error).message });
         }
-        let titan: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>> = [];
-        try {
-          titan = await this.pinnacle.fetchTitanResearchFixtures([0, 1, 2, 3, 4]);
-        } catch (err) {
-          // Crown/titan007 is deliberately non-primary. Its fixture endpoint
-          // must not prevent PinnAPI EV mapping or Optic's unmapped fallback.
-          log("titan_fixtures_error", { error: (err as Error).message });
+        let titan: Awaited<ReturnType<PinnacleProvider["fetchFixtures"]>> =
+          this.fixtureCache?.titan ?? [];
+        if (!lowerTierSignal?.aborted && !this.researchMilestoneRunning) {
+          try {
+            titan = await this.pinnacle.fetchTitanResearchFixtures([0, 1, 2, 3, 4], {
+              signal: lowerTierSignal,
+              timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+              retries: 0,
+            });
+          } catch (err) {
+            // Crown/titan007 is deliberately non-primary. Its fixture endpoint
+            // must not prevent PinnAPI EV mapping or Optic's unmapped fallback.
+            if (!lowerTierSignal?.aborted) {
+              log("titan_fixtures_error", { error: (err as Error).message });
+            }
+          }
         }
         this.fixtureCache = { at: Date.now(), pinnapi, optic, titan };
       }
@@ -1154,6 +1226,7 @@ export class RadarEngine {
   async refreshPinnacleOnlyResearch(
     now = Date.now(),
     captureMilestones = true,
+    sharedLowerTierController?: AbortController,
   ): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
     const refreshStartedAt = Date.now();
     // Requires the caller to have already populated fixtureCache via
@@ -1442,6 +1515,19 @@ export class RadarEngine {
     );
     const eligible = prioritizePendingPinnacleResearchTargets(targets, capturedOuStages, now)
       .filter((target) => captureMilestones || target.stage === "initial");
+    if (this.researchMilestoneRunning) {
+      log("pinnacle_only_research_deferred", {
+        fixtures: targets.length,
+        pendingMilestones: eligible.length,
+        reason: "hkjc_pinnacle_priority",
+      });
+      return { fixtures: targets.length, fetched: 0, failed: 0, rows: 0 };
+    }
+    const lowerTierController = sharedLowerTierController ?? new AbortController();
+    if (!sharedLowerTierController) {
+      this.lowerTierResearchController?.abort();
+      this.lowerTierResearchController = lowerTierController;
+    }
     // Fixture reconciliation can be expensive on a busy slate. The provider
     // budget must start only after that preparation has finished; otherwise
     // pre-processing can consume the whole window and no Titan detail request
@@ -1456,7 +1542,7 @@ export class RadarEngine {
     // in a busy kickoff slate. Priority order is still T5, T15, T30, initial.
     let nextTarget = 0;
     const worker = async (): Promise<void> => {
-      while (Date.now() <= deadline) {
+      while (Date.now() <= deadline && !lowerTierController.signal.aborted) {
         const target = eligible[nextTarget++];
         if (!target) return;
         let providerSucceeded = false;
@@ -1473,9 +1559,14 @@ export class RadarEngine {
                   current: DEMO_FIXTURE.pinnaclePrices[`titan:${target.eventId}`] ?? [],
                   sourceUrls: { AH: "demo:pinnacle:AH", OU: "demo:pinnacle:OU" },
                 }
-              : await this.pinnacle.fetchPinnacleResearchPrices(target.eventId);
+              : await this.pinnacle.fetchPinnacleResearchPrices(target.eventId, {
+                  signal: lowerTierController.signal,
+                  timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+                  retries: 0,
+                });
             providerSucceeded = true;
           } catch (err) {
+            if (lowerTierController.signal.aborted) return;
             log("pinnacle_only_titan_detail_error", {
               eventId: target.eventId,
               error: (err as Error).message,
@@ -1500,14 +1591,20 @@ export class RadarEngine {
             !current.length
             && target.stage !== "initial"
             && pinnapiMapping
+            && !lowerTierController.signal.aborted
           ) {
             try {
-              current = await this.pinnapi.fetchMatchPrices(pinnapiMapping.eventId);
+              current = await this.pinnapi.fetchMatchPrices(pinnapiMapping.eventId, {
+                signal: lowerTierController.signal,
+                timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+                retries: 0,
+              });
               if (pinnapiMapping.reversed) current = this.reversePinnaclePrices(current);
               currentSourceName = "pinnapi";
               currentSourceMatchId = pinnapiMapping.eventId;
               providerSucceeded = true;
             } catch (err) {
+              if (lowerTierController.signal.aborted) return;
               log("pinnacle_only_pinnapi_detail_error", {
                 eventId: target.eventId,
                 pinnapiEventId: pinnapiMapping.eventId,
@@ -1541,7 +1638,13 @@ export class RadarEngine {
       }
     };
     const workerCount = Math.min(12, eligible.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    try {
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    } finally {
+      if (this.lowerTierResearchController === lowerTierController) {
+        this.lowerTierResearchController = null;
+      }
+    }
 
     // Pinnacle-only fixtures can qualify for the OU signal path via the
     // existing prealert/observation sync (rule provider='pinnacle' only).
@@ -2242,8 +2345,21 @@ export class RadarEngine {
    * Crown fetch or Telegram work. Each provider request owns a real aborting
    * timeout, and observations are timestamped only after the response arrives.
    */
-  async runResearchMilestoneTick(): Promise<{
+  async runResearchMilestoneTick() {
+    this.researchMilestoneRunning = true;
+    this.lowerTierResearchController?.abort();
+    this.lowerTierResearchController = null;
+    try {
+      return await this.collectResearchMilestoneTick();
+    } finally {
+      this.researchMilestoneRunning = false;
+    }
+  }
+
+  private async collectResearchMilestoneTick(): Promise<{
     selected: number;
+    selectedHkjcPinnacle: number;
+    selectedPinnacleCrown: number;
     /** In-window fixtures with no Pinnacle/Titan id, so never requested. */
     unmapped: number;
     /** In-window fixtures whose current checkpoint is already complete. */
@@ -2253,12 +2369,17 @@ export class RadarEngine {
     failed: number;
     rows: number;
     runtimeMs: number;
+    attemptedByStage: Record<"T30" | "T15" | "T5", number>;
+    deadlineSkippedByStage: Record<"T30" | "T15" | "T5", number>;
+    attemptedBySource: Record<ResearchMilestoneSourceTier, number>;
+    deadlineSkippedBySource: Record<ResearchMilestoneSourceTier, number>;
   }> {
     const startedAt = Date.now();
     type Target = {
       id: string;
       kickoffUtc: number;
       stage: "T30" | "T15" | "T5";
+      sourceTier: ResearchMilestoneSourceTier;
       titanId: string | null;
       titanReversed: boolean;
       pinnapiId: string | null;
@@ -2267,7 +2388,7 @@ export class RadarEngine {
       missingMarkets: Array<"AH" | "OU">;
     };
     const candidates = rawDb.prepare(
-      `SELECT m.id,m.kickoff_utc,m.titan_id,m.pinnacle_match_id,
+      `SELECT m.id,m.fixture_source,m.kickoff_utc,m.titan_id,m.pinnacle_match_id,
               p.titan_id mapped_titan_id,COALESCE(p.titan_reversed,0) titan_reversed,
               p.pinnapi_id,COALESCE(p.pinnapi_reversed,0) pinnapi_reversed,
               p.active_source,m.status
@@ -2280,6 +2401,7 @@ export class RadarEngine {
         ORDER BY m.kickoff_utc`,
     ).all(startedAt, startedAt + 30 * 60_000) as Array<{
       id: string;
+      fixture_source: "hkjc" | "pinnacle";
       kickoff_utc: number;
       titan_id: string | null;
       pinnacle_match_id: string | null;
@@ -2340,6 +2462,7 @@ export class RadarEngine {
         id: row.id,
         kickoffUtc: row.kickoff_utc,
         stage,
+        sourceTier: row.fixture_source === "hkjc" ? "hkjc-pinnacle" : "pinnacle-crown",
         titanId,
         titanReversed: !!row.titan_reversed,
         pinnapiId,
@@ -2352,105 +2475,131 @@ export class RadarEngine {
         missingMarkets,
       }];
     });
-    const targets = allocateMilestoneTargets(
+    const targets = allocateMilestoneTargetsBySource(
       eligible.sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc),
       researchMilestoneCapacity(candidates.length),
     );
+    const hkjcPinnacleTargets = targets.filter((target) => target.sourceTier === "hkjc-pinnacle");
+    const pinnacleCrownTargets = targets.filter((target) => target.sourceTier === "pinnacle-crown");
 
     let attempted = 0;
     let fetched = 0;
     let failed = 0;
     let rows = 0;
-    let cursor = 0;
-    const worker = async (): Promise<void> => {
-      while (true) {
-        // Every worker always services at least one target; beyond that the
-        // tick must yield before the next 30-second scheduler callback.
-        if (cursor > 0 && Date.now() - startedAt > RESEARCH_MILESTONE_LOOP_MS) return;
-        const target = targets[cursor++];
-        if (!target) return;
-        attempted++;
-        const [titan, pinnapi] = await Promise.allSettled([
-          target.titanId
-            ? this.pinnacle.fetchPinnacleResearchPrices(target.titanId, {
-                timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
-                retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
-              }).then((value) => ({ prices: value.current, completedAt: Date.now() }))
-            : Promise.resolve(null),
-          target.pinnapiId
-            ? this.pinnapi.fetchMatchPrices(target.pinnapiId, {
-                timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
-                retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
-              }).then((prices) => ({ prices, completedAt: Date.now() }))
-            : Promise.resolve(null),
-        ]);
-        const titanResult = titan.status === "fulfilled" && titan.value
-          ? {
-              prices: target.titanReversed
-                ? this.reversePinnaclePrices(titan.value.prices)
-                : titan.value.prices,
-              completedAt: titan.value.completedAt,
-              sourceName: "titan007-pinnacle",
-              sourceMatchId: target.titanId,
-            }
-          : null;
-        const pinnapiResult = pinnapi.status === "fulfilled" && pinnapi.value
-          ? {
-              prices: target.pinnapiReversed
-                ? this.reversePinnaclePrices(pinnapi.value.prices)
-                : pinnapi.value.prices,
-              completedAt: pinnapi.value.completedAt,
-              sourceName: "pinnapi",
-              sourceMatchId: target.pinnapiId,
-            }
-          : null;
-        const preferred = target.activeSource === "pinnapi"
-          ? [pinnapiResult, titanResult]
-          : [titanResult, pinnapiResult];
-        let insertedForTarget = 0;
-        for (const market of target.missingMarkets) {
-          const chosen = preferred.find((result) => {
-            if (!result) return false;
-            const selections = new Set(
-              result.prices
-                .filter((price) => price.market === market)
-                .map((price) => price.selection),
-            );
-            return market === "AH"
-              ? selections.has("H") && selections.has("A")
-              : selections.has("O") && selections.has("U");
-          });
-          if (!chosen) continue;
-          const completedStage = researchStageFor(target.kickoffUtc, chosen.completedAt);
+    const attemptedByStage = { T30: 0, T15: 0, T5: 0 };
+    const attemptedBySource = { "hkjc-pinnacle": 0, "pinnacle-crown": 0 };
+    const runBatch = async (
+      batch: readonly Target[],
+      allowFirstPastDeadline: boolean,
+    ): Promise<void> => {
+      const dispatchQueue = orderMilestoneTargetsForDispatch(batch);
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        while (true) {
+          // HKJC + Pinnacle owns the first pass. The lower-priority
+          // Pinnacle + Crown batch is never allowed to start after the tick
+          // budget has expired, so slow Crown-linked work cannot extend or
+          // displace the core HKJC collection.
           if (
-            !completedStage
-            || completePairs.has(`${target.id}:${completedStage}:${market}`)
-          ) continue;
-          insertedForTarget += captureResearchTimelinePrices(
-            target.id,
-            "pinnacle",
-            chosen.prices.filter((price) => price.market === market),
-            target.kickoffUtc,
-            chosen.completedAt,
-            {
-              sourceName: chosen.sourceName,
-              sourceMatchId: chosen.sourceMatchId,
-            },
-          );
+            Date.now() - startedAt > RESEARCH_MILESTONE_LOOP_MS
+            && (!allowFirstPastDeadline || cursor > 0)
+          ) return;
+          const target = dispatchQueue[cursor++];
+          if (!target) return;
+          attempted++;
+          attemptedByStage[target.stage]++;
+          attemptedBySource[target.sourceTier]++;
+          const [titan, pinnapi] = await Promise.allSettled([
+            target.titanId
+              ? this.pinnacle.fetchPinnacleResearchPrices(target.titanId, {
+                  timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+                  retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
+                }).then((value) => ({ prices: value.current, completedAt: Date.now() }))
+              : Promise.resolve(null),
+            target.pinnapiId
+              ? this.pinnapi.fetchMatchPrices(target.pinnapiId, {
+                  timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+                  retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
+                }).then((prices) => ({ prices, completedAt: Date.now() }))
+              : Promise.resolve(null),
+          ]);
+          const titanResult = titan.status === "fulfilled" && titan.value
+            ? {
+                prices: target.titanReversed
+                  ? this.reversePinnaclePrices(titan.value.prices)
+                  : titan.value.prices,
+                completedAt: titan.value.completedAt,
+                sourceName: "titan007-pinnacle",
+                sourceMatchId: target.titanId,
+              }
+            : null;
+          const pinnapiResult = pinnapi.status === "fulfilled" && pinnapi.value
+            ? {
+                prices: target.pinnapiReversed
+                  ? this.reversePinnaclePrices(pinnapi.value.prices)
+                  : pinnapi.value.prices,
+                completedAt: pinnapi.value.completedAt,
+                sourceName: "pinnapi",
+                sourceMatchId: target.pinnapiId,
+              }
+            : null;
+          const preferred = target.activeSource === "pinnapi"
+            ? [pinnapiResult, titanResult]
+            : [titanResult, pinnapiResult];
+          let insertedForTarget = 0;
+          for (const market of target.missingMarkets) {
+            const chosen = preferred.find((result) => {
+              if (!result) return false;
+              const selections = new Set(
+                result.prices
+                  .filter((price) => price.market === market)
+                  .map((price) => price.selection),
+              );
+              return market === "AH"
+                ? selections.has("H") && selections.has("A")
+                : selections.has("O") && selections.has("U");
+            });
+            if (!chosen) continue;
+            const completedStage = researchStageFor(target.kickoffUtc, chosen.completedAt);
+            if (
+              !completedStage
+              || completePairs.has(`${target.id}:${completedStage}:${market}`)
+            ) continue;
+            insertedForTarget += captureResearchTimelinePrices(
+              target.id,
+              "pinnacle",
+              chosen.prices.filter((price) => price.market === market),
+              target.kickoffUtc,
+              chosen.completedAt,
+              {
+                sourceName: chosen.sourceName,
+                sourceMatchId: chosen.sourceMatchId,
+              },
+            );
+          }
+          if (!insertedForTarget) {
+            failed++;
+            continue;
+          }
+          fetched++;
+          rows += insertedForTarget;
         }
-        if (!insertedForTarget) {
-          failed++;
-          continue;
-        }
-        fetched++;
-        rows += insertedForTarget;
       }
+      await Promise.all(
+        Array.from({ length: researchMilestoneConcurrency(batch.length) }, () => worker()),
+      );
     };
-    await Promise.all(
-      Array.from({ length: researchMilestoneConcurrency(targets.length) }, () => worker()),
-    );
+    await runBatch(hkjcPinnacleTargets, true);
+    await runBatch(pinnacleCrownTargets, hkjcPinnacleTargets.length === 0);
+    const selectedByStage = {
+      T30: targets.filter((target) => target.stage === "T30").length,
+      T15: targets.filter((target) => target.stage === "T15").length,
+      T5: targets.filter((target) => target.stage === "T5").length,
+    };
     return {
       selected: targets.length,
+      selectedHkjcPinnacle: hkjcPinnacleTargets.length,
+      selectedPinnacleCrown: pinnacleCrownTargets.length,
       unmapped,
       alreadyComplete,
       attempted,
@@ -2458,6 +2607,17 @@ export class RadarEngine {
       failed,
       rows,
       runtimeMs: Date.now() - startedAt,
+      attemptedByStage,
+      deadlineSkippedByStage: {
+        T30: selectedByStage.T30 - attemptedByStage.T30,
+        T15: selectedByStage.T15 - attemptedByStage.T15,
+        T5: selectedByStage.T5 - attemptedByStage.T5,
+      },
+      attemptedBySource,
+      deadlineSkippedBySource: {
+        "hkjc-pinnacle": hkjcPinnacleTargets.length - attemptedBySource["hkjc-pinnacle"],
+        "pinnacle-crown": pinnacleCrownTargets.length - attemptedBySource["pinnacle-crown"],
+      },
     };
   }
 
@@ -2567,9 +2727,26 @@ export class RadarEngine {
   async runResearchTimelineTick(
     options: { captureMilestones?: boolean } = {},
   ): Promise<{ selected: number; detailCalls: number }> {
+    const lowerTierController = new AbortController();
+    this.lowerTierResearchController?.abort();
+    if (this.researchMilestoneRunning) lowerTierController.abort();
+    else this.lowerTierResearchController = lowerTierController;
+    try {
+      return await this.collectResearchTimelineTick(options, lowerTierController);
+    } finally {
+      if (this.lowerTierResearchController === lowerTierController) {
+        this.lowerTierResearchController = null;
+      }
+    }
+  }
+
+  private async collectResearchTimelineTick(
+    options: { captureMilestones?: boolean },
+    lowerTierController: AbortController,
+  ): Promise<{ selected: number; detailCalls: number }> {
     const captureMilestones = options.captureMilestones ?? true;
     await this.refreshHkjc();
-    await this.refreshPinnacleFixtures();
+    await this.refreshPinnacleFixtures(lowerTierController.signal);
     // This pass is deliberately independent of the dense execution scanner.
     // It selects only the current, still-pre-kickoff milestone and bypasses the
     // normal detail cache so a T30/T15/T5 checkpoint cannot inherit an earlier
@@ -2598,7 +2775,14 @@ export class RadarEngine {
     // fixture cache. A failed refresh never deletes the last good universe.
     if (!DEMO && this.fixtureCache) {
       try {
-        const live = await this.pinnacle.fetchTitanLiveFixtures([0, 1, 2, 3, 4]);
+        if (lowerTierController.signal.aborted || this.researchMilestoneRunning) {
+          throw new DOMException("Deferred for HKJC + Pinnacle milestone", "AbortError");
+        }
+        const live = await this.pinnacle.fetchTitanLiveFixtures([0, 1, 2, 3, 4], {
+          signal: lowerTierController.signal,
+          timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+          retries: 0,
+        });
         const liveIds = new Set(live.map((fixture) => fixture.providerMatchId));
         const merged = new Map(
           [...this.fixtureCache.titan, ...live].map((fixture) => [fixture.providerMatchId, fixture]),
@@ -2610,18 +2794,20 @@ export class RadarEngine {
           mergedFixtures: this.fixtureCache.titan.length,
         });
       } catch (err) {
-        log("titan_live_fixture_error", {
-          error: (err as Error).message,
-          retainedLiveFixtures: this.lastTitanLiveFixtureIds.size,
-          retainedMergedFixtures: this.fixtureCache.titan.length,
-        });
+        if (!lowerTierController.signal.aborted) {
+          log("titan_live_fixture_error", {
+            error: (err as Error).message,
+            retainedLiveFixtures: this.lastTitanLiveFixtureIds.size,
+            retainedMergedFixtures: this.fixtureCache.titan.length,
+          });
+        }
       }
     }
     // Pinnacle-only research runs after the shared fixture cache is warm.
     // It writes only research-timeline rows and never touches HKJC execution
     // or the T-30 window scanner.
     try {
-      await this.refreshPinnacleOnlyResearch(Date.now(), captureMilestones);
+      await this.refreshPinnacleOnlyResearch(Date.now(), captureMilestones, lowerTierController);
     } catch (err) {
       log("pinnacle_only_research_error", { error: (err as Error).message });
     }
