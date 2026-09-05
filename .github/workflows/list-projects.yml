@@ -1,0 +1,16 @@
+name: list-projects
+on: workflow_dispatch
+jobs:
+  d:
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'ls /opt/ 2>/dev/null; echo === package.json ===; find /opt -maxdepth 3 -name "package.json" 2>/dev/null; echo === systemd ===; sudo systemctl list-units --type=service --state=running 2>/dev/null | grep -iE "node|odds|radar|signal|crown|v2" | head -20; echo === pm2 ===; pm2 list 2>/dev/null | head -30; sudo -u root pm2 list 2>/dev/null | head -30; echo === nginx ===; sudo grep -rE "server_name|proxy_pass|listen " /etc/nginx/ 2>/dev/null | grep -v "^#" | head -40'
