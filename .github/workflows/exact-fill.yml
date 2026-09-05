@@ -24,11 +24,10 @@ jobs:
           scp "$TSV" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/exact.tsv"
           cat > /tmp/e.py <<'PYEOF'
           import sqlite3, datetime, time
-          try:
-              from zhconv import convert
-          except:
-              import subprocess; subprocess.check_call(["pip3","install","--quiet","zhconv"])
-              from zhconv import convert
+          # inline simp->trad table
+          _MAP = {"诺":"諾","贝":"貝","尔":"爾","罗":"羅","纳":"納","车":"車","头":"頭","鲁":"魯","亚":"亞","陆":"陸","军":"軍","队":"隊","达":"達","电":"電","鲜":"鮮","费":"費","伦":"倫","维":"維","萨":"薩","体":"體","圣":"聖","宾":"賓","莱":"萊","马":"馬","乌":"烏","泽":"澤","兹":"茲","兰":"蘭","波":"波","泰":"泰","奥":"奧","塔":"塔","堡":"堡","青":"青","及":"及","信":"信","朗":"朗","越":"越","南":"南","加":"加","勒":"勒","斯":"斯","特":"特","快":"快","速":"速","蒙":"蒙","格":"格","多":"多","察":"察","索":"索","菲":"菲","中":"中","央":"央","保":"保","文":"文","雅":"雅","洛":"洛","朝":"朝","伊":"伊","巴":"巴","吉":"吉","里":"里","茨":"茨","辛":"辛","迪":"迪","哥":"哥","卡":"卡","穆":"穆","罕":"罕","普":"普","育":"育","彼":"彼","德":"德","年":"年","喀":"喀","山":"山","切":"切","尼":"尼","什":"什","瓦":"瓦","布":"布","利":"利","沃":"沃","蒂":"蒂","米":"米","红":"紅","篮":"籃","塞":"塞","让":"讓","东":"東","国":"國","会":"會","专":"專","车":"車"}
+          def to_trad(s):
+              return "".join(_MAP.get(c, c) for c in s)
           hkt = datetime.timezone(datetime.timedelta(hours=8))
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30, isolation_level=None)
           db.execute("PRAGMA busy_timeout=60000")
@@ -39,20 +38,14 @@ jobs:
               if len(p) < 5: continue
               fills.append(dict(home=p[0],away=p[1],hs=int(p[2]),as_=int(p[3]),date=p[4]))
           def variants(s):
-              vs = {s}
-              for tgt in ["zh-hk","zh-tw","zh-cn","zh-hant","zh-hans"]:
-                  try: vs.add(convert(s, tgt))
-                  except: pass
-              return list(vs)
+              return list({s, to_trad(s)})
           filled = 0; missed = []; matched_ids = []
           for e in fills:
               y,m,d = [int(x) for x in e["date"].split("-")]
               lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
               hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
               hs = variants(e["home"]); as_ = variants(e["away"])
-              # EXACT match on BOTH team names (any variant)
-              rows = []
-              seen = set()
+              rows = []; seen = set()
               for h in hs:
                   for a in as_:
                       for r in db.execute("""
