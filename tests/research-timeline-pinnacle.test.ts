@@ -6,12 +6,24 @@ process.env.RADAR_DB = dbPath;
 
 let RadarEngine: typeof import("../server/lib/engine").RadarEngine;
 let rawDb: typeof import("../server/lib/store").rawDb;
+let researchMilestoneCapacity: typeof import("../server/lib/engine").researchMilestoneCapacity;
+let researchMilestoneConcurrency: typeof import("../server/lib/engine").researchMilestoneConcurrency;
+let MIN_RESEARCH_MILESTONE_TARGETS: number;
+let MAX_RESEARCH_MILESTONE_TARGETS: number;
+let RESEARCH_MILESTONE_CONCURRENCY: number;
 
 const NOW = 1_900_000_000_000;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
-  ({ RadarEngine } = await import("../server/lib/engine"));
+  ({
+    RadarEngine,
+    researchMilestoneCapacity,
+    researchMilestoneConcurrency,
+    MIN_RESEARCH_MILESTONE_TARGETS,
+    MAX_RESEARCH_MILESTONE_TARGETS,
+    RESEARCH_MILESTONE_CONCURRENCY,
+  } = await import("../server/lib/engine"));
   rawDb = store.rawDb;
   store.migrate();
 });
@@ -272,8 +284,8 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     });
 
     expect(fetchTitan).toHaveBeenCalledWith("fast-t5", {
-      timeoutMs: 7_000,
-      retries: 0,
+      timeoutMs: 4_000,
+      retries: 1,
     });
     expect(refreshHkjc).not.toHaveBeenCalled();
     expect(refreshFixtures).not.toHaveBeenCalled();
@@ -345,7 +357,7 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     ]);
   });
 
-  it("prioritizes T5 and caps each fast pass", async () => {
+  it("prioritizes T5 but no longer drops the rest of the window", async () => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
     for (let i = 0; i < 13; i++) {
       addPinnacleFixture(`pinnacle:t5-${i}`, NOW + (i + 1) * 10_000, `t5-${i}`);
@@ -364,11 +376,52 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     });
 
     await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
-      selected: 12,
-      attempted: 12,
-      fetched: 12,
+      selected: 15,
+      attempted: 15,
+      fetched: 15,
     });
-    expect(requested).toHaveLength(12);
-    expect(requested.every((id) => id.startsWith("t5-"))).toBe(true);
+    // T5 keeps absolute priority, but T15/T30 in the same window are served in
+    // the same tick instead of being starved by a fixed 12-fixture slice.
+    expect(requested.slice(0, 13).every((id) => id.startsWith("t5-"))).toBe(true);
+    expect(requested).toContain("t15");
+    expect(requested).toContain("t30");
+  });
+
+  it("scales the per-tick budget past the capacity floor and honours the ceiling", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    for (let i = 0; i < 60; i++) {
+      addPinnacleFixture(`pinnacle:burst-${i}`, NOW + 16 * 60_000 + i * 1_000, `burst-${i}`);
+    }
+    const engine = new RadarEngine();
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn().mockResolvedValue({
+      opening: [],
+      current: currentAhOu(),
+      sourceUrls: { AH: "ah", OU: "ou" },
+    });
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 60,
+      attempted: 60,
+      fetched: 60,
+    });
+  });
+});
+
+describe("milestone capacity helpers", () => {
+  it("never selects fewer than the floor and never exceeds the ceiling", () => {
+    expect(researchMilestoneCapacity(3, {})).toBe(MIN_RESEARCH_MILESTONE_TARGETS);
+    expect(researchMilestoneCapacity(120, {})).toBe(120);
+    expect(researchMilestoneCapacity(5_000, {})).toBe(MAX_RESEARCH_MILESTONE_TARGETS);
+    expect(researchMilestoneCapacity(5_000, { RADAR_MILESTONE_MAX_TARGETS: "90" })).toBe(90);
+    expect(researchMilestoneCapacity(5_000, { RADAR_MILESTONE_MAX_TARGETS: "nope" }))
+      .toBe(MAX_RESEARCH_MILESTONE_TARGETS);
+  });
+
+  it("caps worker fan-out by the work available", () => {
+    expect(researchMilestoneConcurrency(0, {})).toBe(0);
+    expect(researchMilestoneConcurrency(3, {})).toBe(3);
+    expect(researchMilestoneConcurrency(100, {})).toBe(RESEARCH_MILESTONE_CONCURRENCY);
+    expect(researchMilestoneConcurrency(100, { RADAR_MILESTONE_CONCURRENCY: "24" })).toBe(24);
+    expect(researchMilestoneConcurrency(100, { RADAR_MILESTONE_CONCURRENCY: "999" })).toBe(64);
   });
 });

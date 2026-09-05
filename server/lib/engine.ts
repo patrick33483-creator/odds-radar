@@ -134,9 +134,71 @@ export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
 /** Keep the primary HKJC checkpoint pass bounded below the 30-second scheduler cadence. */
 export const RESEARCH_TIMELINE_DETAIL_LOOP_MS = 20_000;
 const MAX_RESEARCH_TIMELINE_DETAIL_TARGETS = 100;
-export const RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS = 7_000;
-export const MAX_RESEARCH_MILESTONE_TARGETS = 12;
-export const RESEARCH_MILESTONE_CONCURRENCY = 4;
+/**
+ * One provider request inside a milestone tick. Kept short on purpose: a slow
+ * upstream must not consume a capacity slot that another fixture in the same
+ * T30/T15/T5 window still needs. A single retry recovers transient peak-hour
+ * failures without letting the worst case exceed 2 x timeout per provider.
+ */
+export const RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS = 4_000;
+export const RESEARCH_MILESTONE_REQUEST_RETRIES = 1;
+/**
+ * Capacity floor for one milestone tick. The previous hard cap of 12 fixtures
+ * per 30-second tick throttled the whole collector to 24 fixtures/minute,
+ * while a European weekend evening puts well over a hundred fixtures inside
+ * the rolling 30-minute window at the same time. Because targets are sorted
+ * T5 -> T15 -> T30, the surplus starved the T30 checkpoint outright.
+ */
+export const MIN_RESEARCH_MILESTONE_TARGETS = 48;
+/** Absolute ceiling per tick, overridable with RADAR_MILESTONE_MAX_TARGETS. */
+export const MAX_RESEARCH_MILESTONE_TARGETS = 240;
+export const RESEARCH_MILESTONE_CONCURRENCY = 16;
+/**
+ * Wall-clock budget for one tick. The scheduler fires every 30 seconds and
+ * skips overlapping runs, so the loop must always yield before the next tick
+ * regardless of how many fixtures were selected.
+ */
+export const RESEARCH_MILESTONE_LOOP_MS = 20_000;
+/** SQLite caps bound parameters per statement; chunk id lists below that. */
+const SQLITE_PARAM_CHUNK = 500;
+
+function envInt(raw: string | undefined, fallback: number, lo: number, hi: number): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(hi, Math.max(lo, Math.round(parsed)));
+}
+
+/**
+ * Per-tick target budget. Scales with the number of fixtures actually inside
+ * the window instead of a fixed slice, so a peak-hour burst is not silently
+ * dropped, and stays bounded by an explicit ceiling.
+ */
+export function researchMilestoneCapacity(
+  candidateCount: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const ceiling = envInt(
+    env.RADAR_MILESTONE_MAX_TARGETS,
+    MAX_RESEARCH_MILESTONE_TARGETS,
+    MIN_RESEARCH_MILESTONE_TARGETS,
+    2_000,
+  );
+  return Math.min(ceiling, Math.max(MIN_RESEARCH_MILESTONE_TARGETS, candidateCount));
+}
+
+/** Worker fan-out for one tick, never more than the work available. */
+export function researchMilestoneConcurrency(
+  targetCount: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const configured = envInt(
+    env.RADAR_MILESTONE_CONCURRENCY,
+    RESEARCH_MILESTONE_CONCURRENCY,
+    1,
+    64,
+  );
+  return Math.max(0, Math.min(configured, targetCount));
+}
 const PINNACLE_OPENING_RECOVERY_LOOKBACK_MS = 6 * 60 * 60_000;
 const STARTED_MATCH_STATUS = /INPLAY|LIVE|FINISHED|ENDED|ABANDON|CANCEL|POSTPONE|RESULT/i;
 
@@ -2161,17 +2223,6 @@ export class RadarEngine {
       activeSource: "titan007" | "pinnapi" | null;
       missingMarkets: Array<"AH" | "OU">;
     };
-    const completePairs = new Set(
-      (rawDb.prepare(
-        `SELECT match_id,stage,market
-           FROM research_timeline_snapshots
-          WHERE provider='pinnacle' AND market IN ('AH','OU')
-            AND stage IN ('T30','T15','T5')
-          GROUP BY match_id,stage,market,line_key
-         HAVING COUNT(DISTINCT selection)>=2`,
-      ).all() as Array<{ match_id: string; stage: string; market: string }>)
-        .map((row) => `${row.match_id}:${row.stage}:${row.market}`),
-    );
     const candidates = rawDb.prepare(
       `SELECT m.id,m.kickoff_utc,m.titan_id,m.pinnacle_match_id,
               p.titan_id mapped_titan_id,COALESCE(p.titan_reversed,0) titan_reversed,
@@ -2196,6 +2247,27 @@ export class RadarEngine {
       active_source: string | null;
       status: string;
     }>;
+    // Restricted to the fixtures in this window. The previous unbounded
+    // GROUP BY aggregated the entire snapshot table on every 30-second tick,
+    // so each tick grew slower as research history accumulated.
+    const completePairs = new Set<string>();
+    const candidateIds = candidates.map((row) => row.id);
+    for (let offset = 0; offset < candidateIds.length; offset += SQLITE_PARAM_CHUNK) {
+      const chunk = candidateIds.slice(offset, offset + SQLITE_PARAM_CHUNK);
+      if (!chunk.length) break;
+      const rowsForChunk = rawDb.prepare(
+        `SELECT match_id,stage,market
+           FROM research_timeline_snapshots
+          WHERE provider='pinnacle' AND market IN ('AH','OU')
+            AND stage IN ('T30','T15','T5')
+            AND match_id IN (${chunk.map(() => "?").join(",")})
+          GROUP BY match_id,stage,market,line_key
+         HAVING COUNT(DISTINCT selection)>=2`,
+      ).all(...chunk) as Array<{ match_id: string; stage: string; market: string }>;
+      for (const row of rowsForChunk) {
+        completePairs.add(`${row.match_id}:${row.stage}:${row.market}`);
+      }
+    }
     const priority = { T5: 0, T15: 1, T30: 2 } as const;
     const targets = candidates.flatMap((row): Target[] => {
       const stage = researchStageFor(row.kickoff_utc, startedAt);
@@ -2228,7 +2300,7 @@ export class RadarEngine {
       }];
     }).sort((a, b) =>
       priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc
-    ).slice(0, MAX_RESEARCH_MILESTONE_TARGETS);
+    ).slice(0, researchMilestoneCapacity(candidates.length));
 
     let attempted = 0;
     let fetched = 0;
@@ -2237,6 +2309,9 @@ export class RadarEngine {
     let cursor = 0;
     const worker = async (): Promise<void> => {
       while (true) {
+        // Every worker always services at least one target; beyond that the
+        // tick must yield before the next 30-second scheduler callback.
+        if (cursor > 0 && Date.now() - startedAt > RESEARCH_MILESTONE_LOOP_MS) return;
         const target = targets[cursor++];
         if (!target) return;
         attempted++;
@@ -2244,13 +2319,13 @@ export class RadarEngine {
           target.titanId
             ? this.pinnacle.fetchPinnacleResearchPrices(target.titanId, {
                 timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
-                retries: 0,
+                retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
               }).then((value) => ({ prices: value.current, completedAt: Date.now() }))
             : Promise.resolve(null),
           target.pinnapiId
             ? this.pinnapi.fetchMatchPrices(target.pinnapiId, {
                 timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
-                retries: 0,
+                retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
               }).then((prices) => ({ prices, completedAt: Date.now() }))
             : Promise.resolve(null),
         ]);
@@ -2317,10 +2392,7 @@ export class RadarEngine {
       }
     };
     await Promise.all(
-      Array.from(
-        { length: Math.min(RESEARCH_MILESTONE_CONCURRENCY, targets.length) },
-        () => worker(),
-      ),
+      Array.from({ length: researchMilestoneConcurrency(targets.length) }, () => worker()),
     );
     return {
       selected: targets.length,
