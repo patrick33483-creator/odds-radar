@@ -1,0 +1,38 @@
+name: 匯出賠率時點特徵（只讀）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 匯出特徵 CSV（不寫入資料庫）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE' > export.log
+          set -euo pipefail
+          cd /opt/odds-radar
+          sudo docker compose exec -T radar node dist/export-signal-features-20260906.cjs
+          REMOTE
+          wc -c export.log
+
+      - name: 上載匯出結果
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-features
+          path: export.log
+          retention-days: 7
