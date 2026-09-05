@@ -4,6 +4,7 @@ jobs:
   d:
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
       - env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -13,4 +14,5 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'set -e; echo === /opt/footbreak files ===; ls /opt/footbreak/ 2>/dev/null | head -40; echo === DB files ===; find /opt/footbreak -maxdepth 4 -name "*.db" -o -name "*.sqlite*" 2>/dev/null; echo === service unit ===; sudo systemctl cat crown-dashboard-api.service 2>/dev/null | head -40; echo === source dirs ===; find /opt/footbreak -maxdepth 3 -type d 2>/dev/null | head -30'
+          scp scripts/fb-inspect.sh "$DEPLOY_USER@$DEPLOY_HOST:/tmp/fb-inspect.sh"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'bash /tmp/fb-inspect.sh'
