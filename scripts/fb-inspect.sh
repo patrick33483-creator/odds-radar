@@ -1,17 +1,19 @@
 #!/bin/bash
 set -e
-echo "=== LEARNING DB path check ==="
-sudo ls -la /var/lib/footbreak/learning/ 2>&1 | head -10
-echo "=== predictions.sqlite tables ==="
-sudo sqlite3 /var/lib/footbreak/learning/predictions.sqlite ".tables" 2>&1
-echo "=== predictions.sqlite schema for key tables ==="
-sudo sqlite3 /var/lib/footbreak/learning/predictions.sqlite ".schema" 2>&1 | head -200
-echo "=== sim_ledger.json head ==="
-sudo head -c 3000 /opt/footbreak/system/sim_ledger.json 2>/dev/null | head -50
-echo "=== result cache count ==="
-sudo ls /opt/footbreak/system/cache/results/ 2>/dev/null | wc -l
-sudo ls /opt/footbreak/system/cache/results/ 2>/dev/null | head -10
-echo "=== crown module files ==="
-sudo ls /opt/footbreak/crown/ 2>/dev/null
-echo "=== dashboard_api.py first 100 lines ==="
-sudo head -100 /opt/footbreak/crown/dashboard_api.py 2>/dev/null
+DB=/var/lib/footbreak/learning/predictions.sqlite
+echo "=== grades schema ==="
+sudo sqlite3 $DB ".schema grades"
+echo "=== results schema ==="
+sudo sqlite3 $DB ".schema results"
+echo "=== grades count ==="
+sudo sqlite3 $DB "SELECT COUNT(*) FROM grades;"
+echo "=== results count ==="
+sudo sqlite3 $DB "SELECT COUNT(*) FROM results;"
+echo "=== grades sample ==="
+sudo sqlite3 -header -column $DB "SELECT * FROM grades LIMIT 3;"
+echo "=== results sample ==="
+sudo sqlite3 -header -column $DB "SELECT * FROM results LIMIT 3;"
+echo "=== dashboard_data.py ==="
+sudo cat /opt/footbreak/crown/dashboard_data.py 2>/dev/null | head -300
+echo "=== settle.py ==="
+sudo cat /opt/footbreak/crown/settle.py 2>/dev/null | head -200
