@@ -1,0 +1,68 @@
+name: full-diag
+on: workflow_dispatch
+jobs:
+  d:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          cat > /tmp/d.py <<'PYEOF'
+          import sqlite3, datetime, time
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          now_ms = int(time.time()*1000)
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          # 1. dashboard 世界 (ou_signal_observations) 而家嘅 by source
+          q1 = db.execute("""
+            SELECT m.fixture_source,
+                   SUM(CASE WHEN r.match_id IS NULL AND m.kickoff_utc<=? THEN 1 ELSE 0 END) awaiting,
+                   SUM(CASE WHEN r.match_id IS NOT NULL THEN 1 ELSE 0 END) settled,
+                   COUNT(*) total
+              FROM ou_signal_observations o
+              JOIN matches m ON m.id=o.match_id
+              LEFT JOIN research_results r ON r.match_id=o.match_id
+             GROUP BY m.fixture_source
+          """,(now_ms,)).fetchall()
+          print("== dashboard (ou_signal_observations) ==")
+          total_a = 0; total_s = 0
+          for r in q1:
+              print(f"  {r['fixture_source']:10s} awaiting={r['awaiting']} settled={r['settled']} total={r['total']}")
+              total_a += r['awaiting']; total_s += r['settled']
+          print(f"  TOTAL awaiting={total_a} settled={total_s}")
+          # 2. 所有 manual fills 過去 24 小時
+          q2 = db.execute("""
+            SELECT COUNT(*) c, MIN(fetched_at) mn, MAX(fetched_at) mx
+              FROM research_results
+             WHERE result_source='manual' AND fetched_at>=?
+          """,(now_ms - 24*3600*1000,)).fetchone()
+          print(f"\n== manual fills past 24h: {q2['c']} rows ==")
+          if q2['mn']:
+              print(f"  fetched_at range: {datetime.datetime.fromtimestamp(q2['mn']/1000,hkt)} to {datetime.datetime.fromtimestamp(q2['mx']/1000,hkt)}")
+          # 3. dashboard awaiting 場 (前 30)
+          q3 = db.execute("""
+            SELECT DISTINCT m.id, m.fixture_source, m.home_team, m.away_team, m.kickoff_utc,
+                   pt.zh_home, pt.zh_away
+              FROM ou_signal_observations o
+              JOIN matches m ON m.id=o.match_id
+              LEFT JOIN research_results r ON r.match_id=o.match_id
+              LEFT JOIN pinnacle_translations pt
+                ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
+             WHERE r.match_id IS NULL AND m.kickoff_utc<=?
+             ORDER BY m.kickoff_utc DESC LIMIT 30
+          """,(now_ms,)).fetchall()
+          print(f"\n== dashboard awaiting (top 30) ==")
+          for r in q3:
+              t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
+              zh = f" | zh: {r['zh_home']} vs {r['zh_away']}" if r['zh_home'] else ""
+              print(f"  {t} [{r['fixture_source']}] {r['home_team']} vs {r['away_team']}{zh}")
+          PYEOF
+          scp /tmp/d.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/d.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/d.py'
