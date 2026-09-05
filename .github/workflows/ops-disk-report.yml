@@ -1,0 +1,39 @@
+name: 伺服器磁碟用量報告（只讀）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 收集用量（只讀）
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -uo pipefail
+          echo "=== df -h ==="; df -h
+          echo "=== inodes ==="; df -i
+          echo "=== /opt/odds-radar top level ==="
+          cd /opt/odds-radar && sudo du -sh -- * 2>/dev/null | sort -h | tail -20
+          echo "=== data dir ==="
+          sudo du -sh data 2>/dev/null
+          sudo ls -lh data 2>/dev/null | tail -30
+          echo "=== container backups ==="
+          sudo docker compose exec -T radar sh -c 'du -sh /app/backups; ls -lh /app/backups | tail -20' 2>/dev/null || true
+          echo "=== docker usage ==="; sudo docker system df 2>/dev/null
+          echo "=== biggest dirs under / ==="
+          sudo du -xh / --max-depth=2 2>/dev/null | sort -h | tail -25
+          REMOTE
