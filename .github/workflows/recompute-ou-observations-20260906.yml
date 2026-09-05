@@ -1,0 +1,46 @@
+name: 重算 OU 觀察（初盤主線推斷修正後）
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 輸入 RECOMPUTE_CONFIRMED_OU_MAINLINE_20260906
+        required: true
+        type: string
+
+jobs:
+  recompute:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 核對確認字句
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: test "$CONFIRMATION" = "RECOMPUTE_CONFIRMED_OU_MAINLINE_20260906"
+
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 備份資料庫後重算歷史觀察
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          sudo docker compose exec -T radar sh -c \
+            "sqlite3 /app/data/data.db \".backup '/app/data/pre-recompute-${stamp}.db'\"" \
+            || sudo docker compose exec -T radar node -e \
+              "require('node:fs').copyFileSync('/app/data/data.db','/app/data/pre-recompute-${stamp}.db')"
+          sudo docker compose exec -T \
+            -e OU_RECOMPUTE_CONFIRMATION=RECOMPUTE_CONFIRMED_OU_MAINLINE_20260906 \
+            radar node dist/recompute-ou-observations-20260906.cjs
+          REMOTE
