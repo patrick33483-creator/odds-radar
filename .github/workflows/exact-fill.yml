@@ -24,11 +24,9 @@ jobs:
           scp "$TSV" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/exact.tsv"
           cat > /tmp/e.py <<'PYEOF'
           import sqlite3, datetime, time
-          try:
-              from zhconv import convert
-          except:
-              import subprocess; subprocess.check_call(["pip3","install","--quiet","zhconv"])
-              from zhconv import convert
+          # simple simp<->trad table for common chars we care about
+          _S2T = str.maketrans({"诺":"諾","沃":"沃","拉":"拉","利":"利","沃":"沃","诺":"諾","蒂":"蒂","米":"米","什":"什","瓦":"瓦","布":"布","加":"加","勒":"勒","斯":"斯","特":"特","快":"快","速":"速","贝":"貝","尔":"爾","罗":"羅","蒙":"蒙","塔":"塔","纳":"納","格":"格","车":"車","头":"頭","多":"多","鲁":"魯","察":"察","索":"索","菲":"菲","亚":"亞","中":"中","央":"央","陆":"陸","军":"軍","队":"隊","保":"保","文":"文","达":"達","雅":"雅","洛":"洛","及":"及","电":"電","信":"信","朝":"朝","鲜":"鮮","伊":"伊","朗":"朗","巴":"巴","越":"越","南":"南","吉":"吉","奥":"奧","里":"里","费":"費","伦":"倫","茨":"茨","罗":"羅","辛":"辛","迪":"迪","泰":"泰","哥":"哥","维":"維","卡":"卡","穆":"穆","罕":"罕","普":"普","萨":"薩","体":"體","育":"育","圣":"聖","彼":"彼","德":"德","堡":"堡","青":"青","年":"年","喀":"喀","山":"山","鲁":"魯","宾":"賓","莱":"萊","切":"切","马":"馬","乌":"烏","尼":"尼","泽":"澤","波":"波","兹":"茲","兰":"蘭"})
+          def to_trad(s): return s.translate(_S2T)
           hkt = datetime.timezone(datetime.timedelta(hours=8))
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30, isolation_level=None)
           db.execute("PRAGMA busy_timeout=60000")
@@ -39,11 +37,7 @@ jobs:
               if len(p) < 5: continue
               fills.append(dict(home=p[0],away=p[1],hs=int(p[2]),as_=int(p[3]),date=p[4]))
           def variants(s):
-              vs = {s}
-              for tgt in ["zh-hk","zh-tw","zh-cn","zh-hant","zh-hans"]:
-                  try: vs.add(convert(s, tgt))
-                  except: pass
-              return list(vs)
+              return list({s, to_trad(s)})
           filled = 0; missed = []; matched_ids = []
           for e in fills:
               y,m,d = [int(x) for x in e["date"].split("-")]
