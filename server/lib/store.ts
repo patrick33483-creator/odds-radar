@@ -199,6 +199,17 @@ CREATE INDEX IF NOT EXISTS quote_direction_watch_match_idx
 CREATE INDEX IF NOT EXISTS quote_direction_watch_rule_idx
   ON quote_direction_watch_observations(rule_id,status,detected_at);
 
+-- HKJC only exposes a fixture's corner count while that fixture is in play:
+-- the historic result query always returns ttlCornerResult = -1 and ended
+-- fixtures leave the pre-match feed. Corner counts must therefore be captured
+-- live or they are lost permanently. Kept separate from research_results so it
+-- can never be mistaken for HKJC's official confirmed corner figure.
+CREATE TABLE IF NOT EXISTS hkjc_live_corners (
+  match_id TEXT PRIMARY KEY, hkjc_id TEXT NOT NULL, corner INTEGER NOT NULL,
+  home_corner INTEGER, away_corner INTEGER, last_status TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL, observed_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS hkjc_live_corners_observed_idx ON hkjc_live_corners(observed_at);
+
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,
   away_score INTEGER NOT NULL, match_minutes INTEGER, match_state TEXT,

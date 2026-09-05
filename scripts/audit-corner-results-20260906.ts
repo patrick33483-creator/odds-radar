@@ -98,8 +98,33 @@ const analysable = db.prepare(
      HAVING COUNT(DISTINCT s.stage) = 3)`,
 ).get(now) as { n: number };
 
+// Live capture coverage. HKJC's confirmed corner figure is never published in
+// the historic feed, so this table is the only corner source that can grow.
+let liveCapture: Record<string, unknown> = { table_present: false };
+try {
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM hkjc_live_corners`).get() as { n: number };
+  const matched = db.prepare(
+    `SELECT COUNT(*) AS n
+       FROM hkjc_live_corners c
+       JOIN research_timeline_snapshots s ON s.match_id = c.match_id AND s.market = 'COU'`,
+  ).get() as { n: number };
+  const ended = db.prepare(
+    `SELECT COUNT(*) AS n FROM hkjc_live_corners
+       WHERE last_status LIKE '%SECONDHALF%' OR last_status LIKE '%ENDED%'`,
+  ).get() as { n: number };
+  liveCapture = {
+    table_present: true,
+    rows: total.n,
+    with_corner_odds: matched.n,
+    reached_second_half_or_ended: ended.n,
+  };
+} catch {
+  // Pre-deploy databases do not have the table yet.
+}
+
 console.log(JSON.stringify({
   event: "corner_result_audit",
+  live_capture: liveCapture,
   generated_at: new Date().toISOString(),
   ...bucket,
   coverage_rate: rows.length ? Number((bucket.with_corner_result / rows.length).toFixed(4)) : 0,

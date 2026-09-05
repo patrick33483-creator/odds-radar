@@ -28,7 +28,7 @@ import { OpticOddsProvider } from "../providers/opticodds";
 import { PinnapiProvider, type PinnapiFixture } from "../providers/pinnapi";
 import { HkjcProvider } from "../providers/hkjc";
 import { isMainThread, workerData } from "node:worker_threads";
-import type { ProviderPrice } from "../providers/types";
+import type { LiveCornerObservation, ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
 import { CROWN_FIXED_STAKE, findThreeWayArb, findTwoWayArb, isArbitrageTotal } from "./arb";
@@ -975,6 +975,55 @@ export class RadarEngine {
     return task;
   }
 
+  /**
+   * Retain in-play corner counts.
+   *
+   * HKJC's historic result query always returns ttlCornerResult = -1 and an
+   * ended fixture leaves the pre-match feed, so a corner count that is not
+   * stored while the fixture is live cannot be recovered afterwards. The count
+   * is monotonic within a fixture, so a lower reading is treated as a stale or
+   * reset payload and never overwrites a higher stored one.
+   *
+   * This is research provenance only. Corner settlement still requires HKJC's
+   * official confirmed figure, so nothing here is written into
+   * research_results.
+   */
+  private persistLiveCorners(observations: LiveCornerObservation[], now: number): void {
+    if (!observations.length) return;
+    const upsert = rawDb.prepare(
+      `INSERT INTO hkjc_live_corners
+         (match_id,hkjc_id,corner,home_corner,away_corner,last_status,first_seen_at,observed_at)
+       VALUES(?,?,?,?,?,?,?,?)
+       ON CONFLICT(match_id) DO UPDATE SET
+         corner=MAX(hkjc_live_corners.corner, excluded.corner),
+         home_corner=CASE WHEN excluded.corner >= hkjc_live_corners.corner
+           THEN excluded.home_corner ELSE hkjc_live_corners.home_corner END,
+         away_corner=CASE WHEN excluded.corner >= hkjc_live_corners.corner
+           THEN excluded.away_corner ELSE hkjc_live_corners.away_corner END,
+         last_status=excluded.last_status,
+         observed_at=excluded.observed_at`,
+    );
+    const writeAll = rawDb.transaction((rows: LiveCornerObservation[]) => {
+      for (const row of rows) {
+        upsert.run(
+          `hkjc:${row.providerMatchId}`,
+          row.providerMatchId,
+          row.corner,
+          row.homeCorner,
+          row.awayCorner,
+          row.status,
+          now,
+          now,
+        );
+      }
+    });
+    try {
+      writeAll(observations);
+    } catch (err) {
+      log("live_corner_persist_failed", { error: (err as Error).message });
+    }
+  }
+
   private async performHkjcRefresh(): Promise<boolean> {
     const now = Date.now();
     try {
@@ -982,6 +1031,7 @@ export class RadarEngine {
         ? { events: DEMO_FIXTURE.hkjc, latencyMs: 1, partial: false, warnings: ["DEMO"] }
         : await this.hkjc.fetchPreMatch({});
       this.setHealth("hkjc", { ok: true, latencyMs: res.latencyMs, itemCount: res.events.length, mode: DEMO ? "demo" : "live" });
+      this.persistLiveCorners(res.liveCorners ?? [], now);
       const persistBatch = rawDb.transaction((events: typeof res.events) => {
         const listLatestKeys = rawDb.prepare(
           "SELECT key FROM odds_latest WHERE match_id=? AND provider='hkjc'",
