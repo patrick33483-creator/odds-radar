@@ -14,7 +14,7 @@
  * gives, so it must not be flipped.
  */
 
-import { fetchJson } from "../lib/http";
+import { fetchJson, type FetchOpts } from "../lib/http";
 import { isQuarterStep } from "../lib/lines";
 import type { ProviderPrice } from "./types";
 
@@ -631,13 +631,16 @@ export class PinnapiProvider {
   }
 
   /** Raw, read-only event line payload for capability validation. */
-  async fetchEventLinePayload(eventId: string): Promise<unknown> {
+  async fetchEventLinePayload(
+    eventId: string,
+    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+  ): Promise<unknown> {
     this.requireConfigured();
     const safeId = encodeURIComponent(eventId);
     return fetchJson<unknown>(this.endpoint(`/kit/v1/prematch/lines?event_id=${safeId}`), {
       headers: pinnapiHeaders(),
-      timeoutMs: 25_000,
-      retries: 1,
+      timeoutMs: request.timeoutMs ?? 25_000,
+      retries: request.retries ?? 1,
     });
   }
 
@@ -652,10 +655,13 @@ export class PinnapiProvider {
     });
   }
 
-  async fetchEventLines(eventId: string): Promise<PinnapiLines> {
+  async fetchEventLines(
+    eventId: string,
+    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+  ): Promise<PinnapiLines> {
     this.requireConfigured();
     try {
-      const payload = await this.fetchEventLinePayload(eventId);
+      const payload = await this.fetchEventLinePayload(eventId, request);
       const result = parsePinnapiLines(payload, eventId);
       this.lastSuccessAt = Date.now();
       return result;
@@ -678,8 +684,11 @@ export class PinnapiProvider {
     }
   }
 
-  async fetchMatchPrices(eventId: string): Promise<ProviderPrice[]> {
-    return (await this.fetchEventLines(eventId)).prices;
+  async fetchMatchPrices(
+    eventId: string,
+    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+  ): Promise<ProviderPrice[]> {
+    return (await this.fetchEventLines(eventId, request)).prices;
   }
 
   /**

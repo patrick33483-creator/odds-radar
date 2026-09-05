@@ -67,6 +67,21 @@ function addHkjcFixture(
   );
 }
 
+function addPinnacleFixture(id: string, kickoffUtc: number, titanId: string): void {
+  rawDb.prepare(
+    `INSERT INTO matches(
+      id,hkjc_id,fixture_source,titan_id,pinnacle_match_id,
+      league,home_team,away_team,kickoff_utc,status,inplay,updated_at
+    ) VALUES(?,NULL,'pinnacle',?,?,'Test League','Home','Away',?,'PREEVENT',0,?)`,
+  ).run(id, titanId, `titan:${titanId}`, kickoffUtc, NOW);
+  rawDb.prepare(
+    `INSERT INTO pinnacle_source_map(
+      match_id,pinnapi_id,pinnapi_reversed,optic_id,optic_reversed,
+      titan_id,titan_reversed,active_source,updated_at
+    ) VALUES(?,NULL,0,NULL,0,?,0,'titan007',?)`,
+  ).run(id, titanId, NOW);
+}
+
 function currentAhOu() {
   return [
     { market: "AH" as const, lineValue: -0.25, isMain: true, selection: "H" as const, decimalOdds: 1.91 },
@@ -230,5 +245,130 @@ describe("runResearchTimelineTick Pinnacle checkpoints", () => {
     expect(rawDb.prepare(
       "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=?",
     ).get(matchId)).toEqual({ count: 0 });
+  });
+});
+
+describe("runResearchMilestoneTick fast checkpoint collector", () => {
+  it("captures a persisted Pinnacle-only fixture without running discovery", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const matchId = "pinnacle:fast-t5";
+    addPinnacleFixture(matchId, NOW + 4 * 60_000, "fast-t5");
+    const engine = new RadarEngine();
+    const fetchTitan = vi.fn().mockResolvedValue({
+      opening: [],
+      current: currentAhOu(),
+      sourceUrls: { AH: "ah", OU: "ou" },
+    });
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = fetchTitan;
+    const refreshHkjc = vi.spyOn(engine as any, "refreshHkjc");
+    const refreshFixtures = vi.spyOn(engine as any, "refreshPinnacleFixtures");
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 1,
+      attempted: 1,
+      fetched: 1,
+      failed: 0,
+      rows: 4,
+    });
+
+    expect(fetchTitan).toHaveBeenCalledWith("fast-t5", {
+      timeoutMs: 7_000,
+      retries: 0,
+    });
+    expect(refreshHkjc).not.toHaveBeenCalled();
+    expect(refreshFixtures).not.toHaveBeenCalled();
+    expect(capturedMarkets(matchId)).toEqual([
+      { market: "AH", rows: 2 },
+      { market: "OU", rows: 2 },
+    ]);
+  });
+
+  it("uses response completion time and never fabricates a missed checkpoint", async () => {
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(NOW)
+      .mockReturnValue(NOW + 6 * 60_000);
+    const matchId = "pinnacle:late-response";
+    addPinnacleFixture(matchId, NOW + 4 * 60_000, "late-response");
+    const engine = new RadarEngine();
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn().mockResolvedValue({
+      opening: [],
+      current: currentAhOu(),
+      sourceUrls: { AH: "ah", OU: "ou" },
+    });
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 1,
+      attempted: 1,
+      fetched: 0,
+      failed: 1,
+      rows: 0,
+    });
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=?",
+    ).get(matchId)).toEqual({ count: 0 });
+  });
+
+  it("uses the active source per market and fills a missing market from fallback", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const matchId = "hkjc:market-aware-fallback";
+    addHkjcFixture(matchId, NOW + 4 * 60_000, "titan:market-aware", {
+      pinnapiId: "pinnapi-market-aware",
+      titanId: "market-aware",
+    });
+    rawDb.prepare(
+      "UPDATE pinnacle_source_map SET active_source='titan007' WHERE match_id=?",
+    ).run(matchId);
+    const engine = new RadarEngine();
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn().mockResolvedValue({
+      opening: [],
+      current: currentAhOu().filter((price) => price.market === "AH"),
+      sourceUrls: { AH: "ah", OU: "ou" },
+    });
+    (engine as any).pinnapi.fetchMatchPrices = vi.fn().mockResolvedValue(
+      currentAhOu().filter((price) => price.market === "OU"),
+    );
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 1,
+      fetched: 1,
+      failed: 0,
+      rows: 4,
+    });
+    expect(rawDb.prepare(
+      `SELECT market,source_name,COUNT(*) rows
+         FROM research_timeline_snapshots
+        WHERE match_id=? AND stage='T5'
+        GROUP BY market,source_name ORDER BY market`,
+    ).all(matchId)).toEqual([
+      { market: "AH", source_name: "titan007-pinnacle", rows: 2 },
+      { market: "OU", source_name: "pinnapi", rows: 2 },
+    ]);
+  });
+
+  it("prioritizes T5 and caps each fast pass", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    for (let i = 0; i < 13; i++) {
+      addPinnacleFixture(`pinnacle:t5-${i}`, NOW + (i + 1) * 10_000, `t5-${i}`);
+    }
+    addPinnacleFixture("pinnacle:t15", NOW + 10 * 60_000, "t15");
+    addPinnacleFixture("pinnacle:t30", NOW + 20 * 60_000, "t30");
+    const engine = new RadarEngine();
+    const requested: string[] = [];
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn(async (id: string) => {
+      requested.push(id);
+      return {
+        opening: [],
+        current: currentAhOu(),
+        sourceUrls: { AH: "ah", OU: "ou" },
+      };
+    });
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 12,
+      attempted: 12,
+      fetched: 12,
+    });
+    expect(requested).toHaveLength(12);
+    expect(requested.every((id) => id.startsWith("t5-"))).toBe(true);
   });
 });

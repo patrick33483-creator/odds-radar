@@ -27,6 +27,9 @@ let autoScanStartupTimer: NodeJS.Timeout | null = null;
 let researchTimelineTimer: NodeJS.Timeout | null = null;
 let researchTimelineStartupTimer: NodeJS.Timeout | null = null;
 let researchTimelineInFlight: ReturnType<typeof engine.runResearchTimelineTick> | null = null;
+let researchMilestoneTimer: NodeJS.Timeout | null = null;
+let researchMilestoneStartupTimer: NodeJS.Timeout | null = null;
+let researchMilestoneInFlight: ReturnType<typeof engine.runResearchMilestoneTick> | null = null;
 let hourlyPrewarmTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmStartupTimer: NodeJS.Timeout | null = null;
 let cornerValidationInFlight: Promise<unknown> | null = null;
@@ -195,7 +198,11 @@ function installResearchTimelineCollection(): void {
   if (!autoScanEnabled() || researchTimelineTimer) return;
   const run = async () => {
     if (researchTimelineInFlight) return;
-    researchTimelineInFlight = engine.runResearchTimelineTick();
+    // Discovery/mapping/opening preparation only. The isolated milestone
+    // worker is the sole automated T30/T15/T5 writer.
+    researchTimelineInFlight = engine.runResearchTimelineTick({
+      captureMilestones: false,
+    });
     try {
       const research = await researchTimelineInFlight;
       console.log(JSON.stringify({
@@ -220,6 +227,36 @@ function installResearchTimelineCollection(): void {
   researchTimelineStartupTimer.unref();
   researchTimelineTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
   researchTimelineTimer.unref();
+}
+
+function installResearchMilestoneCollection(): void {
+  if (!autoScanEnabled() || researchMilestoneTimer) return;
+  const run = async () => {
+    if (researchMilestoneInFlight) return;
+    researchMilestoneInFlight = engine.runResearchMilestoneTick();
+    try {
+      const outcome = await researchMilestoneInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_milestone",
+        ...outcome,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_milestone_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      researchMilestoneInFlight = null;
+    }
+  };
+  researchMilestoneStartupTimer = setTimeout(() => void run(), 5_000);
+  researchMilestoneStartupTimer.unref();
+  researchMilestoneTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
+  researchMilestoneTimer.unref();
 }
 
 /**
@@ -427,6 +464,11 @@ export function startBackgroundCollectors(): void {
   installResearchOpeningCollection();
   installQuoteDirectionWatchCollection();
   installResearchResultCollection();
+}
+
+/** Run only the latency-sensitive T30/T15/T5 collector in its own worker. */
+export function startResearchMilestoneCollector(): void {
+  installResearchMilestoneCollection();
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {

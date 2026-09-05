@@ -1,7 +1,11 @@
 import "dotenv/config";
 import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
-import { registerRoutes, startBackgroundCollectors } from "./routes";
+import {
+  registerRoutes,
+  startBackgroundCollectors,
+  startResearchMilestoneCollector,
+} from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
@@ -97,15 +101,21 @@ app.use((req, res, next) => {
   next();
 });
 
-if (!isMainThread && workerData?.role === "collector") {
-  startBackgroundCollectors();
-  log("background collectors started in isolated worker", "collector");
+if (!isMainThread && (workerData?.role === "collector" || workerData?.role === "milestone")) {
+  if (workerData.role === "milestone") {
+    startResearchMilestoneCollector();
+    log("research milestone collector started in isolated worker", "milestone");
+  } else {
+    startBackgroundCollectors();
+    log("background collectors started in isolated worker", "collector");
+  }
   // Collector timers deliberately use unref() so tests/process shutdown are
   // clean. This one reference owns the production worker lifecycle.
   setInterval(() => undefined, 60_000);
 } else void (async () => {
   if (process.env.NODE_ENV !== "production") {
     startBackgroundCollectors();
+    startResearchMilestoneCollector();
   }
   await registerRoutes(httpServer, app);
 
@@ -150,12 +160,26 @@ if (!isMainThread && workerData?.role === "collector") {
         const collector = new Worker(process.argv[1], {
           workerData: { role: "collector" },
         });
+        const milestone = new Worker(process.argv[1], {
+          workerData: { role: "milestone" },
+        });
         collector.on("error", (err) => {
           console.error("Background collector worker error:", err);
         });
         collector.on("exit", (code) => {
           if (code !== 0) {
             console.error(`Background collector worker exited with code ${code}`);
+          }
+        });
+        milestone.on("error", (err) => {
+          console.error("Research milestone worker error:", err);
+        });
+        milestone.on("exit", (code) => {
+          if (code !== 0) {
+            console.error(`Research milestone worker exited with code ${code}`);
+            // Keep container health honest: Docker restarts the whole process
+            // instead of leaving HTTP green with checkpoint collection dead.
+            process.exit(1);
           }
         });
       }

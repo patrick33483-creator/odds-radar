@@ -134,6 +134,9 @@ export const PINNACLE_RESEARCH_LOOP_MS = 20_000;
 /** Keep the primary HKJC checkpoint pass bounded below the 30-second scheduler cadence. */
 export const RESEARCH_TIMELINE_DETAIL_LOOP_MS = 20_000;
 const MAX_RESEARCH_TIMELINE_DETAIL_TARGETS = 100;
+export const RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS = 7_000;
+export const MAX_RESEARCH_MILESTONE_TARGETS = 12;
+export const RESEARCH_MILESTONE_CONCURRENCY = 4;
 const PINNACLE_OPENING_RECOVERY_LOOKBACK_MS = 6 * 60 * 60_000;
 const STARTED_MATCH_STATUS = /INPLAY|LIVE|FINISHED|ENDED|ABANDON|CANCEL|POSTPONE|RESULT/i;
 
@@ -1047,7 +1050,10 @@ export class RadarEngine {
    * scanner.  It only writes research-timeline rows so the Pinnacle-only OU
    * signal path (rule provider='pinnacle', >1.70 gate) can evaluate them.
    */
-  async refreshPinnacleOnlyResearch(now = Date.now()): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
+  async refreshPinnacleOnlyResearch(
+    now = Date.now(),
+    captureMilestones = true,
+  ): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
     const refreshStartedAt = Date.now();
     // Requires the caller to have already populated fixtureCache via
     // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
@@ -1333,7 +1339,8 @@ export class RadarEngine {
       ).all() as Array<{ match_id: string; stage: "initial" | "T30" | "T15" | "T5" }>)
         .map((row) => `${row.match_id}:${row.stage}`),
     );
-    const eligible = prioritizePendingPinnacleResearchTargets(targets, capturedOuStages, now);
+    const eligible = prioritizePendingPinnacleResearchTargets(targets, capturedOuStages, now)
+      .filter((target) => captureMilestones || target.stage === "initial");
     // Fixture reconciliation can be expensive on a busy slate. The provider
     // budget must start only after that preparation has finished; otherwise
     // pre-processing can consume the whole window and no Titan detail request
@@ -1410,7 +1417,7 @@ export class RadarEngine {
           // Current quotes are checkpoint observations only. In particular, a
           // first-seen PinnAPI quote outside T30/T15/T5 must never become an
           // opening or retroactively fill a missed milestone.
-          if (current.length && researchStageFor(target.kickoffUtc, capturedAt)) {
+          if (captureMilestones && current.length && researchStageFor(target.kickoffUtc, capturedAt)) {
             const inserted = captureResearchTimelinePrices(
               target.matchId,
               "pinnacle",
@@ -2128,6 +2135,203 @@ export class RadarEngine {
       .map(({ stage: _stage, ...target }) => target);
   }
 
+  /**
+   * Fast, DB-driven checkpoint pass. It deliberately performs no fixture
+   * discovery, reconciliation, translation, result collection, simulation,
+   * Crown fetch or Telegram work. Each provider request owns a real aborting
+   * timeout, and observations are timestamped only after the response arrives.
+   */
+  async runResearchMilestoneTick(): Promise<{
+    selected: number;
+    attempted: number;
+    fetched: number;
+    failed: number;
+    rows: number;
+    runtimeMs: number;
+  }> {
+    const startedAt = Date.now();
+    type Target = {
+      id: string;
+      kickoffUtc: number;
+      stage: "T30" | "T15" | "T5";
+      titanId: string | null;
+      titanReversed: boolean;
+      pinnapiId: string | null;
+      pinnapiReversed: boolean;
+      activeSource: "titan007" | "pinnapi" | null;
+      missingMarkets: Array<"AH" | "OU">;
+    };
+    const completePairs = new Set(
+      (rawDb.prepare(
+        `SELECT match_id,stage,market
+           FROM research_timeline_snapshots
+          WHERE provider='pinnacle' AND market IN ('AH','OU')
+            AND stage IN ('T30','T15','T5')
+          GROUP BY match_id,stage,market,line_key
+         HAVING COUNT(DISTINCT selection)>=2`,
+      ).all() as Array<{ match_id: string; stage: string; market: string }>)
+        .map((row) => `${row.match_id}:${row.stage}:${row.market}`),
+    );
+    const candidates = rawDb.prepare(
+      `SELECT m.id,m.kickoff_utc,m.titan_id,m.pinnacle_match_id,
+              p.titan_id mapped_titan_id,COALESCE(p.titan_reversed,0) titan_reversed,
+              p.pinnapi_id,COALESCE(p.pinnapi_reversed,0) pinnapi_reversed,
+              p.active_source,m.status
+         FROM matches m
+         LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+        WHERE m.fixture_source IN ('hkjc','pinnacle')
+          AND m.inplay=0
+          AND m.kickoff_utc>?
+          AND m.kickoff_utc<=?
+        ORDER BY m.kickoff_utc`,
+    ).all(startedAt, startedAt + 30 * 60_000) as Array<{
+      id: string;
+      kickoff_utc: number;
+      titan_id: string | null;
+      pinnacle_match_id: string | null;
+      mapped_titan_id: string | null;
+      titan_reversed: number;
+      pinnapi_id: string | null;
+      pinnapi_reversed: number;
+      active_source: string | null;
+      status: string;
+    }>;
+    const priority = { T5: 0, T15: 1, T30: 2 } as const;
+    const targets = candidates.flatMap((row): Target[] => {
+      const stage = researchStageFor(row.kickoff_utc, startedAt);
+      if (!stage) return [];
+      if (STARTED_MATCH_STATUS.test(row.status ?? "")) return [];
+      const missingMarkets = (["AH", "OU"] as const).filter(
+        (market) => !completePairs.has(`${row.id}:${stage}:${market}`),
+      );
+      if (!missingMarkets.length) return [];
+      const titanId = row.mapped_titan_id
+        ?? row.titan_id
+        ?? (row.pinnacle_match_id?.startsWith("titan:") ? row.pinnacle_match_id.slice(6) : null);
+      const pinnapiId = row.pinnapi_id
+        ?? (row.pinnacle_match_id?.startsWith("pinnapi:") ? row.pinnacle_match_id.slice(8) : null);
+      if (!titanId && !pinnapiId) return [];
+      return [{
+        id: row.id,
+        kickoffUtc: row.kickoff_utc,
+        stage,
+        titanId,
+        titanReversed: !!row.titan_reversed,
+        pinnapiId,
+        pinnapiReversed: !!row.pinnapi_reversed,
+        activeSource: row.active_source === "pinnapi"
+          ? "pinnapi"
+          : row.active_source === "titan007" || row.active_source === "titan"
+            ? "titan007"
+            : null,
+        missingMarkets,
+      }];
+    }).sort((a, b) =>
+      priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc
+    ).slice(0, MAX_RESEARCH_MILESTONE_TARGETS);
+
+    let attempted = 0;
+    let fetched = 0;
+    let failed = 0;
+    let rows = 0;
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const target = targets[cursor++];
+        if (!target) return;
+        attempted++;
+        const [titan, pinnapi] = await Promise.allSettled([
+          target.titanId
+            ? this.pinnacle.fetchPinnacleResearchPrices(target.titanId, {
+                timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+                retries: 0,
+              }).then((value) => ({ prices: value.current, completedAt: Date.now() }))
+            : Promise.resolve(null),
+          target.pinnapiId
+            ? this.pinnapi.fetchMatchPrices(target.pinnapiId, {
+                timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
+                retries: 0,
+              }).then((prices) => ({ prices, completedAt: Date.now() }))
+            : Promise.resolve(null),
+        ]);
+        const titanResult = titan.status === "fulfilled" && titan.value
+          ? {
+              prices: target.titanReversed
+                ? this.reversePinnaclePrices(titan.value.prices)
+                : titan.value.prices,
+              completedAt: titan.value.completedAt,
+              sourceName: "titan007-pinnacle",
+              sourceMatchId: target.titanId,
+            }
+          : null;
+        const pinnapiResult = pinnapi.status === "fulfilled" && pinnapi.value
+          ? {
+              prices: target.pinnapiReversed
+                ? this.reversePinnaclePrices(pinnapi.value.prices)
+                : pinnapi.value.prices,
+              completedAt: pinnapi.value.completedAt,
+              sourceName: "pinnapi",
+              sourceMatchId: target.pinnapiId,
+            }
+          : null;
+        const preferred = target.activeSource === "pinnapi"
+          ? [pinnapiResult, titanResult]
+          : [titanResult, pinnapiResult];
+        let insertedForTarget = 0;
+        for (const market of target.missingMarkets) {
+          const chosen = preferred.find((result) => {
+            if (!result) return false;
+            const selections = new Set(
+              result.prices
+                .filter((price) => price.market === market)
+                .map((price) => price.selection),
+            );
+            return market === "AH"
+              ? selections.has("H") && selections.has("A")
+              : selections.has("O") && selections.has("U");
+          });
+          if (!chosen) continue;
+          const completedStage = researchStageFor(target.kickoffUtc, chosen.completedAt);
+          if (
+            !completedStage
+            || completePairs.has(`${target.id}:${completedStage}:${market}`)
+          ) continue;
+          insertedForTarget += captureResearchTimelinePrices(
+            target.id,
+            "pinnacle",
+            chosen.prices.filter((price) => price.market === market),
+            target.kickoffUtc,
+            chosen.completedAt,
+            {
+              sourceName: chosen.sourceName,
+              sourceMatchId: chosen.sourceMatchId,
+            },
+          );
+        }
+        if (!insertedForTarget) {
+          failed++;
+          continue;
+        }
+        fetched++;
+        rows += insertedForTarget;
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(RESEARCH_MILESTONE_CONCURRENCY, targets.length) },
+        () => worker(),
+      ),
+    );
+    return {
+      selected: targets.length,
+      attempted,
+      fetched,
+      failed,
+      rows,
+      runtimeMs: Date.now() - startedAt,
+    };
+  }
+
   /** Candidate keys that currently pass every pre-bet rule except re-confirmation. */
   private simulationCandidateKeys(
     dash: DashboardResponse,
@@ -2231,7 +2435,10 @@ export class RadarEngine {
    * Crown-only research detail is intentionally not scheduled here: the window
    * scanner must never wait behind a separate provider's research backlog.
    */
-  async runResearchTimelineTick(): Promise<{ selected: number; detailCalls: number }> {
+  async runResearchTimelineTick(
+    options: { captureMilestones?: boolean } = {},
+  ): Promise<{ selected: number; detailCalls: number }> {
+    const captureMilestones = options.captureMilestones ?? true;
     await this.refreshHkjc();
     await this.refreshPinnacleFixtures();
     // This pass is deliberately independent of the dense execution scanner.
@@ -2240,7 +2447,9 @@ export class RadarEngine {
     // observation. INSERT OR IGNORE in captureResearchTimelinePrices preserves
     // the first genuine quote for every checkpoint key across retries.
     const checkpointNow = Date.now();
-    const targets = this.researchTimelinePinnacleTargets(checkpointNow);
+    const targets = captureMilestones
+      ? this.researchTimelinePinnacleTargets(checkpointNow)
+      : [];
     let detailCalls = 0;
     if (targets.length) {
       const detail = await this.pollPinnacleDetail(
@@ -2283,7 +2492,7 @@ export class RadarEngine {
     // It writes only research-timeline rows and never touches HKJC execution
     // or the T-30 window scanner.
     try {
-      await this.refreshPinnacleOnlyResearch();
+      await this.refreshPinnacleOnlyResearch(Date.now(), captureMilestones);
     } catch (err) {
       log("pinnacle_only_research_error", { error: (err as Error).message });
     }

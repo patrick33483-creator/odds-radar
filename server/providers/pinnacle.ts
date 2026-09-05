@@ -31,7 +31,7 @@
  * (visible label "平*", company id 47) and in the 1X2 JS as "Pinnacle".
  */
 
-import { fetchText } from "../lib/http";
+import { fetchText, type FetchOpts } from "../lib/http";
 import { hkToDecimal, parsePinnacleHandicap, parsePinnacleTotal } from "../lib/lines";
 import {
   fetchApiFixtures,
@@ -639,15 +639,20 @@ export class PinnacleProvider {
   }
 
   /** Research-only Pinnacle AH/OU with explicit opening and current values. */
-  async fetchPinnacleResearchPrices(sId: string): Promise<CrownResearchPrices> {
+  async fetchPinnacleResearchPrices(
+    sId: string,
+    request: Pick<FetchOpts, "timeoutMs" | "retries"> = {},
+  ): Promise<CrownResearchPrices> {
     const now = Date.now();
+    const timeoutMs = request.timeoutMs ?? 30_000;
+    const retries = request.retries ?? 1;
     const sourceUrls = {
       AH: `${VIP}/AsianOdds_n.aspx?id=${sId}`,
       OU: `${VIP}/OverDown_n.aspx?id=${sId}`,
     };
     const [ah, ou] = await Promise.allSettled([
-      fetchText(sourceUrls.AH, { timeoutMs: 30_000, retries: 1 }),
-      fetchText(sourceUrls.OU, { timeoutMs: 30_000, retries: 1 }),
+      fetchText(sourceUrls.AH, { timeoutMs, retries }),
+      fetchText(sourceUrls.OU, { timeoutMs, retries }),
     ]);
     if (ah.status === "rejected" && ou.status === "rejected") {
       throw new Error(`Pinnacle research detail unavailable for ${sId}: ${(ah.reason as Error)?.message ?? "unknown"}`);
