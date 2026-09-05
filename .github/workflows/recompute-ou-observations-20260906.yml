@@ -36,17 +36,17 @@ jobs:
           set -euo pipefail
           cd /opt/odds-radar
           stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          # Copy from the host bind mount (./data:/app/data). The container
-          # image has no sqlite3 CLI, and copying inside the container was
-          # OOM-killed. Every WAL sidecar is copied so the snapshot is
-          # restorable as-is.
-          sudo mkdir -p data/pre-recompute-"$stamp"
-          for suffix in "" "-wal" "-shm"; do
-            if [ -f "data/data.db$suffix" ]; then
-              sudo cp -p "data/data.db$suffix" "data/pre-recompute-$stamp/data.db$suffix"
-            fi
-          done
-          sudo ls -l data/pre-recompute-"$stamp"
+          # Stream-compress the snapshot instead of copying it. A plain copy of
+          # the 4.5G database plus its WAL would leave under 2G free on a 24G
+          # disk that was at 100% earlier today, and SQLite needs headroom to
+          # keep writing while the recompute runs.
+          sudo sh -c "gzip -c data/data.db > data/pre-recompute-${stamp}.db.gz"
+          if [ -f data/data.db-wal ]; then
+            sudo sh -c "gzip -c data/data.db-wal > data/pre-recompute-${stamp}.db-wal.gz"
+          fi
+          sudo ls -lh data/pre-recompute-"$stamp"*
+          df -h /
+
           sudo docker compose exec -T \
             -e OU_RECOMPUTE_CONFIRMATION=RECOMPUTE_CONFIRMED_OU_MAINLINE_20260906 \
             radar node dist/recompute-ou-observations-20260906.cjs
