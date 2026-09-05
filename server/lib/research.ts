@@ -9,7 +9,13 @@ import {
 } from "../providers/tipsme-opening";
 import type { ProviderPrice } from "../providers/types";
 import { lineKeyOf } from "./lines";
-import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
+import {
+  KICKOFF_TOLERANCE_MS,
+  matchEvent,
+  normalizeName,
+  type AliasIndex,
+  type CandidateEvent,
+} from "./matching";
 import { getState, rawDb, setState } from "./store";
 import type {
   ResearchDatasetResponse,
@@ -788,60 +794,128 @@ export async function collectResearchResults(
              source_match_id=excluded.source_match_id,fetched_at=excluded.fetched_at`,
         );
 
+        type TitanFixture = ReturnType<typeof parseSchedulePage>[number];
+        const titanRequestCache = new Map<string, TitanFixture[]>();
+        const loadTitanKind = async (
+          yyyymmdd: string,
+          kind: "Over" | "Next",
+        ): Promise<TitanFixture[]> => {
+          const cacheKey = `${kind}_${yyyymmdd}`;
+          const cached = titanRequestCache.get(cacheKey);
+          if (cached) return cached;
+          const html = await fetchText(`${titanBase}/${cacheKey}.htm`, {
+            charset: "gb18030",
+            timeoutMs: 25_000,
+            retries: 1,
+          });
+          const fixtures = parseSchedulePage(html, yyyymmdd).filter(
+            (fixture) => /完|-1/.test(fixture.statusText)
+              && fixture.homeScore !== null
+              && fixture.awayScore !== null,
+          );
+          titanRequestCache.set(cacheKey, fixtures);
+          return fixtures;
+        };
+        const loadTitanPage = async (
+          yyyymmdd: string,
+        ): Promise<{ fixtures: Map<string, TitanFixture>; conflictedIds: Set<string> }> => {
+          const byTitanId = new Map<string, TitanFixture>();
+          const conflictedIds = new Set<string>();
+          for (const kind of ["Over", "Next"] as const) {
+            try {
+              const fixtures = await loadTitanKind(yyyymmdd, kind);
+              for (const f of fixtures) {
+                if (conflictedIds.has(f.providerMatchId)) continue;
+                const existing = byTitanId.get(f.providerMatchId);
+                if (
+                  existing
+                  && (existing.homeScore !== f.homeScore || existing.awayScore !== f.awayScore)
+                ) {
+                  byTitanId.delete(f.providerMatchId);
+                  conflictedIds.add(f.providerMatchId);
+                } else if (!existing) {
+                  byTitanId.set(f.providerMatchId, f);
+                }
+              }
+            } catch {
+              // 喺一頁 404 不影響另一頁
+            }
+          }
+          return { fixtures: byTitanId, conflictedIds };
+        };
+
         for (const [yyyymmdd, rows] of titanByDate.entries()) {
           try {
-            // titan007：已完場包在 Over_ 及 Next_ 兩頁。當日/前一日場常在 Next_ 頁
-            //           （Over_ 只有已命名雷場時已採集完成）。兩頁先 Over_ 後 Next_ 都試。
-            const byTitanId = new Map<string, ReturnType<typeof parseSchedulePage>[number]>();
-            for (const kind of ["Over", "Next"] as const) {
-              try {
-                const html = await fetchText(`${titanBase}/${kind}_${yyyymmdd}.htm`, {
-                  charset: "gb18030",
-                  timeoutMs: 25_000,
-                  retries: 1,
-                });
-                const fixtures = parseSchedulePage(html, yyyymmdd);
-                for (const f of fixtures) {
-                  const finished = /完|-1/.test(f.statusText)
-                    || yyyymmdd < titanHktYyyymmdd(now);
-                  if (!finished) continue;
-                  const existing = byTitanId.get(f.providerMatchId);
-                  // 只保留有分數那份；Over_ 優先，但如果 Over_ 沒分而 Next_ 有分就換。
-                  const fHasScore = f.homeScore !== null && f.awayScore !== null;
-                  const existingHasScore = existing !== undefined
-                    && existing.homeScore !== null
-                    && existing.awayScore !== null;
-                  if (!existing || (!existingHasScore && fHasScore)) {
-                    byTitanId.set(f.providerMatchId, f);
-                  }
+            // Titan 的 Over_ 頁鍵是賽程批次日，不一定等於香港開賽日。凌晨場經常
+            // 出現在前一日 Over_ 頁，因此同時合併開賽日及前一日的 Over_/Next_。
+            const byTitanId = new Map<string, TitanFixture>();
+            const conflictedIds = new Set<string>();
+            for (const pageKey of [yyyymmdd, titanHktYyyymmdd(
+              Date.parse(
+                `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}T00:00:00+08:00`,
+              ) - 24 * 60 * 60_000,
+            )]) {
+              const page = await loadTitanPage(pageKey);
+              for (const id of page.conflictedIds) {
+                byTitanId.delete(id);
+                conflictedIds.add(id);
+              }
+              for (const [id, fixture] of page.fixtures) {
+                if (conflictedIds.has(id)) continue;
+                const existing = byTitanId.get(id);
+                if (
+                  existing
+                  && (existing.homeScore !== fixture.homeScore || existing.awayScore !== fixture.awayScore)
+                ) {
+                  byTitanId.delete(id);
+                  conflictedIds.add(id);
+                } else if (!existing) {
+                  byTitanId.set(id, fixture);
                 }
-              } catch {
-                // 喺一頁 404 不影響另一頁
               }
             }
             const tx = rawDb.transaction(() => {
               for (const row of rows) {
                 let fixture = row.titan_id ? byTitanId.get(row.titan_id) : undefined;
                 let reversed = false;
+                if (
+                  fixture
+                  && Math.abs(fixture.kickoffUtc - row.kickoff_utc) > KICKOFF_TOLERANCE_MS
+                ) {
+                  fixture = undefined;
+                }
                 if (!fixture) {
-                  const decision = matchEvent(
-                    {
+                  const target = {
                       id: row.id,
                       league: row.league,
                       homeTeam: row.home_team,
                       awayTeam: row.away_team,
                       kickoffUtc: row.kickoff_utc,
-                    },
-                    Array.from(byTitanId.values()).map((candidate) => ({
+                    };
+                  const accepted = Array.from(byTitanId.values()).flatMap((candidate) => {
+                    const decision = matchEvent(target, [{
                       id: candidate.providerMatchId,
                       league: candidate.league,
                       homeTeam: candidate.homeTeam,
                       awayTeam: candidate.awayTeam,
                       kickoffUtc: candidate.kickoffUtc,
-                    })),
-                  );
-                  if (!decision.pinnacleMatchId) continue;
-                  fixture = byTitanId.get(decision.pinnacleMatchId);
+                    }]);
+                    return decision.pinnacleMatchId ? [{ candidate, decision }] : [];
+                  });
+                  if (accepted.length !== 1) {
+                    if (accepted.length > 1) {
+                      console.warn(JSON.stringify({
+                        ts: new Date().toISOString(),
+                        scope: "radar",
+                        event: "research_results_titan_ambiguous",
+                        matchId: row.id,
+                        candidateIds: accepted.map(({ candidate }) => candidate.providerMatchId),
+                      }));
+                    }
+                    continue;
+                  }
+                  const { candidate, decision } = accepted[0];
+                  fixture = candidate;
                   reversed = decision.reversed;
                 }
                 if (!fixture) continue;

@@ -84,27 +84,47 @@ export interface PinnacleFixture {
 export function parseTitanTime(text: string, pageYyyymmdd: string): number | null {
   const year = Number(pageYyyymmdd.slice(0, 4));
   const pageMonth = Number(pageYyyymmdd.slice(4, 6));
-  let mo: number;
-  let d: number;
-  let h: number;
-  let mi: number;
+  const pageDay = Number(pageYyyymmdd.slice(6, 8));
+  const pageUtc = Date.UTC(year, pageMonth - 1, pageDay) - HK_TZ_OFFSET_MS;
   const a = text.match(/(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})/);
   const b = text.match(/(\d{1,2})\u65e5\s*(\d{1,2}):(\d{2})/);
+  const candidates: number[] = [];
+  const addCandidate = (y: number, mo: number, d: number, h: number, mi: number): void => {
+    const local = new Date(Date.UTC(y, mo - 1, d, h, mi));
+    if (
+      local.getUTCFullYear() !== y
+      || local.getUTCMonth() !== mo - 1
+      || local.getUTCDate() !== d
+    ) return;
+    candidates.push(local.getTime() - HK_TZ_OFFSET_MS);
+  };
   if (a) {
-    mo = Number(a[1]);
-    d = Number(a[2]);
-    h = Number(a[3]);
-    mi = Number(a[4]);
+    const mo = Number(a[1]);
+    const d = Number(a[2]);
+    const h = Number(a[3]);
+    const mi = Number(a[4]);
+    for (const candidateYear of [year - 1, year, year + 1]) {
+      addCandidate(candidateYear, mo, d, h, mi);
+    }
   } else if (b) {
-    mo = pageMonth;
-    d = Number(b[1]);
-    h = Number(b[2]);
-    mi = Number(b[3]);
+    const d = Number(b[1]);
+    const h = Number(b[2]);
+    const mi = Number(b[3]);
+    for (const monthOffset of [-1, 0, 1]) {
+      const monthAnchor = new Date(Date.UTC(year, pageMonth - 1 + monthOffset, 1));
+      addCandidate(
+        monthAnchor.getUTCFullYear(),
+        monthAnchor.getUTCMonth() + 1,
+        d,
+        h,
+        mi,
+      );
+    }
   } else {
     return null;
   }
-  const utc = Date.UTC(year, mo - 1, d, h, mi);
-  return utc - HK_TZ_OFFSET_MS;
+  if (candidates.length === 0) return null;
+  return candidates.sort((left, right) => Math.abs(left - pageUtc) - Math.abs(right - pageUtc))[0];
 }
 
 /** Parse a Next_/Over_ schedule page. */

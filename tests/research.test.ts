@@ -15,10 +15,12 @@ let researchStageFor: typeof import("../server/lib/research").researchStageFor;
 let researchCsv: typeof import("../server/lib/research").researchCsv;
 let researchDataset: typeof import("../server/lib/research").researchDataset;
 let saveResearchInitialSnapshots: typeof import("../server/lib/research").saveResearchInitialSnapshots;
+let parseTitanTime: typeof import("../server/providers/pinnacle").parseTitanTime;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
   const research = await import("../server/lib/research");
+  const pinnacle = await import("../server/providers/pinnacle");
   const tipsme = await import("../server/providers/tipsme-opening");
   rawDb = store.rawDb;
   captureResearchTimelinePrices = research.captureResearchTimelinePrices;
@@ -29,6 +31,7 @@ beforeAll(async () => {
   researchCsv = research.researchCsv;
   researchDataset = research.researchDataset;
   saveResearchInitialSnapshots = research.saveResearchInitialSnapshots;
+  parseTitanTime = pinnacle.parseTitanTime;
   parseTipsmeOpeningQuotes = tipsme.parseTipsmeOpeningQuotes;
   store.migrate();
 });
@@ -236,6 +239,148 @@ describe("research data collection", () => {
         source_match_id: "3100001",
       },
     ]);
+  });
+
+  it("finds an early-HKT final result on Titan's previous-day Over page", async () => {
+    const now = Date.parse("2026-09-05T06:00:00Z");
+    const kickoff = Date.parse("2026-09-04T19:30:00Z");
+    addMatch("pinnacle:previous-day-over", kickoff, "Deportivo Capiata", "3 De Noviembre");
+    rawDb.prepare(
+      `UPDATE matches
+          SET fixture_source='pinnacle',titan_id='3200001',league='Paraguay Division Intermedia'
+        WHERE id='pinnacle:previous-day-over'`,
+    ).run();
+
+    const previousDayPage = [
+      "<table>",
+      "<tr sId='3200001'><td>Paraguay Division Intermedia</td><td>9-5 03:30</td><td>-1</td>",
+      "<td>Deportivo Capiata</td><td>4 - 3</td><td>3 De Noviembre</td><td>2 - 1</td></tr>",
+      "</table>",
+    ].join("");
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      return new Response(url.includes("Over_20260904.htm") ? previousDayPage : "<table></table>");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const result = await collectResearchResults({ fetchHistoricResults: async () => [] } as never, now);
+      expect(result).toEqual({ candidates: 1, collected: 1 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("Over_20260904.htm"))).toBe(true);
+    expect(rawDb.prepare(
+      `SELECT home_score,away_score,result_source,source_match_id
+         FROM research_results WHERE match_id='pinnacle:previous-day-over'`,
+    ).get()).toEqual({
+      home_score: 4,
+      away_score: 3,
+      result_source: "titan007",
+      source_match_id: "3200001",
+    });
+  });
+
+  it("does not persist a live score found on Titan's previous-day page", async () => {
+    const now = Date.parse("2026-09-05T06:00:00Z");
+    const kickoff = Date.parse("2026-09-04T19:30:00Z");
+    addMatch("pinnacle:previous-day-live", kickoff, "Live Home", "Live Away");
+    rawDb.prepare(
+      `UPDATE matches
+          SET fixture_source='pinnacle',titan_id='3200002',league='Live League'
+        WHERE id='pinnacle:previous-day-live'`,
+    ).run();
+    const livePage = [
+      "<table>",
+      "<tr sId='3200002'><td>Live League</td><td>9-5 03:30</td><td>70</td>",
+      "<td>Live Home</td><td>1 - 0</td><td>Live Away</td><td>0 - 0</td></tr>",
+      "</table>",
+    ].join("");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      return new Response(url.includes("Over_20260904.htm") ? livePage : "<table></table>");
+    }));
+    try {
+      await expect(collectResearchResults({ fetchHistoricResults: async () => [] } as never, now))
+        .resolves.toEqual({ candidates: 1, collected: 0 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_results WHERE match_id='pinnacle:previous-day-live'",
+    ).get()).toEqual({ count: 0 });
+    rawDb.prepare("DELETE FROM matches WHERE id='pinnacle:previous-day-live'").run();
+  });
+
+  it("resolves Titan cross-month and cross-year schedule times around the page date", () => {
+    expect(parseTitanTime("1日03:30", "20260831")).toBe(Date.parse("2026-08-31T19:30:00Z"));
+    expect(parseTitanTime("1-1 03:30", "20251231")).toBe(Date.parse("2025-12-31T19:30:00Z"));
+  });
+
+  it("fails closed when two Titan IDs both strictly match one unmapped result", async () => {
+    const now = Date.parse("2026-09-05T06:00:00Z");
+    const kickoff = Date.parse("2026-09-04T19:30:00Z");
+    addMatch("pinnacle:ambiguous-cross-day", kickoff, "Same Home", "Same Away");
+    rawDb.prepare(
+      `UPDATE matches
+          SET fixture_source='pinnacle',titan_id=NULL,league='Same League'
+        WHERE id='pinnacle:ambiguous-cross-day'`,
+    ).run();
+    const previousPage = [
+      "<table>",
+      "<tr sId='3300001'><td>Same League</td><td>9-5 03:30</td><td>-1</td>",
+      "<td>Same Home</td><td>2 - 0</td><td>Same Away</td><td>1 - 0</td></tr>",
+      "<tr sId='3300002'><td>Same League</td><td>9-5 03:30</td><td>-1</td>",
+      "<td>Same Home</td><td>1 - 1</td><td>Same Away</td><td>0 - 0</td></tr>",
+      "</table>",
+    ].join("");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      return new Response(url.includes("Over_20260904.htm") ? previousPage : "<table></table>");
+    }));
+    try {
+      await expect(collectResearchResults({ fetchHistoricResults: async () => [] } as never, now))
+        .resolves.toEqual({ candidates: 1, collected: 0 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_results WHERE match_id='pinnacle:ambiguous-cross-day'",
+    ).get()).toEqual({ count: 0 });
+    rawDb.prepare("DELETE FROM matches WHERE id='pinnacle:ambiguous-cross-day'").run();
+  });
+
+  it("does not reintroduce a Titan ID after conflicting final scores across pages", async () => {
+    const now = Date.parse("2026-09-05T06:00:00Z");
+    const kickoff = Date.parse("2026-09-04T19:30:00Z");
+    addMatch("pinnacle:conflicting-titan-id", kickoff, "Conflict Home", "Conflict Away");
+    rawDb.prepare(
+      `UPDATE matches
+          SET fixture_source='pinnacle',titan_id='3400001',league='Conflict League'
+        WHERE id='pinnacle:conflicting-titan-id'`,
+    ).run();
+    const page = (score: string) => [
+      "<table>",
+      "<tr sId='3400001'><td>Conflict League</td><td>9-5 03:30</td><td>-1</td>",
+      `<td>Conflict Home</td><td>${score}</td><td>Conflict Away</td><td>0 - 0</td></tr>`,
+      "</table>",
+    ].join("");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("Over_20260905.htm")) return new Response(page("2 - 0"));
+      if (url.includes("Next_20260905.htm")) return new Response(page("1 - 1"));
+      if (url.includes("Over_20260904.htm")) return new Response(page("2 - 0"));
+      return new Response("<table></table>");
+    }));
+    try {
+      await expect(collectResearchResults({ fetchHistoricResults: async () => [] } as never, now))
+        .resolves.toEqual({ candidates: 1, collected: 0 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM research_results WHERE match_id='pinnacle:conflicting-titan-id'",
+    ).get()).toEqual({ count: 0 });
   });
 
   it("locks a complete checkpoint and does not overwrite it on later scans", () => {
