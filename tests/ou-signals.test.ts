@@ -161,7 +161,7 @@ describe("OU signal monitor", () => {
     expect(syncOuSignalObservations(["threshold-fail"])).toBe(0);
   });
 
-  it("keeps feasible T-30 candidates and suppresses disabled Telegram rules", () => {
+  it("exposes visible Watch candidates at T-30 while suppressing hidden rules", () => {
     expect(syncOuSignalPrealerts()).toBe(7);
     expect(syncOuSignalPrealerts()).toBe(0);
     const rows = rawDb.prepare(
@@ -193,17 +193,16 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_prealert_activated_at'",
     ).run(String(earliest - 1), earliest - 1);
     const pending = unsentOuPrealerts();
-    expect(pending).toHaveLength(2);
+    expect(pending).toHaveLength(6);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
-    expect(pending.map((row) => row.ruleId)).not.toContain("hkjc-ooo-flat-wide-reverse");
-    expect(pending.map((row) => row.ruleId)).not.toContain(
+    expect(pending.map((row) => row.ruleId)).toEqual(expect.arrayContaining([
       "hkjc-ooo-flat-wide-line-225-250-under-watch",
-    );
-    expect(pending.map((row) => row.ruleId)).not.toContain(
+      "hkjc-ooo-flat-wide-reverse",
+      "pinnacle-ouu-t5-selected-180-190-over-watch",
       "hkjc-ooo-t5-selected-le-180-under-watch",
-    );
+    ]));
     markOuPrealertNotified(pending[0].uniqueKey, Date.now());
-    expect(unsentOuPrealerts()).toHaveLength(1);
+    expect(unsentOuPrealerts()).toHaveLength(5);
   });
 
   it("uses the rule signal-side initial odds for a U→O prealert range", () => {

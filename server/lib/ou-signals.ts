@@ -252,13 +252,9 @@ export const OU_HIDDEN_RULE_IDS = new Set([
   "pinnacle-uoo-line-250-275-over-watch",
   "pinnacle-uuu-flat-wide-reverse",
 ]);
-/** T-30 is only a candidate stage, so Watch rules stay silent until fully qualified at T-5. */
+/** Only hidden research rules stay silent at T-30; visible Watch rules may send candidate alerts. */
 export const OU_T30_TG_DISABLED_RULE_IDS = new Set([
   ...OU_HIDDEN_RULE_IDS,
-  "hkjc-ooo-flat-wide-line-225-250-under-watch",
-  "hkjc-ooo-flat-wide-reverse",
-  "pinnacle-ouu-t5-selected-180-190-over-watch",
-  "hkjc-ooo-t5-selected-le-180-under-watch",
 ]);
 
 const RULE_BY_ID = new Map(
