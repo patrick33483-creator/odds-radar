@@ -27,7 +27,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 執行白名單原子補錄並核對待發數
+      - name: 唯讀核對 Dashboard 補錄後統計
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -35,7 +35,42 @@ jobs:
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/odds-radar
-          sudo docker compose exec -T \
-            -e OU_T5_BACKFILL_CONFIRMATION=BACKFILL_CONFIRMED_T5_20260905 \
-            radar node dist/backfill-ou-t5-20260905.cjs
+          sudo docker compose exec -T radar node -e '
+            const ids = new Set([
+              "hkjc:50074295", "hkjc:50074592", "hkjc:50074706",
+              "hkjc:50075104", "hkjc:50074704", "hkjc:50074555",
+              "crown:3012499", "hkjc:50074636", "hkjc:50075021",
+              "hkjc:50074864", "hkjc:50074840", "hkjc:50074717"
+            ]);
+            const rules = new Set([
+              "pinnacle-ouu-t5-selected-180-190-over-watch",
+              "hkjc-ooo-t5-selected-le-180-under-watch",
+              "hkjc-ooo-flat-wide-reverse"
+            ]);
+            const authorization = `Basic ${Buffer.from(
+              `${process.env.RADAR_ACCESS_USER}:${process.env.RADAR_ACCESS_PASSWORD}`
+            ).toString("base64")}`;
+            fetch("http://127.0.0.1:5000/api/ou-signals", {
+              headers: { authorization }
+            })
+              .then((response) => {
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response.json();
+              })
+              .then((data) => console.log(JSON.stringify({
+                generatedAt: data.generatedAt,
+                totalObservations: data.observations.length,
+                totalSettled: data.summaries.reduce((sum, row) => sum + row.settled, 0),
+                targetSummaries: data.summaries.filter((row) => rules.has(row.rule.id)),
+                approvedRows: data.observations
+                  .filter((row) => ids.has(row.matchId) && rules.has(row.ruleId))
+                  .map((row) => ({
+                    matchId: row.matchId,
+                    ruleId: row.ruleId,
+                    teams: `${row.homeTeam} vs ${row.awayTeam}`,
+                    status: row.matchStatus,
+                    result: row.result
+                  }))
+              }, null, 2)));
+          '
           REMOTE
