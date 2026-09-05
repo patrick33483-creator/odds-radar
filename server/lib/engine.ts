@@ -186,6 +186,45 @@ export function researchMilestoneCapacity(
   return Math.min(ceiling, Math.max(MIN_RESEARCH_MILESTONE_TARGETS, candidateCount));
 }
 
+/**
+ * Reserved share of one tick's budget per checkpoint. T5 keeps first claim on
+ * the free slots, but T30 and T15 hold guaranteed floors so a burst of T5 work
+ * can no longer consume the whole tick and leave the earlier checkpoints
+ * permanently uncollected.
+ */
+export const MILESTONE_STAGE_RESERVE = { T30: 0.4, T15: 0.25 } as const;
+
+/**
+ * Split a priority-sorted target list across the tick budget while honouring
+ * the per-stage floors. Returns the targets to run, still in T5 -> T15 -> T30
+ * execution order.
+ */
+export function allocateMilestoneTargets<T extends { stage: "T30" | "T15" | "T5" }>(
+  targets: readonly T[],
+  capacity: number,
+): T[] {
+  if (capacity <= 0) return [];
+  if (targets.length <= capacity) return [...targets];
+  const byStage = { T5: [] as T[], T15: [] as T[], T30: [] as T[] };
+  for (const target of targets) byStage[target.stage].push(target);
+  const taken = { T5: 0, T15: 0, T30: 0 };
+  // Floors first, so the free-slot pass below can never starve them.
+  for (const stage of ["T30", "T15"] as const) {
+    taken[stage] = Math.min(
+      byStage[stage].length,
+      Math.floor(capacity * MILESTONE_STAGE_RESERVE[stage]),
+    );
+  }
+  let remaining = capacity - taken.T30 - taken.T15;
+  for (const stage of ["T5", "T15", "T30"] as const) {
+    if (remaining <= 0) break;
+    const extra = Math.min(remaining, byStage[stage].length - taken[stage]);
+    taken[stage] += extra;
+    remaining -= extra;
+  }
+  return (["T5", "T15", "T30"] as const).flatMap((stage) => byStage[stage].slice(0, taken[stage]));
+}
+
 /** Worker fan-out for one tick, never more than the work available. */
 export function researchMilestoneConcurrency(
   targetCount: number,
@@ -2205,6 +2244,10 @@ export class RadarEngine {
    */
   async runResearchMilestoneTick(): Promise<{
     selected: number;
+    /** In-window fixtures with no Pinnacle/Titan id, so never requested. */
+    unmapped: number;
+    /** In-window fixtures whose current checkpoint is already complete. */
+    alreadyComplete: number;
     attempted: number;
     fetched: number;
     failed: number;
@@ -2269,20 +2312,30 @@ export class RadarEngine {
       }
     }
     const priority = { T5: 0, T15: 1, T30: 2 } as const;
-    const targets = candidates.flatMap((row): Target[] => {
+    // Counted separately so an unmapped fixture is never reported as a
+    // collection failure: it is a fixture-matching gap, not a missed request.
+    let alreadyComplete = 0;
+    let unmapped = 0;
+    const eligible = candidates.flatMap((row): Target[] => {
       const stage = researchStageFor(row.kickoff_utc, startedAt);
       if (!stage) return [];
       if (STARTED_MATCH_STATUS.test(row.status ?? "")) return [];
       const missingMarkets = (["AH", "OU"] as const).filter(
         (market) => !completePairs.has(`${row.id}:${stage}:${market}`),
       );
-      if (!missingMarkets.length) return [];
+      if (!missingMarkets.length) {
+        alreadyComplete++;
+        return [];
+      }
       const titanId = row.mapped_titan_id
         ?? row.titan_id
         ?? (row.pinnacle_match_id?.startsWith("titan:") ? row.pinnacle_match_id.slice(6) : null);
       const pinnapiId = row.pinnapi_id
         ?? (row.pinnacle_match_id?.startsWith("pinnapi:") ? row.pinnacle_match_id.slice(8) : null);
-      if (!titanId && !pinnapiId) return [];
+      if (!titanId && !pinnapiId) {
+        unmapped++;
+        return [];
+      }
       return [{
         id: row.id,
         kickoffUtc: row.kickoff_utc,
@@ -2298,9 +2351,11 @@ export class RadarEngine {
             : null,
         missingMarkets,
       }];
-    }).sort((a, b) =>
-      priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc
-    ).slice(0, researchMilestoneCapacity(candidates.length));
+    });
+    const targets = allocateMilestoneTargets(
+      eligible.sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc),
+      researchMilestoneCapacity(candidates.length),
+    );
 
     let attempted = 0;
     let fetched = 0;
@@ -2396,6 +2451,8 @@ export class RadarEngine {
     );
     return {
       selected: targets.length,
+      unmapped,
+      alreadyComplete,
       attempted,
       fetched,
       failed,

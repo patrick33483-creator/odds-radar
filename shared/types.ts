@@ -333,6 +333,7 @@ export type ResearchCellStatus =
   | "pending"
   | "source_unavailable"
   | "match_unmatched"
+  | "fixture_unmapped"
   | "market_unavailable"
   | "historical_unavailable"
   | "checkpoint_missed";
