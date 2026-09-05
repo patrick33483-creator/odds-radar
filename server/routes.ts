@@ -416,12 +416,10 @@ function buildSimulations(): SimulationsResponse {
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  // The 30-second research scheduler performs the first refresh. Keep startup
-  // responsive by default so health checks and dashboard reads cannot collide
-  // with thousands of synchronous SQLite upserts. Bootstrap is opt-in only.
-  if (process.env.RADAR_BOOTSTRAP === "1") {
-    void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
-  }
+  // Do not start a second boot-time refresh. The 30-second research scheduler
+  // owns the initial collection and the hourly prewarm owns broad refreshes.
+  // Keeping only those paths prevents a restart from launching overlapping
+  // HKJC writes before the HTTP service has passed its health gate.
   installResearchTimelineCollection();
   installAutoWindowScan();
   installHourlyPrewarm();

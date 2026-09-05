@@ -132,7 +132,7 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 | `PORT` | `5000` | HTTP 埠 |
 | `RADAR_DB` | `data.db` | SQLite 路徑 |
 | `RADAR_BACKUP_DIR` | `backups` | 備份目錄 |
-| `RADAR_BOOTSTRAP` | 啟用 | 設 `0` 可關閉啟動時的輕量暖機 |
+| `RADAR_BOOTSTRAP` | 已停用 | 保留作舊部署相容；啟動更新由 30 秒研究排程負責 |
 | `RADAR_AUTO_SCAN` | 啟用 | `0` 可關閉每 30 秒視窗檢查 |
 | `RADAR_HOURLY_PREWARM` | 啟用 | `0` 可關閉每小時 24 小時預熱配對 |
 | `RADAR_RESEARCH_RESULTS` | 啟用 | `0` 可關閉每小時 HKJC 官方賽果補抓 |

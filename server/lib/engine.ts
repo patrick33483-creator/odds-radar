@@ -567,6 +567,7 @@ export class RadarEngine {
 
   private refreshing = false;
   private inflight: Promise<void> | null = null;
+  private hkjcInflight: Promise<boolean> | null = null;
   private lastRefreshAt: number | null = null;
   private lastGoodAt: number | null = null;
   private coldStartStage: StatusResponse["coldStartStage"] = "idle";
@@ -775,39 +776,47 @@ export class RadarEngine {
 
   /** HKJC pre-match snapshot. ONE upstream GraphQL call for every match. */
   private async refreshHkjc(): Promise<boolean> {
+    if (this.hkjcInflight) return this.hkjcInflight;
+    const task = this.performHkjcRefresh().finally(() => {
+      if (this.hkjcInflight === task) this.hkjcInflight = null;
+    });
+    this.hkjcInflight = task;
+    return task;
+  }
+
+  private async performHkjcRefresh(): Promise<boolean> {
     const now = Date.now();
     try {
       const res = DEMO
         ? { events: DEMO_FIXTURE.hkjc, latencyMs: 1, partial: false, warnings: ["DEMO"] }
         : await this.hkjc.fetchPreMatch({});
       this.setHealth("hkjc", { ok: true, latencyMs: res.latencyMs, itemCount: res.events.length, mode: DEMO ? "demo" : "live" });
-      const tx = rawDb.transaction(() => {
+      const persistBatch = rawDb.transaction((events: typeof res.events) => {
         const clearLatest = rawDb.prepare(
           "DELETE FROM odds_latest WHERE match_id=? AND provider='hkjc'",
         );
-        for (const ev of res.events) {
+        const upsertMatch = rawDb.prepare(
+          `INSERT INTO matches(id,hkjc_id,pinnacle_match_id,league,league_en,home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at)
+           VALUES(?,?,NULL,?,?,?,?,?,?,?,?,0,?)
+           ON CONFLICT(id) DO UPDATE SET league=excluded.league, league_en=excluded.league_en,
+             home_team=excluded.home_team, away_team=excluded.away_team, kickoff_utc=excluded.kickoff_utc,
+             status=excluded.status, inplay=0, updated_at=excluded.updated_at`,
+        );
+        for (const ev of events) {
           const id = `hkjc:${ev.providerMatchId}`;
-          rawDb
-            .prepare(
-              `INSERT INTO matches(id,hkjc_id,pinnacle_match_id,league,league_en,home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at)
-               VALUES(?,?,NULL,?,?,?,?,?,?,?,?,0,?)
-               ON CONFLICT(id) DO UPDATE SET league=excluded.league, league_en=excluded.league_en,
-                 home_team=excluded.home_team, away_team=excluded.away_team, kickoff_utc=excluded.kickoff_utc,
-                 status=excluded.status, inplay=0, updated_at=excluded.updated_at`,
-            )
-            .run(
-              id,
-              ev.providerMatchId,
-              ev.league,
-              ev.leagueEn ?? null,
-              ev.homeTeam,
-              ev.awayTeam,
-              ev.homeTeamEn ?? null,
-              ev.awayTeamEn ?? null,
-              ev.kickoffUtc,
-              ev.status,
-              now,
-            );
+          upsertMatch.run(
+            id,
+            ev.providerMatchId,
+            ev.league,
+            ev.leagueEn ?? null,
+            ev.homeTeam,
+            ev.awayTeam,
+            ev.homeTeamEn ?? null,
+            ev.awayTeamEn ?? null,
+            ev.kickoffUtc,
+            ev.status,
+            now,
+          );
           // This endpoint is a complete pre-match snapshot for each returned
           // event. Remove lines that disappeared or became suspended before
           // inserting the currently tradable set, otherwise odds_latest can
@@ -816,7 +825,15 @@ export class RadarEngine {
           this.persistPrices(id, "hkjc", ev.prices, now, ev.kickoffUtc);
         }
       });
-      tx();
+      // better-sqlite3 is synchronous. A full HKJC card can contain enough
+      // rows to monopolise Node's only event loop and make every HTTP request
+      // hit nginx's timeout. Keep each atomic section bounded and let pending
+      // dashboard/status requests run between batches.
+      const batchSize = 20;
+      for (let offset = 0; offset < res.events.length; offset += batchSize) {
+        persistBatch(res.events.slice(offset, offset + batchSize));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       log("hkjc_refresh", { matches: res.events.length, latencyMs: res.latencyMs });
       return true;
     } catch (err) {
