@@ -17,6 +17,15 @@ import {
   researchDataset,
 } from "./lib/research";
 import { ouSignalDataset } from "./lib/ou-signals";
+import {
+  DISK_ALERT_STATE_KEY,
+  diskTarget,
+  parseDiskAlertState,
+  readDiskUsage,
+  runDiskCheck,
+} from "./lib/disk-guard";
+import { sendTelegramText } from "./lib/telegram";
+import { getState, setState } from "./lib/store";
 import { syncQuoteDirectionWatchObservations } from "./lib/quote-direction-watch";
 import type { Market, Selection, SimulationBetDto, SimulationSummary, SimulationsResponse } from "@shared/types";
 
@@ -42,10 +51,62 @@ let researchOpeningsInFlight: Promise<Awaited<ReturnType<typeof collectResearchI
 let quoteDirectionWatchTimer: NodeJS.Timeout | null = null;
 let quoteDirectionWatchStartupTimer: NodeJS.Timeout | null = null;
 let quoteDirectionWatchInFlight: Promise<ReturnType<typeof syncQuoteDirectionWatchObservations>> | null = null;
+let diskGuardTimer: NodeJS.Timeout | null = null;
+let diskGuardStartupTimer: NodeJS.Timeout | null = null;
+let diskGuardInFlight: Promise<unknown> | null = null;
 let pinnacleTranslationBackfillTimer: NodeJS.Timeout | null = null;
 let pinnacleTranslationBackfillStartupTimer: NodeJS.Timeout | null = null;
 let pinnacleTranslationBackfillInFlight: Promise<{ scanned: number; translated: number; attempts: number }> | null = null;
 const researchHkjc = new HkjcProvider();
+
+export const DISK_GUARD_INTERVAL_MS = 30 * 60_000;
+
+/**
+ * Watch free space on the database volume. The 2026-09-05 outage filled the
+ * disk to 100% with nothing alerting, and a full disk makes SQLite writes fail
+ * while the dashboard only shows the affected checkpoints as missing.
+ */
+function installDiskGuard(): void {
+  if (process.env.RADAR_DISK_GUARD === "0" || diskGuardTimer) return;
+  const run = async () => {
+    if (diskGuardInFlight) return;
+    const check = runDiskCheck({
+      usage: () => readDiskUsage(diskTarget(process.env.RADAR_DB ?? "data.db")),
+      readState: () => parseDiskAlertState(getState(DISK_ALERT_STATE_KEY)),
+      writeState: (state) => setState(DISK_ALERT_STATE_KEY, JSON.stringify(state)),
+      send: (text) => sendTelegramText(text),
+    });
+    diskGuardInFlight = check;
+    try {
+      const outcome = await check;
+      if (outcome.shouldAlert || outcome.level !== "ok") {
+        console.log(JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "disk_guard",
+          level: outcome.level,
+          freeBytes: outcome.freeBytes,
+          totalBytes: outcome.totalBytes,
+          freeRatio: Number(outcome.freeRatio.toFixed(4)),
+          alerted: outcome.shouldAlert,
+        }));
+      }
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "disk_guard_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      diskGuardInFlight = null;
+    }
+  };
+  diskGuardStartupTimer = setTimeout(() => void run(), 60_000);
+  diskGuardStartupTimer.unref();
+  diskGuardTimer = setInterval(() => void run(), DISK_GUARD_INTERVAL_MS);
+  diskGuardTimer.unref();
+}
 
 function installResearchResultCollection(): void {
   if (process.env.RADAR_RESEARCH_RESULTS === "0" || researchResultsTimer) return;
@@ -464,6 +525,7 @@ export function startBackgroundCollectors(): void {
   installResearchOpeningCollection();
   installQuoteDirectionWatchCollection();
   installResearchResultCollection();
+  installDiskGuard();
 }
 
 /** Run only the latency-sensitive T30/T15/T5 collector in its own worker. */
