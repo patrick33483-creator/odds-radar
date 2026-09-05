@@ -728,29 +728,42 @@ export function backfillOuSignalObservations(
   }
   const matchIds = [...new Set(pairs.map((pair) => pair.matchId))];
   const rowsForPair = rawDb.prepare(
-    `SELECT backfilled_at
+    `SELECT backfilled_at,notified_at
        FROM ou_signal_observations
       WHERE match_id=? AND rule_id=?`,
+  );
+  const adoptUnsent = rawDb.prepare(
+    `UPDATE ou_signal_observations
+        SET backfilled_at=?
+      WHERE match_id=? AND rule_id=?
+        AND backfilled_at IS NULL AND notified_at IS NULL`,
   );
   return rawDb.transaction(() => {
     for (const pair of pairs) {
       const existing = rowsForPair.all(pair.matchId, pair.ruleId) as Array<{
         backfilled_at: number | null;
+        notified_at: number | null;
       }>;
-      if (existing.some((row) => row.backfilled_at === null)) {
-        throw new Error(
-          `Refusing to relabel live observation as historical: ${pair.matchId}|${pair.ruleId}`,
-        );
+      if (existing.length > 1) {
+        throw new Error(`Multiple observations already exist: ${pair.matchId}|${pair.ruleId}`);
       }
+      // A normal sync may have materialized this exact historical row before
+      // the one-time batch acquired the write lock. Adopt it only if it was
+      // never sent; preserve notified rows as genuine live observations.
+      adoptUnsent.run(backfilledAt, pair.matchId, pair.ruleId);
     }
     const inserted = syncOuSignalObservations(matchIds, { backfilledAt, allowedPairs });
     for (const pair of pairs) {
       const stored = rowsForPair.all(pair.matchId, pair.ruleId) as Array<{
         backfilled_at: number | null;
+        notified_at: number | null;
       }>;
-      if (stored.length !== 1 || stored[0]?.backfilled_at === null) {
+      if (
+        stored.length !== 1
+        || (stored[0]?.backfilled_at === null && stored[0]?.notified_at === null)
+      ) {
         throw new Error(
-          `Historical backfill did not produce exactly one marked row: ${pair.matchId}|${pair.ruleId}`,
+          `Historical backfill did not produce exactly one safe row: ${pair.matchId}|${pair.ruleId}`,
         );
       }
     }
@@ -903,12 +916,16 @@ export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
   };
 }
 
-export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSignalObservation[] {
-  syncOuSignalObservations(matchIds);
+export function unsentOuSignals(matchIds?: string[], now = Date.now()): OuSignalObservation[] {
+  // Callers that explicitly pass an empty target list mean "nothing is due",
+  // not "replay every match from the 120-day fallback window".
+  if (matchIds?.length === 0) return [];
+  const targetIds = matchIds ?? [];
+  syncOuSignalObservations(targetIds);
   const activatedAt = Number(
     (rawDb.prepare("SELECT value FROM app_state WHERE key='ou_signal_monitor_activated_at'").get() as { value: string }).value,
   );
-  const filter = matchIds.length ? `AND o.match_id IN (${matchIds.map(() => "?").join(",")})` : "";
+  const filter = targetIds.length ? `AND o.match_id IN (${targetIds.map(() => "?").join(",")})` : "";
   const rows = rawDb.prepare(
     `SELECT o.*,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
@@ -926,18 +943,22 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
         AND o.backfilled_at IS NULL
         AND o.detected_at>=? ${filter}
       ORDER BY o.detected_at`,
-  ).all(activatedAt, ...matchIds) as StoredSignalRow[];
+  ).all(activatedAt, ...targetIds) as StoredSignalRow[];
   return rows
     .map((row) => toObservation(row, now))
     .filter((row) => !OU_HIDDEN_RULE_IDS.has(row.ruleId));
 }
 
-export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
-  syncOuSignalPrealerts(matchIds);
+export function unsentOuPrealerts(matchIds?: string[]): OuSignalPrealert[] {
+  // Preserve the no-argument maintenance scan while making an explicit empty
+  // engine target list a no-op.
+  if (matchIds?.length === 0) return [];
+  const targetIds = matchIds ?? [];
+  syncOuSignalPrealerts(targetIds);
   const activatedAt = Number(
     (rawDb.prepare("SELECT value FROM app_state WHERE key='ou_signal_prealert_activated_at'").get() as { value: string }).value,
   );
-  const filter = matchIds.length ? `AND p.match_id IN (${matchIds.map(() => "?").join(",")})` : "";
+  const filter = targetIds.length ? `AND p.match_id IN (${targetIds.map(() => "?").join(",")})` : "";
   const rows = rawDb.prepare(
     `SELECT p.*,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
@@ -950,7 +971,7 @@ export function unsentOuPrealerts(matchIds: string[] = []): OuSignalPrealert[] {
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
       WHERE m.fixture_source IN ('hkjc','pinnacle') AND p.notified_at IS NULL AND p.detected_at>=? ${filter}
       ORDER BY p.detected_at`,
-  ).all(activatedAt, ...matchIds) as StoredPrealertRow[];
+  ).all(activatedAt, ...targetIds) as StoredPrealertRow[];
   return rows
     .map(toPrealert)
     // A legacy row stays null when it cannot be revalidated from its immutable

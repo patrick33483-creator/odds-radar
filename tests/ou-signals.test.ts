@@ -304,6 +304,23 @@ describe("OU signal monitor", () => {
     expect(unsentOuSignals()).toHaveLength(4);
   });
 
+  it("treats an explicit empty target list as a no-op instead of replaying history", () => {
+    const observationCount = rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_observations",
+    ).get();
+    const prealertCount = rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_prealerts",
+    ).get();
+    expect(unsentOuSignals([])).toEqual([]);
+    expect(unsentOuPrealerts([])).toEqual([]);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_observations",
+    ).get()).toEqual(observationCount);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_prealerts",
+    ).get()).toEqual(prealertCount);
+  });
+
   it("counts an allowlisted historical T-5 backfill without placing it in the Telegram queue", () => {
     const now = afterWatchActivation + 50_000;
     const matchId = "approved-t5-backfill";
@@ -362,10 +379,29 @@ describe("OU signal monitor", () => {
     expect(() => backfillOuSignalObservations([
       { matchId, ruleId: "pinnacle-ouu-t5-selected-180-190-over-watch" },
       { matchId, ruleId: "hkjc-ooo-t5-selected-le-180-under-watch" },
-    ], now + 1_000)).toThrow(/did not produce exactly one marked row/);
+    ], now + 1_000)).toThrow(/did not produce exactly one safe row/);
     expect(rawDb.prepare(
       "SELECT COUNT(*) count FROM ou_signal_observations WHERE match_id=?",
     ).get(matchId)).toEqual({ count: 0 });
+  });
+
+  it("atomically adopts an already materialized unsent row as historical", () => {
+    const now = afterWatchActivation + 58_000;
+    const matchId = "adopt-unsent-t5-backfill";
+    const ruleId = "pinnacle-ouu-t5-selected-180-190-over-watch";
+    addPath(matchId, "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.85],
+    }, now);
+    expect(syncOuSignalObservations([matchId])).toBe(2);
+
+    const backfilledAt = now + 1_000;
+    expect(backfillOuSignalObservations([{ matchId, ruleId }], backfilledAt)).toBe(0);
+    expect(rawDb.prepare(
+      "SELECT backfilled_at,notified_at FROM ou_signal_observations WHERE match_id=? AND rule_id=?",
+    ).get(matchId, ruleId)).toEqual({ backfilled_at: backfilledAt, notified_at: null });
+    expect(unsentOuSignals([matchId])).toEqual([]);
   });
 
   it("tracks all four reverse Watch rules with inclusive line and T-5 odds boundaries", () => {
