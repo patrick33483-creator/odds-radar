@@ -1,0 +1,71 @@
+name: 角球賽果覆蓋率稽核與回補
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "audit（只讀）或 backfill（回補，需要確認碼）"
+        required: true
+        default: audit
+        type: choice
+        options:
+          - audit
+          - backfill
+      confirmation:
+        description: "回補確認碼（backfill 時必填）"
+        required: false
+        default: ""
+      days:
+        description: "回補回溯日數"
+        required: false
+        default: "90"
+
+jobs:
+  corners:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 稽核角球賽果覆蓋率（只讀）
+        if: ${{ inputs.mode == 'audit' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          sudo docker compose exec -T radar node dist/audit-corner-results-20260906.cjs
+          REMOTE
+
+      - name: 回補角球賽果
+        if: ${{ inputs.mode == 'backfill' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DAYS: ${{ inputs.days }}
+        run: |
+          if [ "$CONFIRMATION" != "BACKFILL_CONFIRMED_CORNERS_20260906" ]; then
+            echo "缺少或錯誤的確認碼" >&2
+            exit 1
+          fi
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "CONFIRMATION='$CONFIRMATION' DAYS='$DAYS' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          sudo docker compose exec -T \
+            -e CORNER_BACKFILL_CONFIRMATION="$CONFIRMATION" \
+            -e CORNER_BACKFILL_DAYS="$DAYS" \
+            radar node dist/backfill-corner-results-20260906.cjs
+          REMOTE

@@ -50,6 +50,8 @@ async function buildAll() {
       "backfill-ou-t5-20260905": "scripts/backfill-ou-t5-20260905.ts",
       "recompute-ou-observations-20260906": "scripts/recompute-ou-observations-20260906.ts",
       "export-signal-features-20260906": "scripts/export-signal-features-20260906.ts",
+      "audit-corner-results-20260906": "scripts/audit-corner-results-20260906.ts",
+      "backfill-corner-results-20260906": "scripts/backfill-corner-results-20260906.ts",
     },
     platform: "node",
     bundle: true,
