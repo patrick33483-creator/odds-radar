@@ -447,6 +447,7 @@ function selectStageMain(
   lines: StageLineRows | undefined,
   provider: Provider,
   stage: Stage,
+  flaggedMainHint: string | null = null,
 ): SelectedStageMain | null {
   if (!lines) return null;
   const complete = [...lines.entries()].filter(([, rows]) => rows.has("O") && rows.has("U"));
@@ -466,6 +467,18 @@ function selectStageMain(
   if (complete.length === 1) return { lineKey: complete[0][0], rows: complete[0][1] };
   if (provider !== "hkjc" || stage !== "initial" || complete.length < 2) return null;
 
+  // Later checkpoints carry HKJC's own main flag. When the opening snapshot
+  // omits every flag, that single flagged line is auditable evidence of which
+  // pair was the opening main - strictly better than inferring from price
+  // balance, which picks whichever line happens to look balanced. A 2.50
+  // opening carried as the flagged main at T-30/T-15 was previously discarded
+  // because the unflagged 2.75 pair looked more balanced than the threshold
+  // allowed, so the whole fixture never reached rule evaluation.
+  if (flaggedMainHint) {
+    const hinted = lines.get(flaggedMainHint);
+    if (hinted?.has("O") && hinted.has("U")) return { lineKey: flaggedMainHint, rows: hinted };
+  }
+
   const ranked = complete
     .map(([lineKey, rows]) => ({
       lineKey,
@@ -476,6 +489,23 @@ function selectStageMain(
   const [best, runnerUp] = ranked;
   if (best.balanceGap > 0.1 || runnerUp.balanceGap - best.balanceGap < 0.1) return null;
   return { lineKey: best.lineKey, rows: best.rows };
+}
+
+/**
+ * The line key that the source itself flagged as main at every other stage
+ * where a flag exists. Returns null when stages disagree or none is flagged,
+ * so an ambiguous opening still fails closed.
+ */
+function flaggedMainLineKey(stages: StageRows, excludeStage: Stage): string | null {
+  const keys = new Set<string>();
+  for (const [stage, lines] of stages) {
+    if (stage === excludeStage) continue;
+    for (const [lineKey, rows] of lines) {
+      if (!rows.has("O") || !rows.has("U")) continue;
+      if ([...rows.values()].every((row) => row.is_main === 1)) keys.add(lineKey);
+    }
+  }
+  return keys.size === 1 ? [...keys][0] : null;
 }
 
 function evaluatorVersion(lineKeys: string[]): "same-line-v1" | "stage-main-v2" {
@@ -536,7 +566,8 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
       const [, provider] = groupKey.split("|") as [string, Provider];
-      const initial = selectStageMain(stages.get("initial"), provider, "initial");
+      const initialMainHint = flaggedMainLineKey(stages, "initial");
+      const initial = selectStageMain(stages.get("initial"), provider, "initial", initialMainHint);
       const t30 = selectStageMain(stages.get("T30"), provider, "T30");
       if (!initial || !t30) continue;
       const stageMains = [initial, t30];
@@ -641,7 +672,8 @@ export function syncOuSignalObservations(
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
       const [, provider] = groupKey.split("|") as [string, Provider];
-      const initial = selectStageMain(stages.get("initial"), provider, "initial");
+      const initialMainHint = flaggedMainLineKey(stages, "initial");
+      const initial = selectStageMain(stages.get("initial"), provider, "initial", initialMainHint);
       const t30 = selectStageMain(stages.get("T30"), provider, "T30");
       const t5 = selectStageMain(stages.get("T5"), provider, "T5");
       if (!initial || !t30 || !t5) continue;

@@ -48,6 +48,7 @@ async function buildAll() {
     entryPoints: {
       index: "server/index.ts",
       "backfill-ou-t5-20260905": "scripts/backfill-ou-t5-20260905.ts",
+      "recompute-ou-observations-20260906": "scripts/recompute-ou-observations-20260906.ts",
     },
     platform: "node",
     bundle: true,

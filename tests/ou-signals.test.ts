@@ -678,7 +678,7 @@ describe("OU signal monitor", () => {
     });
   });
 
-  it("fails closed when an unflagged HKJC initial main is not clearly unique", () => {
+  it("resolves an ambiguous unflagged HKJC initial main from the flagged later-stage main", () => {
     const now = afterWatchActivation + 225_000;
     const matchId = "hkjc-ambiguous-balanced-initial";
     addMatch(matchId, now + 30 * 60_000);
@@ -686,6 +686,70 @@ describe("OU signal monitor", () => {
     addStage(matchId, "hkjc", "initial", "2.75", 1.84, 1.88, now - 25 * 60_000, false);
     addStage(matchId, "hkjc", "T30", "2.5", 1.79, 1.91, now - 20 * 60_000);
     addStage(matchId, "hkjc", "T5", "2.5", 1.76, 1.94, now - 60_000);
+
+    // Price balance cannot separate the two openings, but HKJC flagged 2.5 as
+    // its main at both later checkpoints, so the opening main is 2.5.
+    expect(syncOuSignalObservations([matchId])).toBeGreaterThan(0);
+    expect(rawDb.prepare(
+      "SELECT DISTINCT initial_line_key FROM ou_signal_observations WHERE match_id=?",
+    ).all(matchId)).toEqual([{ initial_line_key: "2.5" }]);
+  });
+
+  it("reproduces the 2.50/2.75 unflagged opening that previously produced no signal", () => {
+    // 費薩里 FC vs 艾哈森, 5 Sep 2026: HKJC opened 2.50 (1.72/2.00) and 2.75
+    // (1.91/1.79) with no main flag, then flagged 2.50 as main at T-30/T-15.
+    // Balance inference picked 2.75 (gap 0.12) and then rejected it for
+    // exceeding the 0.10 threshold, so the fixture never reached rule
+    // evaluation and no O→O→O candidate or signal was ever produced.
+    const now = afterWatchActivation + 255_000;
+    const matchId = "hkjc-faisaly-style-opening";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "hkjc", "initial", "2.5", 1.72, 2.00, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "initial", "2.75", 1.91, 1.79, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "T30", "2.5", 1.75, 1.95, now - 20 * 60_000);
+    addStage(matchId, "hkjc", "T5", "2.5", 1.75, 1.95, now - 60_000);
+
+    expect(syncOuSignalPrealerts([matchId])).toBeGreaterThan(0);
+    expect(syncOuSignalObservations([matchId])).toBeGreaterThan(0);
+    const rows = rawDb.prepare(
+      `SELECT rule_id,initial_line_key,direction_path,drift_bucket,initial_signal_odds,t5_signal_odds
+         FROM ou_signal_observations WHERE match_id=? ORDER BY rule_id`,
+    ).all(matchId) as Array<Record<string, unknown>>;
+    expect(rows.map((row) => row.rule_id)).toContain("hkjc-ooo-flat-wide-reverse");
+    for (const row of rows) {
+      expect(row.initial_line_key).toBe("2.5");
+      expect(row.direction_path).toBe("O→O→O");
+      // 1.72 -> 1.75 is a widening opening price on the selected side.
+      expect(row.drift_bucket).toBe("持平或拉闊");
+      expect(row.initial_signal_odds).toBe(1.72);
+      expect(row.t5_signal_odds).toBe(1.75);
+    }
+  });
+
+  it("still fails closed when the later checkpoints flag different main lines", () => {
+    const now = afterWatchActivation + 270_000;
+    const matchId = "hkjc-conflicting-flagged-mains";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "hkjc", "initial", "2.5", 1.83, 1.87, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "initial", "2.75", 1.84, 1.88, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "T30", "2.5", 1.79, 1.91, now - 20 * 60_000);
+    addStage(matchId, "hkjc", "T5", "2.75", 1.76, 1.94, now - 60_000);
+
+    // At T-30 the only evidence is the T-30 flag, so a candidate is still
+    // locked; the final evaluation sees two conflicting flagged mains and
+    // refuses to pick an opening main, so no observation is recorded.
+    expect(syncOuSignalPrealerts([matchId])).toBeGreaterThan(0);
+    expect(syncOuSignalObservations([matchId])).toBe(0);
+  });
+
+  it("does not use a flagged later main for a Pinnacle opening", () => {
+    const now = afterWatchActivation + 285_000;
+    const matchId = "pinnacle-ambiguous-opening";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "pinnacle", "initial", "2.5", 1.83, 1.87, now - 25 * 60_000, false);
+    addStage(matchId, "pinnacle", "initial", "2.75", 1.84, 1.88, now - 25 * 60_000, false);
+    addStage(matchId, "pinnacle", "T30", "2.5", 1.79, 1.91, now - 20 * 60_000);
+    addStage(matchId, "pinnacle", "T5", "2.5", 1.76, 1.94, now - 60_000);
 
     expect(syncOuSignalPrealerts([matchId])).toBe(0);
     expect(syncOuSignalObservations([matchId])).toBe(0);
