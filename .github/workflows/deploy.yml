@@ -6,6 +6,7 @@ on:
     paths-ignore:
       - ".github/workflows/**"
       - "reports/**"
+      - "scripts/audit-ou-missed.ts"
       - "**/*.md"
   workflow_dispatch:
 

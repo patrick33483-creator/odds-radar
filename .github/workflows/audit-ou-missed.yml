@@ -1,0 +1,68 @@
+name: 回溯入球大細訊號漏報（只讀副本）
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "回溯自訊號啟動起最多幾多日的比賽（預設 30 日，會自動裁到啟動日）"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-ou-missed-radar
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: 安裝依賴
+        run: npm ci
+
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 從生產抽取只讀 SQLite 副本
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          umask 077
+          mkdir -p audit-ou-workdir
+          REMOTE_TMP="/tmp/audit-ou-$(date -u +%Y%m%dT%H%M%SZ).db"
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo sqlite3 'file:/opt/odds-radar/data/data.db?mode=ro' \".backup '$REMOTE_TMP'\" && sudo chown \"$DEPLOY_USER\":\"$DEPLOY_USER\" '$REMOTE_TMP' && ls -l '$REMOTE_TMP'"
+          scp -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_TMP" audit-ou-workdir/data.db
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" "rm -f '$REMOTE_TMP'"
+
+      - name: 用最新引擎重放 syncOuSignal*（只寫副本）
+        env:
+          RADAR_DB: ${{ github.workspace }}/audit-ou-workdir/data.db
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days }}
+        run: |
+          # 副本檔案路徑必須包含 "audit-ou-" 才會被 script 接受
+          test -f "$RADAR_DB"
+          npx tsx scripts/audit-ou-missed.ts
+
+      - name: 清理副本
+        if: always()
+        run: rm -rf audit-ou-workdir
