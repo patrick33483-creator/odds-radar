@@ -7,6 +7,7 @@ process.env.RADAR_DB = dbPath;
 let RadarEngine: typeof import("../server/lib/engine").RadarEngine;
 let rawDb: typeof import("../server/lib/store").rawDb;
 let researchMilestoneCapacity: typeof import("../server/lib/engine").researchMilestoneCapacity;
+let allocateMilestoneTargets: typeof import("../server/lib/engine").allocateMilestoneTargets;
 let researchMilestoneConcurrency: typeof import("../server/lib/engine").researchMilestoneConcurrency;
 let MIN_RESEARCH_MILESTONE_TARGETS: number;
 let MAX_RESEARCH_MILESTONE_TARGETS: number;
@@ -20,6 +21,7 @@ beforeAll(async () => {
     RadarEngine,
     researchMilestoneCapacity,
     researchMilestoneConcurrency,
+    allocateMilestoneTargets,
     MIN_RESEARCH_MILESTONE_TARGETS,
     MAX_RESEARCH_MILESTONE_TARGETS,
     RESEARCH_MILESTONE_CONCURRENCY,
@@ -423,5 +425,62 @@ describe("milestone capacity helpers", () => {
     expect(researchMilestoneConcurrency(100, {})).toBe(RESEARCH_MILESTONE_CONCURRENCY);
     expect(researchMilestoneConcurrency(100, { RADAR_MILESTONE_CONCURRENCY: "24" })).toBe(24);
     expect(researchMilestoneConcurrency(100, { RADAR_MILESTONE_CONCURRENCY: "999" })).toBe(64);
+  });
+});
+
+describe("per-stage fair allocation", () => {
+  const make = (stage: "T30" | "T15" | "T5", n: number) =>
+    Array.from({ length: n }, (_, i) => ({ stage, id: `${stage}-${i}` }));
+
+  it("returns everything when the budget is not binding", () => {
+    const targets = [...make("T5", 3), ...make("T30", 2)];
+    expect(allocateMilestoneTargets(targets, 10)).toHaveLength(5);
+  });
+
+  it("keeps guaranteed floors for T30 and T15 when T5 would take the tick", () => {
+    const targets = [...make("T5", 200), ...make("T15", 50), ...make("T30", 50)];
+    const picked = allocateMilestoneTargets(targets, 100);
+    expect(picked).toHaveLength(100);
+    const count = (stage: string) => picked.filter((t) => t.stage === stage).length;
+    // 40% floor for T30 and 25% for T15; T5 still claims every free slot.
+    expect(count("T30")).toBe(40);
+    expect(count("T15")).toBe(25);
+    expect(count("T5")).toBe(35);
+    // Execution order stays T5 -> T15 -> T30.
+    expect(picked[0].stage).toBe("T5");
+    expect(picked[picked.length - 1].stage).toBe("T30");
+  });
+
+  it("gives unused reserved slots back to T5", () => {
+    const targets = [...make("T5", 100), ...make("T30", 3)];
+    const picked = allocateMilestoneTargets(targets, 20);
+    expect(picked.filter((t) => t.stage === "T30")).toHaveLength(3);
+    expect(picked.filter((t) => t.stage === "T5")).toHaveLength(17);
+  });
+
+  it("handles an empty budget", () => {
+    expect(allocateMilestoneTargets(make("T5", 5), 0)).toEqual([]);
+  });
+});
+
+describe("unmapped fixtures are reported, not counted as failures", () => {
+  it("skips a fixture with no Pinnacle or Titan id and reports it separately", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const matchId = "hkjc:no-mapping";
+    rawDb.prepare(
+      `INSERT INTO matches(id,fixture_source,hkjc_id,titan_id,pinnacle_match_id,league,home_team,away_team,kickoff_utc,inplay,status,updated_at)
+       VALUES(?,'hkjc',?,NULL,NULL,'Iceland - 1. Deild','Vestri','Throttur',?,0,'PREMATCH',?)`,
+    ).run(matchId, "no-mapping", NOW + 4 * 60_000, NOW);
+    const engine = new RadarEngine();
+    const fetchTitan = vi.fn();
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = fetchTitan;
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selected: 0,
+      attempted: 0,
+      failed: 0,
+      unmapped: 1,
+    });
+    expect(fetchTitan).not.toHaveBeenCalled();
   });
 });

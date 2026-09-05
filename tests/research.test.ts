@@ -633,4 +633,38 @@ describe("research data collection", () => {
     expect(missed?.timeline.initial.cells.pinnacle.COU).toBe("source_unavailable");
     expect(dataset.summary.collectionStartedAt).toBe(collectionStartedAt);
   });
+
+  it("separates an unmapped fixture and the unsupported Pinnacle corner market from real misses", () => {
+    const collectionStartedAt = Number((rawDb.prepare(
+      "SELECT MIN(COALESCE(first_captured_at,created_at)) value FROM research_timeline_points",
+    ).get() as { value: number }).value);
+    const kickoff = collectionStartedAt + 120 * 60_000;
+    const now = kickoff + 60_000;
+
+    // No pinnacle_source_map row and no titan id: the milestone collector
+    // never requests this fixture, so its Pinnacle cells are a matching gap.
+    addMatch("unmapped-fixture", kickoff);
+    // Same window, but mapped to a Pinnacle event: a real miss stays a miss.
+    addMatch("mapped-fixture", kickoff);
+    rawDb.prepare(
+      `INSERT INTO pinnacle_source_map(match_id,titan_id,pinnapi_id,active_source,updated_at)
+       VALUES(?,?,?,?,?)`,
+    ).run("mapped-fixture", "titan-mapped", null, "titan007", Date.now());
+
+    const dataset = researchDataset({ days: 7, provider: "all", market: "all" }, now);
+    const unmapped = dataset.matches.find((match) => match.matchId === "unmapped-fixture");
+    const mapped = dataset.matches.find((match) => match.matchId === "mapped-fixture");
+
+    for (const stage of ["T30", "T15", "T5"] as const) {
+      expect(unmapped?.timeline[stage].cells.pinnacle.AH).toBe("fixture_unmapped");
+      expect(unmapped?.timeline[stage].cells.pinnacle.OU).toBe("fixture_unmapped");
+      // Corners are never offered at a checkpoint; not a collection defect.
+      expect(unmapped?.timeline[stage].cells.pinnacle.COU).toBe("source_unavailable");
+      expect(mapped?.timeline[stage].cells.pinnacle.COU).toBe("source_unavailable");
+      // A mapped fixture that was genuinely never collected still reports it.
+      expect(mapped?.timeline[stage].cells.pinnacle.AH).toBe("checkpoint_missed");
+    }
+    // HKJC classification is untouched by the Pinnacle mapping state.
+    expect(unmapped?.timeline.T30.cells.hkjc.AH).toBe("checkpoint_missed");
+  });
 });

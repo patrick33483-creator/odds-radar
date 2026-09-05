@@ -51,6 +51,10 @@ const CELL_STATUS_META: Record<ResearchCellStatus, { label: string; detail: stri
   pending: { label: "待時間點", detail: "尚未到指定收集時間" },
   source_unavailable: { label: "來源不提供", detail: "外部來源本身沒有提供此市場" },
   match_unmatched: { label: "初盤配對不到", detail: "未能在外部初盤來源配對此賽事" },
+  fixture_unmapped: {
+    label: "賽事未配對來源",
+    detail: "此賽事沒有對應的 Pinnacle／Titan 賽事編號，臨場收集器無從查詢，並非收集失敗",
+  },
   market_unavailable: { label: "當時未開盤", detail: "收集已執行，但莊家未開盤或來源沒有返回" },
   historical_unavailable: { label: "上線前資料", detail: "研究收集功能上線前，無法回補此時間點" },
   checkpoint_missed: { label: "疑似漏收", detail: "時間點已過，但沒有建立任何收集紀錄" },
@@ -60,6 +64,7 @@ type DataStateFilter = "all" | "review" | "unavailable" | "pending" | "captured"
 const UNAVAILABLE_STATUSES = new Set<ResearchCellStatus>([
   "source_unavailable",
   "match_unmatched",
+  "fixture_unmapped",
   "market_unavailable",
   "historical_unavailable",
 ]);
