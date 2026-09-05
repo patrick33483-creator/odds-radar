@@ -13,6 +13,8 @@ let allocateMilestoneTargetsBySource:
 let orderMilestoneTargetsForDispatch:
   typeof import("../server/lib/engine").orderMilestoneTargetsForDispatch;
 let researchMilestoneConcurrency: typeof import("../server/lib/engine").researchMilestoneConcurrency;
+let isOuNotificationSenderProcess:
+  typeof import("../server/lib/engine").isOuNotificationSenderProcess;
 let MIN_RESEARCH_MILESTONE_TARGETS: number;
 let MAX_RESEARCH_MILESTONE_TARGETS: number;
 let RESEARCH_MILESTONE_CONCURRENCY: number;
@@ -25,6 +27,7 @@ beforeAll(async () => {
     RadarEngine,
     researchMilestoneCapacity,
     researchMilestoneConcurrency,
+    isOuNotificationSenderProcess,
     allocateMilestoneTargets,
     allocateMilestoneTargetsBySource,
     orderMilestoneTargetsForDispatch,
@@ -36,9 +39,36 @@ beforeAll(async () => {
   store.migrate();
 });
 
+describe("OU notification sender ownership", () => {
+  it("assigns production delivery exclusively to the milestone worker", () => {
+    expect(isOuNotificationSenderProcess("production", true, undefined)).toBe(false);
+    expect(isOuNotificationSenderProcess("production", false, "collector")).toBe(false);
+    expect(isOuNotificationSenderProcess("production", false, "milestone")).toBe(true);
+    expect(isOuNotificationSenderProcess("test", true, undefined)).toBe(true);
+  });
+
+  it("lets collectors request a pass but only the designated sender complete it", async () => {
+    const collector = new RadarEngine({ ouNotificationSender: false });
+    await (collector as any).syncAndDrainOuNotifications([], "collector-test");
+    expect(rawDb.prepare(
+      `SELECT requested_version,completed_version
+         FROM ou_notification_drain_state WHERE singleton=1`,
+    ).get()).toEqual({ requested_version: 1, completed_version: 0 });
+
+    const milestone = new RadarEngine({ ouNotificationSender: true });
+    await (milestone as any).syncAndDrainOuNotifications([], "milestone-test");
+    expect(rawDb.prepare(
+      `SELECT requested_version,completed_version
+         FROM ou_notification_drain_state WHERE singleton=1`,
+    ).get()).toEqual({ requested_version: 2, completed_version: 2 });
+  });
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const table of [
+    "ou_signal_prealerts",
+    "ou_signal_observations",
     "research_timeline_snapshots",
     "research_timeline_points",
     "odds_latest",
@@ -50,6 +80,10 @@ afterEach(() => {
   ]) {
     rawDb.prepare(`DELETE FROM ${table}`).run();
   }
+  rawDb.prepare(
+    `UPDATE ou_notification_drain_state
+        SET requested_version=0,completed_version=0`,
+  ).run();
 });
 
 afterAll(() => {
@@ -312,6 +346,10 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     });
     addPinnacleFixture("pinnacle:crown-t5", NOW + 4 * 60_000, "crown-t5");
     const engine = new RadarEngine();
+    const notificationDrain = vi.spyOn(
+      engine as any,
+      "syncAndDrainOuNotifications",
+    ).mockResolvedValue(undefined);
     const requested: string[] = [];
     (engine as any).pinnapi.fetchMatchPrices = vi.fn(async (id: string) => {
       requested.push(`hkjc:${id}`);
@@ -334,6 +372,10 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
       fetched: 2,
     });
     expect(requested).toEqual(["hkjc:priority-t30", "crown:crown-t5"]);
+    expect(notificationDrain).toHaveBeenCalledWith(
+      expect.arrayContaining(["hkjc:priority-t30", "pinnacle:crown-t5"]),
+      "research_milestone",
+    );
   });
 
   it("aborts an in-flight lower-tier Titan request when the core milestone starts", async () => {
