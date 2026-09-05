@@ -25,6 +25,15 @@ const { syncOuSignalPrealerts, syncOuSignalObservations, OU_HIDDEN_RULE_IDS } = 
 const { rawDb, migrate } = await import("../server/lib/store.ts");
 migrate();
 
+const beforePrealerts = new Set(
+  (rawDb.prepare("SELECT unique_key FROM ou_signal_prealerts").all() as Array<{ unique_key: string }>)
+    .map((row) => row.unique_key),
+);
+const beforeObservations = new Set(
+  (rawDb.prepare("SELECT unique_key FROM ou_signal_observations").all() as Array<{ unique_key: string }>)
+    .map((row) => row.unique_key),
+);
+
 const recomputed = {
   prealerts: syncOuSignalPrealerts(),
   observations: syncOuSignalObservations(),
@@ -39,8 +48,9 @@ console.log(JSON.stringify({ window: { since_ms: since, now_ms: nowMs, lookback_
 
 const unsentT30 = rawDb
   .prepare(
-    `SELECT p.match_id, p.rule_id, p.direction_path, p.drift_bucket,
-            p.line_key, p.signal_selection, p.initial_signal_odds,
+    `SELECT p.unique_key, p.match_id, p.rule_id, p.direction_path,
+            p.line_key, p.initial_line_key, p.t30_line_key, p.line_path,
+            p.signal_selection, p.initial_signal_odds,
             p.signal_t30_odds, p.detected_at, p.notified_at,
             m.league, m.home_team, m.away_team, m.kickoff_utc, m.status
        FROM ou_signal_prealerts p
@@ -48,9 +58,15 @@ const unsentT30 = rawDb
       WHERE m.fixture_source IN ('hkjc','pinnacle')
         AND p.notified_at IS NULL
         AND p.detected_at >= ?
+        AND m.kickoff_utc <= ?
       ORDER BY m.kickoff_utc ASC`,
   )
-  .all(since) as Array<{ rule_id: string; kickoff_utc: number; [k: string]: unknown }>;
+  .all(since, nowMs) as Array<{
+    unique_key: string;
+    rule_id: string;
+    kickoff_utc: number;
+    [k: string]: unknown;
+  }>;
 
 const unsentT5 = rawDb
   .prepare(
@@ -63,18 +79,32 @@ const unsentT5 = rawDb
       WHERE m.fixture_source IN ('hkjc','pinnacle')
         AND o.notified_at IS NULL
         AND o.detected_at >= ?
+        AND m.kickoff_utc <= ?
       ORDER BY m.kickoff_utc ASC`,
   )
-  .all(since) as Array<{ rule_id: string; kickoff_utc: number; [k: string]: unknown }>;
+  .all(since, nowMs) as Array<{
+    unique_key: string;
+    rule_id: string;
+    kickoff_utc: number;
+    [k: string]: unknown;
+  }>;
 
 const visibleT30 = unsentT30.filter((r) => !OU_HIDDEN_RULE_IDS.has(r.rule_id));
 const visibleT5 = unsentT5.filter((r) => !OU_HIDDEN_RULE_IDS.has(r.rule_id));
+const missedNewT30 = visibleT30.filter((r) => !beforePrealerts.has(r.unique_key));
+const missedExistingT30 = visibleT30.filter((r) => beforePrealerts.has(r.unique_key));
+const missedNewT5 = visibleT5.filter((r) => !beforeObservations.has(r.unique_key));
+const missedExistingT5 = visibleT5.filter((r) => beforeObservations.has(r.unique_key));
 
-console.log("\n=== unsent T-30 candidates (visible Watch rules, activated) ===");
-for (const row of visibleT30) console.log(JSON.stringify(row));
+function emit(title: string, rows: Array<Record<string, unknown>>): void {
+  console.log(`\n=== ${title} ===`);
+  for (const row of rows) console.log(JSON.stringify(row));
+}
 
-console.log("\n=== unsent T-5 signals (visible Watch rules, activated) ===");
-for (const row of visibleT5) console.log(JSON.stringify(row));
+emit("T-30 engine-record misses (new on replay)", missedNewT30);
+emit("T-30 delivery misses (existed but notified_at null)", missedExistingT30);
+emit("T-5 engine-record misses (new on replay)", missedNewT5);
+emit("T-5 delivery misses (existed but notified_at null)", missedExistingT5);
 
 console.log(
   "\n=== summary ===\n" +
@@ -86,6 +116,8 @@ console.log(
           .prepare("SELECT COUNT(*) c FROM ou_signal_prealerts WHERE detected_at >= ? AND notified_at IS NULL")
           .get(since),
         prealerts_unsent_visible: visibleT30.length,
+        prealerts_new_on_replay: missedNewT30.length,
+        prealerts_existing_unsent: missedExistingT30.length,
         observations_total: rawDb
           .prepare("SELECT COUNT(*) c FROM ou_signal_observations WHERE detected_at >= ?")
           .get(since),
@@ -93,6 +125,8 @@ console.log(
           .prepare("SELECT COUNT(*) c FROM ou_signal_observations WHERE detected_at >= ? AND notified_at IS NULL")
           .get(since),
         observations_unsent_visible: visibleT5.length,
+        observations_new_on_replay: missedNewT5.length,
+        observations_existing_unsent: missedExistingT5.length,
       },
       null,
       2,
