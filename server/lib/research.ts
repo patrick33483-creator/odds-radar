@@ -1082,6 +1082,7 @@ function researchCellStatus(
   collectionStartedAt: number | null,
   fixtureSource: "hkjc" | "pinnacle" | "crown",
   titanId: string | null,
+  pinnacleMapped = true,
 ): ResearchStageSnapshot["cells"][ResearchProvider][ResearchMarket] {
   const pairQuotes = stageQuotes.filter((quote) => quote.provider === provider && quote.market === market);
   if (pairQuotes.length >= 2) return "captured";
@@ -1094,12 +1095,19 @@ function researchCellStatus(
   // initial checkpoint has no external Tipsme opening.
   if (fixtureSource === "pinnacle" && provider !== "pinnacle") return "source_unavailable";
   if (provider === "crown" && (market === "COU" || titanId === null)) return "source_unavailable";
-  if (stage === "initial" && provider === "pinnacle" && market === "COU") return "source_unavailable";
+  // The milestone collector only requests AH and OU; no verified Pinnacle
+  // corner market exists for any checkpoint. Reporting the empty corner cell
+  // as a miss inflated the review count by a third without a defect behind it.
+  if (provider === "pinnacle" && market === "COU") return "source_unavailable";
   if (snapshotStatus === "pending") return "pending";
   if (stage === "initial") return firstCapturedAt ? "market_unavailable" : "match_unmatched";
   if (targetAt !== null && collectionStartedAt !== null && targetAt < collectionStartedAt) {
     return "historical_unavailable";
   }
+  // A fixture with no Pinnacle/Titan event id is never queried by the
+  // milestone collector (engine.ts drops it during target selection), so the
+  // empty cell is a fixture-matching coverage gap, not a collection miss.
+  if (provider === "pinnacle" && !pinnacleMapped) return "fixture_unmapped";
   return firstCapturedAt ? "market_unavailable" : "checkpoint_missed";
 }
 
@@ -1187,6 +1195,8 @@ export function researchDataset(
   const matchRows = rawDb
     .prepare(
       `SELECT m.id match_id,m.hkjc_id,m.fixture_source,m.titan_id,
+              COALESCE(psm.titan_id,m.titan_id) mapped_titan_id,psm.pinnapi_id mapped_pinnapi_id,
+              m.pinnacle_match_id,
               CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
               CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
               CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
@@ -1199,6 +1209,7 @@ export function researchDataset(
               COALESCE(rr.source,r.source) result_source,
               COALESCE(rr.fetched_at,r.fetched_at) result_fetched_at
          FROM matches m
+         LEFT JOIN pinnacle_source_map psm ON psm.match_id=m.id
          LEFT JOIN pinnacle_translations pt
            ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
          LEFT JOIN research_timeline_snapshots q ON q.match_id=m.id
@@ -1291,6 +1302,14 @@ export function researchDataset(
       const fixtureSource = String(row.fixture_source) as "hkjc" | "pinnacle" | "crown";
       const hkjcId = row.hkjc_id === null || row.hkjc_id === undefined ? null : String(row.hkjc_id);
       const titanId = row.titan_id === null || row.titan_id === undefined ? null : String(row.titan_id);
+      // Mirrors the milestone collector's target-selection rule in engine.ts:
+      // without one of these ids the fixture is never requested at all.
+      const pinnacleMapped = Boolean(
+        row.mapped_titan_id
+        || row.mapped_pinnapi_id
+        || row.pinnacle_match_id
+        || titanId,
+      );
       return {
         matchId,
         fixtureKey: titanId
@@ -1343,6 +1362,7 @@ export function researchDataset(
                       collectionStartedAt,
                       fixtureSource,
                       titanId,
+                      pinnacleMapped,
                     ),
                   ]),
                 ),
