@@ -13,7 +13,13 @@ import { fetchText } from "../lib/http";
 import { HKJC_MATCH_LIST_QUERY } from "./hkjc-query";
 import { HKJC_HISTORIC_FOOTBALL_MATCHES_QUERY } from "./hkjc-result-query";
 import { lineKeyOf, parseHkjcHandicap, parseHkjcTotal } from "../lib/lines";
-import type { OddsProvider, ProviderEvent, ProviderFetchResult, ProviderPrice } from "./types";
+import type {
+  LiveCornerObservation,
+  OddsProvider,
+  ProviderEvent,
+  ProviderFetchResult,
+  ProviderPrice,
+} from "./types";
 import type { Selection } from "@shared/types";
 
 const ENDPOINT = "https://info.cld.hkjc.com/graphql/base/";
@@ -51,6 +57,13 @@ interface GqlMatch {
   awayTeam: { name_ch: string; name_en: string };
   tournament: { name_ch: string; name_en: string };
   foPools: GqlPool[] | null;
+  runningResult?: {
+    homeScore?: unknown;
+    awayScore?: unknown;
+    corner?: unknown;
+    homeCorner?: unknown;
+    awayCorner?: unknown;
+  } | null;
 }
 
 interface HistoricResultRow {
@@ -325,8 +338,23 @@ export class HkjcProvider implements OddsProvider {
     const warnings: string[] = [];
     const cutoff = opts.windowMinutes ? Date.now() + opts.windowMinutes * 60_000 : null;
     const events: ProviderEvent[] = [];
+    const liveCorners: LiveCornerObservation[] = [];
     let inplaySkipped = 0;
     for (const m of raw) {
+      // Corner counts must be harvested before the in-play skip below: an
+      // ended fixture disappears from this feed, and the historic result query
+      // never publishes the confirmed corner figure, so a corner count not
+      // taken while the fixture is live is lost for good.
+      const corner = asInt(m.runningResult?.corner);
+      if (corner !== null && corner >= 0) {
+        liveCorners.push({
+          providerMatchId: String(m.id),
+          status: m.status,
+          corner,
+          homeCorner: asInt(m.runningResult?.homeCorner),
+          awayCorner: asInt(m.runningResult?.awayCorner),
+        });
+      }
       const ev = mapHkjcMatch(m);
       if (!ev) continue;
       if (ev.inplay) {
@@ -339,6 +367,7 @@ export class HkjcProvider implements OddsProvider {
     if (inplaySkipped) warnings.push(`skipped ${inplaySkipped} in-play match(es)`);
     return {
       events,
+      liveCorners,
       latencyMs: Date.now() - started,
       partial: cutoff !== null,
       warnings,
