@@ -5,6 +5,7 @@ const dbPath = `/tmp/odds-radar-ou-signals-${process.pid}.db`;
 process.env.RADAR_DB = dbPath;
 
 let rawDb: typeof import("../server/lib/store").rawDb;
+let backfillOuSignalObservations: typeof import("../server/lib/ou-signals").backfillOuSignalObservations;
 let markOuPrealertNotified: typeof import("../server/lib/ou-signals").markOuPrealertNotified;
 let markOuSignalNotified: typeof import("../server/lib/ou-signals").markOuSignalNotified;
 let ouRuleT5OddsRange: typeof import("../server/lib/ou-signals").ouRuleT5OddsRange;
@@ -19,6 +20,7 @@ beforeAll(async () => {
   const store = await import("../server/lib/store");
   const signals = await import("../server/lib/ou-signals");
   rawDb = store.rawDb;
+  backfillOuSignalObservations = signals.backfillOuSignalObservations;
   markOuPrealertNotified = signals.markOuPrealertNotified;
   markOuSignalNotified = signals.markOuSignalNotified;
   ouRuleT5OddsRange = signals.ouRuleT5OddsRange;
@@ -300,6 +302,70 @@ describe("OU signal monitor", () => {
     expect(pending.map((row) => row.ruleId)).toContain("hkjc-ooo-flat-wide-reverse");
     markOuSignalNotified(pending[0].uniqueKey, latestDetected + 2);
     expect(unsentOuSignals()).toHaveLength(4);
+  });
+
+  it("counts an allowlisted historical T-5 backfill without placing it in the Telegram queue", () => {
+    const now = afterWatchActivation + 50_000;
+    const matchId = "approved-t5-backfill";
+    const ruleId = "pinnacle-ouu-t5-selected-180-190-over-watch";
+    const backfilledAt = now + 1_000;
+    addPath(matchId, "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.85],
+    }, now);
+
+    expect(backfillOuSignalObservations([{ matchId, ruleId }], backfilledAt)).toBe(1);
+    expect(backfillOuSignalObservations([{ matchId, ruleId }], backfilledAt)).toBe(0);
+    expect(rawDb.prepare(
+      "SELECT rule_id,backfilled_at,notified_at FROM ou_signal_observations WHERE match_id=?",
+    ).get(matchId)).toEqual({
+      rule_id: ruleId,
+      backfilled_at: backfilledAt,
+      notified_at: null,
+    });
+    expect(unsentOuSignals([matchId])).toHaveLength(0);
+    expect(ouSignalDataset(now).observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ matchId, ruleId }),
+    ]));
+  });
+
+  it("backfills only the exact approved match/rule pair", () => {
+    const now = afterWatchActivation + 55_000;
+    const matchId = "pair-filtered-t5-backfill";
+    addPath(matchId, "hkjc", {
+      initial: [1.80, 1.92],
+      T30: [1.82, 1.94],
+      T5: [1.80, 1.96],
+    }, now, "2.5");
+
+    expect(backfillOuSignalObservations([{
+      matchId,
+      ruleId: "hkjc-ooo-t5-selected-le-180-under-watch",
+    }], now + 1_000)).toBe(1);
+    expect((rawDb.prepare(
+      "SELECT rule_id FROM ou_signal_observations WHERE match_id=?",
+    ).all(matchId) as Array<{ rule_id: string }>).map((row) => row.rule_id)).toEqual([
+      "hkjc-ooo-t5-selected-le-180-under-watch",
+    ]);
+  });
+
+  it("rolls the whole historical batch back when any approved pair cannot be formed", () => {
+    const now = afterWatchActivation + 57_000;
+    const matchId = "atomic-t5-backfill";
+    addPath(matchId, "pinnacle", {
+      initial: [1.80, 1.95],
+      T30: [1.96, 1.82],
+      T5: [1.98, 1.85],
+    }, now);
+
+    expect(() => backfillOuSignalObservations([
+      { matchId, ruleId: "pinnacle-ouu-t5-selected-180-190-over-watch" },
+      { matchId, ruleId: "hkjc-ooo-t5-selected-le-180-under-watch" },
+    ], now + 1_000)).toThrow(/did not produce exactly one marked row/);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_observations WHERE match_id=?",
+    ).get(matchId)).toEqual({ count: 0 });
   });
 
   it("tracks all four reverse Watch rules with inclusive line and T-5 odds boundaries", () => {

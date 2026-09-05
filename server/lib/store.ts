@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS ou_signal_observations (
   drift_bucket TEXT NOT NULL, original_selection TEXT NOT NULL,
   signal_selection TEXT NOT NULL, initial_signal_odds REAL NOT NULL,
   t5_signal_odds REAL NOT NULL, signal_t5_odds REAL NOT NULL, odds_gap REAL NOT NULL,
-  detected_at INTEGER NOT NULL, notified_at INTEGER);
+  detected_at INTEGER NOT NULL, notified_at INTEGER, backfilled_at INTEGER);
 CREATE INDEX IF NOT EXISTS ou_signal_match_idx
   ON ou_signal_observations(match_id,detected_at);
 CREATE INDEX IF NOT EXISTS ou_signal_rule_idx
@@ -269,6 +269,9 @@ CREATE INDEX IF NOT EXISTS pinnacle_translation_entities_updated_idx
   }
   if (!ouSignalNames.has("drift_comparable")) {
     sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN drift_comparable INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!ouSignalNames.has("backfilled_at")) {
+    sqlite.exec("ALTER TABLE ou_signal_observations ADD COLUMN backfilled_at INTEGER");
   }
   sqlite.exec(`
     UPDATE ou_signal_observations
