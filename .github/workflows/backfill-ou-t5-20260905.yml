@@ -1,0 +1,41 @@
+name: 補錄 2026-09-03 至 09-05 正式 T-5 訊號
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 輸入 BACKFILL_CONFIRMED_T5_20260905
+        required: true
+        type: string
+
+jobs:
+  backfill:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 核對確認字句
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: test "$CONFIRMATION" = "BACKFILL_CONFIRMED_T5_20260905"
+
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 執行白名單原子補錄並核對待發數
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          sudo docker compose exec -T \
+            -e OU_T5_BACKFILL_CONFIRMATION=BACKFILL_CONFIRMED_T5_20260905 \
+            radar node dist/backfill-ou-t5-20260905.cjs
+          REMOTE

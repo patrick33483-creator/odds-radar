@@ -89,6 +89,16 @@ interface StoredPrealertRow {
   kickoff_utc: number;
 }
 
+export interface OuSignalBackfillPair {
+  matchId: string;
+  ruleId: string;
+}
+
+interface SyncOuSignalOptions {
+  backfilledAt?: number;
+  allowedPairs?: ReadonlySet<string>;
+}
+
 export const OU_SIGNAL_RULES: OuSignalRule[] = [
   {
     id: "pinnacle-uoo-short-005-010",
@@ -594,7 +604,10 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
  * price difference is never evaluated: drift-specific rules fail closed
  * unless initial and T-5 return to the same outcome line.
  */
-export function syncOuSignalObservations(matchIds: string[] = []): number {
+export function syncOuSignalObservations(
+  matchIds: string[] = [],
+  options: SyncOuSignalOptions = {},
+): number {
   const cutoff = Date.now() - 120 * 24 * 60 * 60_000;
   const matchFilter = matchIds.length
     ? `AND s.match_id IN (${matchIds.map(() => "?").join(",")})`
@@ -621,8 +634,8 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
        unique_key,match_id,provider,rule_id,line_key,direction_path,drift_bucket,
        initial_line_key,t30_line_key,t5_line_key,line_path,evaluator_version,drift_comparable,
        original_selection,signal_selection,initial_signal_odds,t5_signal_odds,
-       signal_t5_odds,odds_gap,detected_at,notified_at
-     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+       signal_t5_odds,odds_gap,detected_at,notified_at,backfilled_at
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
   );
   let inserted = 0;
   const tx = rawDb.transaction(() => {
@@ -652,7 +665,11 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
       const version = evaluatorVersion([initial.lineKey, t30.lineKey, t5.lineKey]);
       const detectedAt = Math.max(...[...t5.rows.values()].map((row) => row.captured_at));
       const rules = matchingRules(provider, path, gap, t5.lineKey, decisions[2]!.odds)
-        .filter((rule) => rule.activatedAt === undefined || detectedAt >= rule.activatedAt);
+        .filter((rule) => rule.activatedAt === undefined || detectedAt >= rule.activatedAt)
+        .filter((rule) => (
+          options.allowedPairs === undefined
+          || options.allowedPairs.has(`${matchId}|${rule.id}`)
+        ));
       for (const rule of rules) {
         const signalT5Odds = t5.rows.get(rule.signalSelection)?.decimal_odds;
         if (signalT5Odds === undefined) continue;
@@ -680,12 +697,65 @@ export function syncOuSignalObservations(matchIds: string[] = []): number {
           signalT5Odds,
           gap ?? 0,
           detectedAt,
+          options.backfilledAt ?? null,
         ).changes;
       }
     }
   });
   tx();
   return inserted;
+}
+
+/**
+ * Insert only explicitly approved historical match/rule pairs. The backfill
+ * marker is written in the same INSERT transaction, so historical rows can
+ * never become visible to the Telegram pending-send query.
+ */
+export function backfillOuSignalObservations(
+  pairs: readonly OuSignalBackfillPair[],
+  backfilledAt = Date.now(),
+): number {
+  if (!Number.isSafeInteger(backfilledAt) || backfilledAt <= 0) {
+    throw new Error("backfilledAt must be a positive integer timestamp");
+  }
+  const allowedPairs = new Set<string>();
+  for (const pair of pairs) {
+    if (!RULE_BY_ID.has(pair.ruleId)) throw new Error(`Unknown OU signal rule: ${pair.ruleId}`);
+    if (OU_HIDDEN_RULE_IDS.has(pair.ruleId)) {
+      throw new Error(`Historical backfill cannot target hidden rule: ${pair.ruleId}`);
+    }
+    allowedPairs.add(`${pair.matchId}|${pair.ruleId}`);
+  }
+  const matchIds = [...new Set(pairs.map((pair) => pair.matchId))];
+  const rowsForPair = rawDb.prepare(
+    `SELECT backfilled_at
+       FROM ou_signal_observations
+      WHERE match_id=? AND rule_id=?`,
+  );
+  return rawDb.transaction(() => {
+    for (const pair of pairs) {
+      const existing = rowsForPair.all(pair.matchId, pair.ruleId) as Array<{
+        backfilled_at: number | null;
+      }>;
+      if (existing.some((row) => row.backfilled_at === null)) {
+        throw new Error(
+          `Refusing to relabel live observation as historical: ${pair.matchId}|${pair.ruleId}`,
+        );
+      }
+    }
+    const inserted = syncOuSignalObservations(matchIds, { backfilledAt, allowedPairs });
+    for (const pair of pairs) {
+      const stored = rowsForPair.all(pair.matchId, pair.ruleId) as Array<{
+        backfilled_at: number | null;
+      }>;
+      if (stored.length !== 1 || stored[0]?.backfilled_at === null) {
+        throw new Error(
+          `Historical backfill did not produce exactly one marked row: ${pair.matchId}|${pair.ruleId}`,
+        );
+      }
+    }
+    return inserted;
+  })();
 }
 
 function observationStatus(row: StoredSignalRow, now: number): OuSignalObservation["matchStatus"] {
@@ -851,7 +921,10 @@ export function unsentOuSignals(matchIds: string[] = [], now = Date.now()): OuSi
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
-      WHERE m.fixture_source IN ('hkjc','pinnacle') AND o.notified_at IS NULL AND o.detected_at>=? ${filter}
+      WHERE m.fixture_source IN ('hkjc','pinnacle')
+        AND o.notified_at IS NULL
+        AND o.backfilled_at IS NULL
+        AND o.detected_at>=? ${filter}
       ORDER BY o.detected_at`,
   ).all(activatedAt, ...matchIds) as StoredSignalRow[];
   return rows
