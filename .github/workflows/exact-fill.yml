@@ -1,0 +1,99 @@
+name: exact-fill
+on:
+  workflow_dispatch:
+    inputs:
+      tsv_path:
+        description: "TSV path"
+        required: true
+        default: "fills/exact.tsv"
+jobs:
+  f:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          TSV: ${{ inputs.tsv_path }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          scp "$TSV" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/exact.tsv"
+          cat > /tmp/e.py <<'PYEOF'
+          import sqlite3, datetime, time
+          try:
+              from zhconv import convert
+          except:
+              import subprocess; subprocess.check_call(["pip3","install","--quiet","zhconv"])
+              from zhconv import convert
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30, isolation_level=None)
+          db.execute("PRAGMA busy_timeout=60000")
+          db.row_factory = sqlite3.Row
+          fills = []
+          for ln in open("/tmp/exact.tsv"):
+              p = ln.rstrip("\n").split("\t")
+              if len(p) < 5: continue
+              fills.append(dict(home=p[0],away=p[1],hs=int(p[2]),as_=int(p[3]),date=p[4]))
+          def variants(s):
+              vs = {s}
+              for tgt in ["zh-hk","zh-tw","zh-cn","zh-hant","zh-hans"]:
+                  try: vs.add(convert(s, tgt))
+                  except: pass
+              return list(vs)
+          filled = 0; missed = []; matched_ids = []
+          for e in fills:
+              y,m,d = [int(x) for x in e["date"].split("-")]
+              lo = int(datetime.datetime(y,m,d,0,0,tzinfo=hkt).timestamp()*1000)
+              hi = int(datetime.datetime(y,m,d,23,59,tzinfo=hkt).timestamp()*1000)
+              hs = variants(e["home"]); as_ = variants(e["away"])
+              # EXACT match on BOTH team names (any variant)
+              rows = []
+              seen = set()
+              for h in hs:
+                  for a in as_:
+                      for r in db.execute("""
+                          SELECT id, home_team, away_team, fixture_source, kickoff_utc
+                            FROM matches
+                           WHERE home_team=? AND away_team=?
+                             AND kickoff_utc>=? AND kickoff_utc<=?
+                      """,(h,a,lo,hi)).fetchall():
+                          if r["id"] not in seen: seen.add(r["id"]); rows.append(r)
+              tag = f"{e['home']} vs {e['away']} @ {e['date']}"
+              if not rows:
+                  missed.append(tag); continue
+              now_ms = int(time.time()*1000)
+              for r in rows:
+                  for attempt in range(10):
+                      try:
+                          db.execute("BEGIN IMMEDIATE")
+                          db.execute("""
+                              INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,source_match_id,fetched_at)
+                              VALUES(?,NULL,?,?,NULL,'user','manual',?,?)
+                              ON CONFLICT(match_id) DO UPDATE SET
+                                home_score=excluded.home_score,
+                                away_score=excluded.away_score,
+                                fetched_at=excluded.fetched_at
+                          """,(r["id"],e["hs"],e["as_"],r["id"],now_ms))
+                          db.execute("COMMIT")
+                          filled += 1
+                          matched_ids.append(f"  {tag} => [{r['fixture_source']}] {r['id']} {r['home_team']} vs {r['away_team']} = {e['hs']}-{e['as_']}")
+                          break
+                      except Exception as ex:
+                          try: db.execute("ROLLBACK")
+                          except: pass
+                          if "locked" in str(ex) and attempt < 9:
+                              time.sleep(2); continue
+                          raise
+          print(f"填咗 {filled} 條 record（{len(fills)} 場輸入，missed {len(missed)}）")
+          for x in matched_ids: print(x)
+          if missed:
+              print("--- missed ---")
+              for x in missed: print(" ", x)
+          db.close()
+          PYEOF
+          scp /tmp/e.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/e.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/e.py'
