@@ -36,10 +36,17 @@ jobs:
           set -euo pipefail
           cd /opt/odds-radar
           stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          sudo docker compose exec -T radar sh -c \
-            "sqlite3 /app/data/data.db \".backup '/app/data/pre-recompute-${stamp}.db'\"" \
-            || sudo docker compose exec -T radar node -e \
-              "require('node:fs').copyFileSync('/app/data/data.db','/app/data/pre-recompute-${stamp}.db')"
+          # Copy from the host bind mount (./data:/app/data). The container
+          # image has no sqlite3 CLI, and copying inside the container was
+          # OOM-killed. Every WAL sidecar is copied so the snapshot is
+          # restorable as-is.
+          sudo mkdir -p data/pre-recompute-"$stamp"
+          for suffix in "" "-wal" "-shm"; do
+            if [ -f "data/data.db$suffix" ]; then
+              sudo cp -p "data/data.db$suffix" "data/pre-recompute-$stamp/data.db$suffix"
+            fi
+          done
+          sudo ls -l data/pre-recompute-"$stamp"
           sudo docker compose exec -T \
             -e OU_RECOMPUTE_CONFIRMATION=RECOMPUTE_CONFIRMED_OU_MAINLINE_20260906 \
             radar node dist/recompute-ou-observations-20260906.cjs
