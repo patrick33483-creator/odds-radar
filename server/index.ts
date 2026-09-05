@@ -3,13 +3,16 @@ import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
 import {
   registerRoutes,
+  runResearchLowerCycleOnce,
   startBackgroundCollectors,
+  startResearchLowerMilestoneCollector,
   startResearchMilestoneCollector,
 } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { Worker, isMainThread, workerData } from "node:worker_threads";
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
+import { fork, type ChildProcess } from "node:child_process";
 import { apiLogBody } from "./lib/api-log";
 
 const app = express();
@@ -101,10 +104,131 @@ app.use((req, res, next) => {
   next();
 });
 
-if (!isMainThread && (workerData?.role === "collector" || workerData?.role === "milestone")) {
-  if (workerData.role === "milestone") {
-    startResearchMilestoneCollector();
+const processRole = !isMainThread
+  ? workerData?.role
+  : process.env.RADAR_WORKER_ROLE;
+
+if (
+  processRole === "collector"
+  || processRole === "milestone"
+  || processRole === "milestone-lower"
+  || processRole === "milestone-lower-once"
+) {
+  if (processRole === "milestone") {
+    let lowerCycle: ChildProcess | null = null;
+    const expectedStops = new WeakSet<ChildProcess>();
+    const checkpointReported = new WeakSet<ChildProcess>();
+    let lowerCycleSequence = 0;
+    const stopLowerCycle = async () => {
+      const active = lowerCycle;
+      lowerCycle = null;
+      if (active) {
+        expectedStops.add(active);
+        // A separate OS process can be stopped even while it is executing a
+        // synchronous native SQLite call. Core never starts until SIGKILL has
+        // been observed; failure to stop is fatal so exclusivity is preserved.
+        const stopped = new Promise<boolean>((resolve) => {
+          active.once("exit", () => resolve(true));
+          setTimeout(() => resolve(false), 1_000).unref();
+        });
+        active.kill("SIGKILL");
+        if (!await stopped) {
+          console.error("Lower research cycle did not stop before core deadline");
+          process.exit(1);
+        }
+      }
+    };
+    const startLowerCycle = () => {
+      let worker: ChildProcess;
+      try {
+        worker = fork(process.argv[1], [], {
+          env: {
+            ...process.env,
+            RADAR_WORKER_ROLE: "milestone-lower-once",
+            RADAR_LOWER_DISPATCH_OFFSET: String(lowerCycleSequence++),
+          },
+          stdio: ["ignore", "inherit", "inherit", "ipc"],
+        });
+      } catch (err) {
+        console.error("Unable to launch lower research cycle:", err);
+        process.exit(1);
+      }
+      lowerCycle = worker;
+      worker.on("message", (outcome) => {
+        if (
+          outcome
+          && typeof outcome === "object"
+          && "event" in outcome
+          && outcome.event === "research_milestone_lower_tier"
+        ) {
+          checkpointReported.add(worker);
+        }
+        console.log(JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "research_lower_cycle",
+          outcome,
+        }));
+      });
+      worker.on("error", (err) => {
+        console.error("Lower research cycle worker error:", err);
+        if (!expectedStops.has(worker) && !checkpointReported.has(worker)) {
+          process.exit(1);
+        }
+      });
+      worker.on("exit", (code, signal) => {
+        if (lowerCycle === worker) lowerCycle = null;
+        if (code !== 0 && !expectedStops.has(worker)) {
+          console.error(`Lower research cycle worker exited with code ${code}, signal ${signal}`);
+          if (!checkpointReported.has(worker)) process.exit(1);
+        }
+      });
+    };
+    startResearchMilestoneCollector({
+      beforeRun: stopLowerCycle,
+      afterRun: startLowerCycle,
+    });
     log("research milestone collector started in isolated worker", "milestone");
+  } else if (processRole === "milestone-lower-once") {
+    const sendToOwner = (message: unknown) => new Promise<void>((resolve, reject) => {
+      if (parentPort) {
+        parentPort.postMessage(message);
+        resolve();
+        return;
+      }
+      if (!process.send) {
+        reject(new Error("Lower research cycle has no IPC channel"));
+        return;
+      }
+      process.send(message, undefined, undefined, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    void runResearchLowerCycleOnce(
+      Number.isFinite(Number(process.env.RADAR_LOWER_DISPATCH_OFFSET))
+        ? Number(process.env.RADAR_LOWER_DISPATCH_OFFSET)
+        : undefined,
+      async (milestone) => {
+        await sendToOwner({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "research_milestone_lower_tier",
+          ...milestone,
+        });
+      },
+    )
+      .then(async (outcome) => {
+        await sendToOwner(outcome);
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error("Lower research cycle failed:", err);
+        process.exit(1);
+      });
+  } else if (processRole === "milestone-lower") {
+    startResearchLowerMilestoneCollector();
+    log("lower research milestone collector started in isolated worker", "milestone-lower");
   } else {
     startBackgroundCollectors();
     log("background collectors started in isolated worker", "collector");
@@ -116,6 +240,7 @@ if (!isMainThread && (workerData?.role === "collector" || workerData?.role === "
   if (process.env.NODE_ENV !== "production") {
     startBackgroundCollectors();
     startResearchMilestoneCollector();
+    startResearchLowerMilestoneCollector();
   }
   await registerRoutes(httpServer, app);
 

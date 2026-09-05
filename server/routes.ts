@@ -39,6 +39,10 @@ let researchTimelineInFlight: ReturnType<typeof engine.runResearchTimelineTick> 
 let researchMilestoneTimer: NodeJS.Timeout | null = null;
 let researchMilestoneStartupTimer: NodeJS.Timeout | null = null;
 let researchMilestoneInFlight: ReturnType<typeof engine.runResearchMilestoneTick> | null = null;
+let researchLowerMilestoneTimer: NodeJS.Timeout | null = null;
+let researchLowerMilestoneStartupTimer: NodeJS.Timeout | null = null;
+let researchLowerMilestoneInFlight:
+  ReturnType<typeof engine.runResearchLowerMilestoneTick> | null = null;
 let hourlyPrewarmTimer: NodeJS.Timeout | null = null;
 let hourlyPrewarmStartupTimer: NodeJS.Timeout | null = null;
 let cornerValidationInFlight: Promise<unknown> | null = null;
@@ -290,11 +294,19 @@ function installResearchTimelineCollection(): void {
   researchTimelineTimer.unref();
 }
 
-function installResearchMilestoneCollection(): void {
-  if (!autoScanEnabled() || researchMilestoneTimer) return;
+type ResearchMilestoneHooks = {
+  beforeRun?: () => void | Promise<void>;
+  afterRun?: () => void | Promise<void>;
+};
+
+function installResearchMilestoneCollection(hooks: ResearchMilestoneHooks = {}): void {
+  if (!autoScanEnabled() || researchMilestoneTimer || researchMilestoneStartupTimer) return;
   const run = async () => {
     if (researchMilestoneInFlight) return;
-    researchMilestoneInFlight = engine.runResearchMilestoneTick();
+    researchMilestoneInFlight = (async () => {
+      await hooks.beforeRun?.();
+      return engine.runResearchMilestoneTick();
+    })();
     try {
       const outcome = await researchMilestoneInFlight;
       console.log(JSON.stringify({
@@ -312,12 +324,66 @@ function installResearchMilestoneCollection(): void {
       }));
     } finally {
       researchMilestoneInFlight = null;
+      try {
+        await hooks.afterRun?.();
+      } catch (err) {
+        console.error(JSON.stringify({
+          ts: new Date().toISOString(),
+          scope: "radar",
+          event: "research_milestone_after_run_error",
+          error: (err as Error).message,
+        }));
+      }
     }
   };
-  researchMilestoneStartupTimer = setTimeout(() => void run(), 5_000);
+  researchMilestoneStartupTimer = setTimeout(() => {
+    void run();
+    researchMilestoneTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
+    researchMilestoneTimer.unref();
+  }, 5_000);
   researchMilestoneStartupTimer.unref();
-  researchMilestoneTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
-  researchMilestoneTimer.unref();
+}
+
+/**
+ * Starts one bounded Pinnacle+Crown wave 25 seconds after the core milestone
+ * worker. Production owns this timer in a separate worker thread, so its
+ * provider calls, SQLite work and notification materialization cannot block
+ * the latency-sensitive HKJC+Pinnacle event loop.
+ */
+function installResearchLowerMilestoneCollection(): void {
+  if (
+    !autoScanEnabled()
+    || researchLowerMilestoneTimer
+    || researchLowerMilestoneStartupTimer
+  ) return;
+  const run = async () => {
+    if (researchLowerMilestoneInFlight) return;
+    researchLowerMilestoneInFlight = engine.runResearchLowerMilestoneTick();
+    try {
+      const outcome = await researchLowerMilestoneInFlight;
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_milestone_lower_tier",
+        ...outcome,
+      }));
+    } catch (err) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "research_milestone_lower_tier_error",
+        error: (err as Error).message,
+      }));
+    } finally {
+      researchLowerMilestoneInFlight = null;
+    }
+  };
+  researchLowerMilestoneStartupTimer = setTimeout(() => {
+    void run();
+    researchLowerMilestoneTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
+    researchLowerMilestoneTimer.unref();
+  }, 30_000);
+  researchLowerMilestoneStartupTimer.unref();
 }
 
 /**
@@ -519,18 +585,101 @@ function buildSimulations(): SimulationsResponse {
  * Express event loop and make nginx return 504.
  */
 export function startBackgroundCollectors(): void {
-  installResearchTimelineCollection();
-  installAutoWindowScan();
-  installHourlyPrewarm();
-  installResearchOpeningCollection();
   installQuoteDirectionWatchCollection();
-  installResearchResultCollection();
   installDiskGuard();
 }
 
 /** Run only the latency-sensitive T30/T15/T5 collector in its own worker. */
-export function startResearchMilestoneCollector(): void {
-  installResearchMilestoneCollection();
+export function startResearchMilestoneCollector(hooks: ResearchMilestoneHooks = {}): void {
+  installResearchMilestoneCollection(hooks);
+}
+
+/** Run only the bounded Pinnacle+Crown checkpoint wave in its own worker. */
+export function startResearchLowerMilestoneCollector(): void {
+  installResearchLowerMilestoneCollection();
+}
+
+/**
+ * One preemptible lower-priority cycle. Production runs this in a disposable
+ * worker owned by the core milestone scheduler, never from the general
+ * background collector.
+ */
+export async function runResearchLowerCycleOnce(
+  dispatchOffset?: number,
+  onMilestone?: (
+    outcome: Awaited<ReturnType<typeof engine.runResearchLowerMilestoneTick>>,
+  ) => void | Promise<void>,
+) {
+  const milestone = await engine.runResearchLowerMilestoneTick(dispatchOffset);
+  await onMilestone?.(milestone);
+  const timeline = await engine.runResearchTimelineTick({ captureMilestones: false });
+  const now = Date.now();
+  const runIfDue = async <T>(
+    stateKey: string,
+    intervalMs: number,
+    task: () => Promise<T>,
+  ): Promise<T | null> => {
+    const lastRun = Number(getState(stateKey) ?? 0);
+    if (Number.isFinite(lastRun) && now - lastRun < intervalMs) return null;
+    const outcome = await task();
+    setState(stateKey, String(Date.now()));
+    return outcome;
+  };
+  const openings = process.env.RADAR_RESEARCH_OPENINGS === "0"
+    ? null
+    : await runIfDue(
+        "research_lower_openings_last_run",
+        Math.max(
+          5,
+          Math.min(
+            24 * 60,
+            Number(process.env.RADAR_RESEARCH_OPENING_INTERVAL_MINUTES ?? 30) || 30,
+          ),
+        ) * 60_000,
+        () => collectResearchInitialSnapshots(),
+      );
+  const results = process.env.RADAR_RESEARCH_RESULTS === "0"
+    ? null
+    : await runIfDue(
+        "research_lower_results_last_run",
+        60 * 60_000,
+        () => collectResearchResults(researchHkjc),
+      );
+  const prewarm = process.env.RADAR_HOURLY_PREWARM === "0"
+    ? null
+    : await runIfDue(
+        "research_lower_prewarm_last_run",
+        60 * 60_000,
+        () => engine.refresh({ force: true, mode: "prewarm24h" }),
+      );
+  // Dense scanning is intentionally last. It may remain active for a long
+  // live window and will be killed at the next core tick; fixture preparation
+  // and checkpoint statistics must never sit behind it.
+  let scan: Awaited<ReturnType<typeof engine.runScan>> | null = null;
+  if (engine.windowPreview().length) {
+    scan = await engine.runScan();
+  }
+  return {
+    milestone,
+    scan: scan
+      ? {
+          result: scan.result,
+          selected: scan.selected.length,
+          passes: scan.passes,
+          detailCalls: scan.detailCalls,
+        }
+      : null,
+    timeline,
+    openings,
+    results,
+    prewarm: prewarm
+      ? {
+          started: prewarm.started,
+          throttled: prewarm.throttled,
+          mode: prewarm.mode,
+        }
+      : null,
+  };
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
