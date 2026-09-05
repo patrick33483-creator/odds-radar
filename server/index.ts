@@ -1,10 +1,11 @@
 import "dotenv/config";
 import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
-import { registerRoutes } from "./routes";
+import { registerRoutes, startBackgroundCollectors } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { Worker, isMainThread, workerData } from "node:worker_threads";
 import { apiLogBody } from "./lib/api-log";
 
 const app = express();
@@ -96,7 +97,16 @@ app.use((req, res, next) => {
   next();
 });
 
-(async () => {
+if (!isMainThread && workerData?.role === "collector") {
+  startBackgroundCollectors();
+  log("background collectors started in isolated worker", "collector");
+  // Collector timers deliberately use unref() so tests/process shutdown are
+  // clean. This one reference owns the production worker lifecycle.
+  setInterval(() => undefined, 60_000);
+} else void (async () => {
+  if (process.env.NODE_ENV !== "production") {
+    startBackgroundCollectors();
+  }
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
@@ -136,6 +146,19 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+      if (process.env.NODE_ENV === "production") {
+        const collector = new Worker(process.argv[1], {
+          workerData: { role: "collector" },
+        });
+        collector.on("error", (err) => {
+          console.error("Background collector worker error:", err);
+        });
+        collector.on("exit", (code) => {
+          if (code !== 0) {
+            console.error(`Background collector worker exited with code ${code}`);
+          }
+        });
+      }
     },
   );
 })();

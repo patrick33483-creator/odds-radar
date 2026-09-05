@@ -415,20 +415,21 @@ function buildSimulations(): SimulationsResponse {
   };
 }
 
-export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  // Do not start a second boot-time refresh. The 30-second research scheduler
-  // owns the initial collection and the hourly prewarm owns broad refreshes.
-  // Keeping only those paths prevents a restart from launching overlapping
-  // HKJC writes before the HTTP service has passed its health gate.
+/**
+ * Start every recurring collector in one process. Production runs this in a
+ * worker thread so long provider/matching/database passes cannot block the
+ * Express event loop and make nginx return 504.
+ */
+export function startBackgroundCollectors(): void {
   installResearchTimelineCollection();
   installAutoWindowScan();
   installHourlyPrewarm();
   installResearchOpeningCollection();
   installQuoteDirectionWatchCollection();
   installResearchResultCollection();
-  // Pinnacle-only fixture labels now come directly from Titan007's Chinese
-  // schedule via stable sId. Do not run an English-to-Chinese backfill worker.
+}
 
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   app.get("/api/status", (_req, res) => {
     const dash = engine.dashboardData();
     res.json(dash.status);

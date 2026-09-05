@@ -591,6 +591,7 @@ export class RadarEngine {
   // that immutable object for API polls so a busy provider/scan cannot make a
   // client request synchronously rebuild every market calculation.
   private dashboardCache: DashboardResponse | null = null;
+  private dashboardCacheAt = 0;
 
   constructor() {
     const stored = getState("lastGoodAt");
@@ -2328,12 +2329,18 @@ export class RadarEngine {
 
   /** Return the latest completed read-only board without recomputing it per request. */
   dashboardData(): DashboardResponse {
-    if (this.dashboardCache) return this.dashboardCache;
+    // Production collectors run in a worker with a separate engine instance.
+    // Refresh this read projection periodically so the web process sees their
+    // committed SQLite updates without rebuilding it more than once per burst.
+    if (this.dashboardCache && Date.now() - this.dashboardCacheAt < 5_000) {
+      return this.dashboardCache;
+    }
     return this.rememberDashboard(this.buildDashboardData());
   }
 
   private rememberDashboard(dashboard: DashboardResponse): DashboardResponse {
     this.dashboardCache = dashboard;
+    this.dashboardCacheAt = Date.now();
     return dashboard;
   }
 
