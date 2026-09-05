@@ -39,23 +39,30 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 從生產抽取只讀 SQLite 副本
+      - name: 從生產串流最新壓縮備份
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           umask 077
           mkdir -p audit-ou-workdir
-          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-          REMOTE_TMP="/tmp/audit-ou-${STAMP}.db"
-          REMOTE_GZ="${REMOTE_TMP}.gz"
           SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=60 -o TCPKeepAlive=yes"
+          # Remove only stale files created by earlier failed audit runs.
           ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo sqlite3 'file:/opt/odds-radar/data/data.db?mode=ro' \".backup '$REMOTE_TMP'\" && sudo gzip -f '$REMOTE_TMP' && sudo chown \"$DEPLOY_USER\":\"$DEPLOY_USER\" '$REMOTE_GZ' && ls -l '$REMOTE_GZ'"
-          scp $SSH_OPTS \
-            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_GZ" audit-ou-workdir/data.db.gz
-          ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" "rm -f '$REMOTE_TMP' '$REMOTE_GZ'"
-          gunzip audit-ou-workdir/data.db.gz
+            "sudo rm -f /tmp/audit-ou-*.db /tmp/audit-ou-*.db.gz"
+          # Reuse an existing compressed deploy/hourly backup; do not create
+          # another multi-GB copy on the production host.
+          LATEST="$(
+            ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
+              "sudo find /opt/odds-radar/backups -maxdepth 1 -type f -name '*.sql.gz' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-"
+          )"
+          test -n "$LATEST"
+          echo "Using $(basename "$LATEST")"
+          ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo cat '$LATEST'" > audit-ou-workdir/data.sql.gz
+          gzip -t audit-ou-workdir/data.sql.gz
+          gunzip -c audit-ou-workdir/data.sql.gz | sqlite3 audit-ou-workdir/data.db
+          rm -f audit-ou-workdir/data.sql.gz
           ls -lh audit-ou-workdir/data.db
 
       - name: 用最新引擎重放 syncOuSignal*（只寫副本）
