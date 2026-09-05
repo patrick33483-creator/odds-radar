@@ -135,6 +135,8 @@ titan007 的 Crown 行只用於兩個鎖利類別：同盤路 HKJC × Crown 鎖�
 | `RADAR_BOOTSTRAP` | 已停用 | 保留作舊部署相容；啟動更新由 30 秒研究排程負責 |
 | `RADAR_AUTO_SCAN` | 啟用 | `0` 可關閉每 30 秒視窗檢查 |
 | `RADAR_HOURLY_PREWARM` | 啟用 | `0` 可關閉每小時 24 小時預熱配對 |
+| `RADAR_MILESTONE_MAX_TARGETS` | `240` | 每次 T-30／T-15／T-5 收集的賽事上限；下限固定 48，實際取用視窗內賽事數 |
+| `RADAR_MILESTONE_CONCURRENCY` | `16` | T-30／T-15／T-5 收集的同時請求數，1–64 |
 | `RADAR_RESEARCH_RESULTS` | 啟用 | `0` 可關閉每小時 HKJC 官方賽果補抓 |
 | `RADAR_RESEARCH_RESULT_LOOKBACK_DAYS` | `7` | 每輪賽果補抓向後檢查日數，最多 30 日 |
 | `RADAR_RESEARCH_OPENINGS` | 啟用 | `0` 可關閉莊家真初盤外部匯入 |
