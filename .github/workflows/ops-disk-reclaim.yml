@@ -1,0 +1,77 @@
+name: 清理伺服器磁碟（保留最新備份）
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 輸入 RECLAIM_CONFIRMED_20260906
+        required: true
+        type: string
+
+jobs:
+  reclaim:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 核對確認字句
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: test "$CONFIRMATION" = "RECLAIM_CONFIRMED_20260906"
+
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 刪除殘檔與過期備份，然後收縮 WAL
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          echo "=== before ==="; df -h /
+
+          # 1. 我方中斷嘅重算殘檔（不完整，冇保留價值）
+          sudo rm -f data/pre-recompute-20260905T160630Z.db
+          sudo rm -rf data/pre-recompute-20260905T161111Z
+
+          # 2. 8 月 30 日舊手動備份
+          sudo rm -f data/data.db.bak.20260830113527
+
+          # 3. 部署備份只保留最新 3 份，其餘刪除（絕不觸碰 data.db 本體）
+          sudo docker compose exec -T radar sh -c '
+            set -eu
+            cd /app/backups
+            rm -f *.db-journal
+            ls -1t *.sql.gz *.db 2>/dev/null | tail -n +4 | while IFS= read -r f; do
+              echo "刪除 $f"
+              rm -f -- "$f"
+            done
+            echo "剩餘："; ls -lh
+          '
+
+          # 4. 清無用 docker image / build cache
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo docker builder prune -af >/dev/null 2>&1 || true
+
+          echo "=== after cleanup ==="; df -h /
+
+          # 5. 有空間後做 WAL checkpoint，收縮 493M 嘅 WAL
+          sudo docker compose exec -T radar node -e '
+            const Database = require("better-sqlite3");
+            const db = new Database(process.env.RADAR_DB || "/app/data/data.db");
+            const r = db.pragma("wal_checkpoint(TRUNCATE)");
+            console.log("wal_checkpoint", JSON.stringify(r));
+            db.close();
+          ' || echo "WAL checkpoint 略過（稍後由應用自行處理）"
+
+          echo "=== final ==="; df -h /
+          sudo du -sh data /opt/odds-radar/data 2>/dev/null | head -2
+          sudo ls -lh data
+          REMOTE
