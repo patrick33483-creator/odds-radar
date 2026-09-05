@@ -385,3 +385,24 @@ export async function notifyOuPrealerts(signals: OuSignalPrealert[]): Promise<nu
   }
   return sent;
 }
+
+/**
+ * Send a plain operational message. Returns false when Telegram is not
+ * configured so callers can treat that as "not delivered" rather than success.
+ */
+export async function sendTelegramText(text: string): Promise<boolean> {
+  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
+  if (!token || !chatId || !text.trim()) return false;
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
+  if (!response.ok || !payload.ok) {
+    throw new Error(`Telegram delivery failed: ${payload.description ?? response.status}`);
+  }
+  return true;
+}
