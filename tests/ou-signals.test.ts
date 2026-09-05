@@ -560,4 +560,24 @@ describe("OU signal monitor", () => {
     expect(syncOuSignalPrealerts([matchId])).toBe(0);
     expect(syncOuSignalObservations([matchId])).toBe(0);
   });
+
+  it("keeps the dashboard dataset read-only instead of synchronizing all history", () => {
+    const now = afterWatchActivation + 300_000;
+    const matchId = "dataset-read-only";
+    addPath(matchId, "pinnacle", {
+      initial: [1.90, 1.80],
+      T30: [1.78, 1.96],
+      T5: [1.84, 2.00],
+    }, now);
+
+    ouSignalDataset(now);
+
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) count FROM ou_signal_observations WHERE match_id=?",
+    ).get(matchId)).toEqual({ count: 0 });
+
+    rawDb.prepare("DELETE FROM research_timeline_snapshots WHERE match_id=?").run(matchId);
+    rawDb.prepare("DELETE FROM research_timeline_points WHERE match_id=?").run(matchId);
+    rawDb.prepare("DELETE FROM matches WHERE id=?").run(matchId);
+  });
 });

@@ -779,7 +779,10 @@ function summaries(observations: OuSignalObservation[]): OuSignalRuleSummary[] {
 }
 
 export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
-  syncOuSignalObservations();
+  // Keep this request path read-only. Timeline collectors already synchronize
+  // the affected match IDs through unsentOuSignals(). Replaying 120 days of
+  // snapshots here blocks the single Node event loop and can make nginx time
+  // out every request while a dashboard page is loading.
   const rows = rawDb.prepare(
     `SELECT o.*,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
