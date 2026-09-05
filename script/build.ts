@@ -49,6 +49,7 @@ async function buildAll() {
       index: "server/index.ts",
       "backfill-ou-t5-20260905": "scripts/backfill-ou-t5-20260905.ts",
       "recompute-ou-observations-20260906": "scripts/recompute-ou-observations-20260906.ts",
+      "export-signal-features-20260906": "scripts/export-signal-features-20260906.ts",
     },
     platform: "node",
     bundle: true,
