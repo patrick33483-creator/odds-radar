@@ -17,7 +17,10 @@
  * - Writes only to research_corner_results, never to research_results, so
  *   canSettleCornerMarket keeps requiring HKJC's own confirmed figure and no
  *   simulated bet can settle on a third-party count.
- * - Only fixtures already past kickoff are queried.
+ * - Only fixtures whose kickoff is at least ENDED_AFTER_MIN minutes in the past
+ *   are queried. A 30-minute guard is enough for a final score but not for
+ *   corners: titan reports the running count, so a match still in play would
+ *   store a partial total that later looks like a finished result.
  * - INSERT OR IGNORE: an existing row is never overwritten.
  * - Sequential fetches with a delay, so a backfill does not hammer titan007.
  * - backfill requires an explicit confirmation phrase and the production path.
@@ -44,6 +47,12 @@ const LIMIT = Number(process.env.CORNER_TITAN_LIMIT ?? 0);
 const DELAY_MS = Number(process.env.CORNER_TITAN_DELAY_MS ?? 400);
 const now = Date.now();
 const windowStart = now - LOOKBACK_DAYS * 24 * 3600_000;
+/**
+ * Minutes after kickoff before a fixture's corner count is treated as final.
+ * 90 minutes of play, plus half-time, stoppage and a margin for a late start.
+ */
+const ENDED_AFTER_MIN = Number(process.env.CORNER_TITAN_ENDED_AFTER_MIN ?? 150);
+const endedBefore = now - ENDED_AFTER_MIN * 60_000;
 const hktDate = (ms: number): string => new Date(ms + 8 * 3600_000).toISOString().slice(0, 10);
 
 interface Row {
@@ -68,7 +77,7 @@ const rows = rawDb.prepare(
       AND m.kickoff_utc >= ?
     GROUP BY m.id
     ORDER BY m.kickoff_utc DESC`,
-).all(now - 30 * 60_000, windowStart) as Row[];
+).all(endedBefore, windowStart) as Row[];
 
 const withTitan = rows.filter((r) => r.titan_id);
 const pending = withTitan.filter((r) => r.already === null);
@@ -77,6 +86,7 @@ const targets = LIMIT > 0 ? pending.slice(0, LIMIT) : pending;
 const summary = {
   mode,
   lookback_days: LOOKBACK_DAYS,
+  ended_after_min: ENDED_AFTER_MIN,
   fixtures_with_corner_odds: rows.length,
   with_titan_id: withTitan.length,
   without_titan_id: rows.length - withTitan.length,
