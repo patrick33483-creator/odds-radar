@@ -175,6 +175,12 @@ CREATE INDEX IF NOT EXISTS ou_signal_prealert_match_idx
 CREATE INDEX IF NOT EXISTS ou_signal_prealert_rule_idx
   ON ou_signal_prealerts(rule_id,detected_at);
 
+CREATE TABLE IF NOT EXISTS ou_notification_drain_state (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  requested_version INTEGER NOT NULL DEFAULT 0,
+  completed_version INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO ou_notification_drain_state(singleton) VALUES(1);
+
 CREATE TABLE IF NOT EXISTS quote_direction_watch_observations (
   unique_key TEXT PRIMARY KEY, rule_id TEXT NOT NULL, match_id TEXT NOT NULL,
   league TEXT NOT NULL, market TEXT NOT NULL CHECK(market IN ('AH','OU')),

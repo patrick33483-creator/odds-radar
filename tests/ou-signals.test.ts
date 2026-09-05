@@ -12,9 +12,15 @@ let ouRuleT5OddsRange: typeof import("../server/lib/ou-signals").ouRuleT5OddsRan
 let ouSignalDataset: typeof import("../server/lib/ou-signals").ouSignalDataset;
 let syncOuSignalObservations: typeof import("../server/lib/ou-signals").syncOuSignalObservations;
 let syncOuSignalPrealerts: typeof import("../server/lib/ou-signals").syncOuSignalPrealerts;
+let pendingOuPrealerts: typeof import("../server/lib/ou-signals").pendingOuPrealerts;
+let pendingOuSignals: typeof import("../server/lib/ou-signals").pendingOuSignals;
+let requestOuNotificationDrain: typeof import("../server/lib/ou-signals").requestOuNotificationDrain;
+let completeOuNotificationDrainPass:
+  typeof import("../server/lib/ou-signals").completeOuNotificationDrainPass;
 let unsentOuPrealerts: typeof import("../server/lib/ou-signals").unsentOuPrealerts;
 let unsentOuSignals: typeof import("../server/lib/ou-signals").unsentOuSignals;
 let OU_SIGNAL_RULES: typeof import("../server/lib/ou-signals").OU_SIGNAL_RULES;
+let OU_TELEGRAM_RULE_IDS: typeof import("../server/lib/ou-signals").OU_TELEGRAM_RULE_IDS;
 
 beforeAll(async () => {
   const store = await import("../server/lib/store");
@@ -27,9 +33,14 @@ beforeAll(async () => {
   ouSignalDataset = signals.ouSignalDataset;
   syncOuSignalObservations = signals.syncOuSignalObservations;
   syncOuSignalPrealerts = signals.syncOuSignalPrealerts;
+  pendingOuPrealerts = signals.pendingOuPrealerts;
+  pendingOuSignals = signals.pendingOuSignals;
+  requestOuNotificationDrain = signals.requestOuNotificationDrain;
+  completeOuNotificationDrainPass = signals.completeOuNotificationDrainPass;
   unsentOuPrealerts = signals.unsentOuPrealerts;
   unsentOuSignals = signals.unsentOuSignals;
   OU_SIGNAL_RULES = signals.OU_SIGNAL_RULES;
+  OU_TELEGRAM_RULE_IDS = signals.OU_TELEGRAM_RULE_IDS;
   store.migrate();
 });
 
@@ -100,6 +111,44 @@ describe("OU signal monitor", () => {
       provider: "pinnacle", signalSelection: "O", directionPath: "U→O→O",
       historicalSample: 20, historicalHits: 16,
     });
+  });
+
+  it("sends Telegram for exactly the four approved rules", () => {
+    expect([...OU_TELEGRAM_RULE_IDS].sort()).toEqual([
+      "hkjc-ooo-flat-wide-reverse",
+      "hkjc-ooo-t5-selected-le-180-under-watch",
+      "pinnacle-ooo-short-010-020",
+      "pinnacle-uoo-short-005-010",
+    ]);
+    expect(OU_TELEGRAM_RULE_IDS.has("pinnacle-ouu-t5-selected-180-190-over-watch")).toBe(false);
+    expect(OU_TELEGRAM_RULE_IDS.has("hkjc-ooo-flat-wide-line-225-250-under-watch")).toBe(false);
+  });
+
+  it("preserves a drain request made during delivery", () => {
+    const firstVersion = requestOuNotificationDrain();
+    const secondVersion = requestOuNotificationDrain();
+
+    expect(secondVersion).toBe(firstVersion + 1);
+    expect(completeOuNotificationDrainPass(firstVersion)).toBe(secondVersion);
+    expect(completeOuNotificationDrainPass(secondVersion)).toBeNull();
+  });
+
+  it("takes the SQLite write lock before completing a drain pass", async () => {
+    const BetterSqlite3 = (await import("better-sqlite3")).default;
+    const second = new BetterSqlite3(dbPath);
+    second.pragma("journal_mode = WAL");
+    second.pragma("busy_timeout = 1");
+    try {
+      rawDb.transaction(() => {
+        expect(() => second.prepare(
+          `UPDATE ou_notification_drain_state
+              SET requested_version=requested_version+1
+            WHERE singleton=1`,
+        ).run()).toThrow();
+      }).immediate();
+    } finally {
+      second.close();
+    }
   });
 
   it("locks active rules with exact drift boundaries and retires UUU reverse", () => {
@@ -195,16 +244,31 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_prealert_activated_at'",
     ).run(String(earliest - 1), earliest - 1);
     const pending = unsentOuPrealerts();
-    expect(pending).toHaveLength(6);
+    expect(pending).toHaveLength(4);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
-    expect(pending.map((row) => row.ruleId)).toEqual(expect.arrayContaining([
-      "hkjc-ooo-flat-wide-line-225-250-under-watch",
-      "hkjc-ooo-flat-wide-reverse",
+    expect(pending.map((row) => row.ruleId)).not.toContain(
       "pinnacle-ouu-t5-selected-180-190-over-watch",
+    );
+    expect(pending.map((row) => row.ruleId)).not.toContain(
+      "hkjc-ooo-flat-wide-line-225-250-under-watch",
+    );
+    expect(pending.map((row) => row.ruleId)).toEqual(expect.arrayContaining([
+      "hkjc-ooo-flat-wide-reverse",
       "hkjc-ooo-t5-selected-le-180-under-watch",
     ]));
+    expect(pendingOuPrealerts(afterWatchActivation)).toHaveLength(4);
+    const prealertRetryCandidate = pending[0];
+    rawDb.prepare("UPDATE matches SET status='CANCELLED' WHERE id=?").run(
+      prealertRetryCandidate.matchId,
+    );
+    expect(pendingOuPrealerts(afterWatchActivation).map((row) => row.uniqueKey)).not.toContain(
+      prealertRetryCandidate.uniqueKey,
+    );
+    rawDb.prepare("UPDATE matches SET status='PREEVENT' WHERE id=?").run(
+      prealertRetryCandidate.matchId,
+    );
     markOuPrealertNotified(pending[0].uniqueKey, Date.now());
-    expect(unsentOuPrealerts()).toHaveLength(5);
+    expect(unsentOuPrealerts()).toHaveLength(3);
   });
 
   it("uses the rule signal-side initial odds for a U→O prealert range", () => {
@@ -297,11 +361,33 @@ describe("OU signal monitor", () => {
       "UPDATE app_state SET value=?,updated_at=? WHERE key='ou_signal_monitor_activated_at'",
     ).run(String(latestDetected - 1), latestDetected - 1);
     const pending = unsentOuSignals();
-    expect(pending).toHaveLength(5);
+    expect(pending.length).toBeGreaterThan(0);
+    expect(pending.every((row) => OU_TELEGRAM_RULE_IDS.has(row.ruleId))).toBe(true);
     expect(pending.map((row) => row.ruleId)).not.toContain("pinnacle-ouu-short-010-020-reverse");
+    expect(pending.map((row) => row.ruleId)).not.toContain(
+      "pinnacle-ouu-t5-selected-180-190-over-watch",
+    );
+    expect(pending.map((row) => row.ruleId)).not.toContain(
+      "hkjc-ooo-flat-wide-line-225-250-under-watch",
+    );
     expect(pending.map((row) => row.ruleId)).toContain("hkjc-ooo-flat-wide-reverse");
+    const globalPending = pendingOuSignals(afterWatchActivation);
+    expect(globalPending.length).toBeGreaterThanOrEqual(pending.length);
+    expect(globalPending.every((row) => OU_TELEGRAM_RULE_IDS.has(row.ruleId))).toBe(true);
+    const retryCandidate = globalPending[0];
+    rawDb.prepare("UPDATE matches SET kickoff_utc=? WHERE id=?").run(
+      afterWatchActivation - 1,
+      retryCandidate.matchId,
+    );
+    expect(pendingOuSignals(afterWatchActivation).map((row) => row.uniqueKey)).not.toContain(
+      retryCandidate.uniqueKey,
+    );
+    rawDb.prepare("UPDATE matches SET kickoff_utc=? WHERE id=?").run(
+      retryCandidate.kickoffUtc,
+      retryCandidate.matchId,
+    );
     markOuSignalNotified(pending[0].uniqueKey, latestDetected + 2);
-    expect(unsentOuSignals()).toHaveLength(4);
+    expect(unsentOuSignals()).toHaveLength(pending.length - 1);
   });
 
   it("treats an explicit empty target list as a no-op instead of replaying history", () => {
@@ -313,6 +399,8 @@ describe("OU signal monitor", () => {
     ).get();
     expect(unsentOuSignals([])).toEqual([]);
     expect(unsentOuPrealerts([])).toEqual([]);
+    pendingOuSignals(afterWatchActivation);
+    pendingOuPrealerts(afterWatchActivation);
     expect(rawDb.prepare(
       "SELECT COUNT(*) count FROM ou_signal_observations",
     ).get()).toEqual(observationCount);

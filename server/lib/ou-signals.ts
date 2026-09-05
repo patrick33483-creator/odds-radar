@@ -87,6 +87,8 @@ interface StoredPrealertRow {
   home_team: string;
   away_team: string;
   kickoff_utc: number;
+  status: string;
+  inplay: number;
 }
 
 export interface OuSignalBackfillPair {
@@ -262,10 +264,14 @@ export const OU_HIDDEN_RULE_IDS = new Set([
   "pinnacle-uoo-line-250-275-over-watch",
   "pinnacle-uuu-flat-wide-reverse",
 ]);
-/** Only hidden research rules stay silent at T-30; visible Watch rules may send candidate alerts. */
-export const OU_T30_TG_DISABLED_RULE_IDS = new Set([
-  ...OU_HIDDEN_RULE_IDS,
+/** Explicit allowlist: recorded rules not listed here never send Telegram alerts. */
+export const OU_TELEGRAM_RULE_IDS = new Set([
+  "pinnacle-uoo-short-005-010",
+  "pinnacle-ooo-short-010-020",
+  "hkjc-ooo-t5-selected-le-180-under-watch",
+  "hkjc-ooo-flat-wide-reverse",
 ]);
+const NON_PREEVENT_MATCH_STATUS = /INPLAY|LIVE|FINISHED|ENDED|ABANDON|CANCEL|POSTPONE|RESULT/i;
 
 const RULE_BY_ID = new Map(
   [...OU_SIGNAL_RULES, ...RETIRED_OU_SIGNAL_RULES].map((rule) => [rule.id, rule]),
@@ -948,16 +954,18 @@ export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
   };
 }
 
-export function unsentOuSignals(matchIds?: string[], now = Date.now()): OuSignalObservation[] {
-  // Callers that explicitly pass an empty target list mean "nothing is due",
-  // not "replay every match from the 120-day fallback window".
-  if (matchIds?.length === 0) return [];
-  const targetIds = matchIds ?? [];
-  syncOuSignalObservations(targetIds);
+function selectUnsentOuSignals(
+  targetIds: string[],
+  now: number,
+  futureOnly: boolean,
+): OuSignalObservation[] {
   const activatedAt = Number(
     (rawDb.prepare("SELECT value FROM app_state WHERE key='ou_signal_monitor_activated_at'").get() as { value: string }).value,
   );
-  const filter = targetIds.length ? `AND o.match_id IN (${targetIds.map(() => "?").join(",")})` : "";
+  const targetFilter = targetIds.length
+    ? `AND o.match_id IN (${targetIds.map(() => "?").join(",")})`
+    : "";
+  const futureFilter = futureOnly ? "AND m.kickoff_utc>? AND m.inplay=0" : "";
   const rows = rawDb.prepare(
     `SELECT o.*,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
@@ -973,43 +981,132 @@ export function unsentOuSignals(matchIds?: string[], now = Date.now()): OuSignal
       WHERE m.fixture_source IN ('hkjc','pinnacle')
         AND o.notified_at IS NULL
         AND o.backfilled_at IS NULL
-        AND o.detected_at>=? ${filter}
+        AND o.detected_at>=? ${futureFilter} ${targetFilter}
       ORDER BY o.detected_at`,
-  ).all(activatedAt, ...targetIds) as StoredSignalRow[];
+  ).all(activatedAt, ...(futureOnly ? [now] : []), ...targetIds) as StoredSignalRow[];
   return rows
+    .filter((row) => !futureOnly || !NON_PREEVENT_MATCH_STATUS.test(row.status ?? ""))
     .map((row) => toObservation(row, now))
-    .filter((row) => !OU_HIDDEN_RULE_IDS.has(row.ruleId));
+    .filter((row) => OU_TELEGRAM_RULE_IDS.has(row.ruleId));
 }
 
-export function unsentOuPrealerts(matchIds?: string[]): OuSignalPrealert[] {
-  // Preserve the no-argument maintenance scan while making an explicit empty
-  // engine target list a no-op.
+export function unsentOuSignals(matchIds?: string[], now = Date.now()): OuSignalObservation[] {
+  // Callers that explicitly pass an empty target list mean "nothing is due",
+  // not "replay every match from the 120-day fallback window".
   if (matchIds?.length === 0) return [];
   const targetIds = matchIds ?? [];
-  syncOuSignalPrealerts(targetIds);
+  syncOuSignalObservations(targetIds);
+  return selectUnsentOuSignals(targetIds, now, false);
+}
+
+/**
+ * Read the global Telegram retry queue without running a broad history sync.
+ * Past or already-started fixtures are deliberately excluded so a deployment
+ * cannot replay stale alerts.
+ */
+export function pendingOuSignals(now = Date.now()): OuSignalObservation[] {
+  return selectUnsentOuSignals([], now, true);
+}
+
+function selectUnsentOuPrealerts(
+  targetIds: string[],
+  now: number,
+  futureOnly: boolean,
+): OuSignalPrealert[] {
   const activatedAt = Number(
     (rawDb.prepare("SELECT value FROM app_state WHERE key='ou_signal_prealert_activated_at'").get() as { value: string }).value,
   );
-  const filter = targetIds.length ? `AND p.match_id IN (${targetIds.map(() => "?").join(",")})` : "";
+  const targetFilter = targetIds.length
+    ? `AND p.match_id IN (${targetIds.map(() => "?").join(",")})`
+    : "";
+  const futureFilter = futureOnly ? "AND m.kickoff_utc>? AND m.inplay=0" : "";
   const rows = rawDb.prepare(
     `SELECT p.*,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_league IS NOT NULL THEN pt.zh_league ELSE m.league END league,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_home IS NOT NULL THEN pt.zh_home ELSE m.home_team END home_team,
             CASE WHEN m.fixture_source='pinnacle' AND m.titan_id IS NULL AND pt.zh_away IS NOT NULL THEN pt.zh_away ELSE m.away_team END away_team,
-            m.kickoff_utc
+            m.kickoff_utc,m.status,m.inplay
        FROM ou_signal_prealerts p
        JOIN matches m ON m.id=p.match_id
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
-      WHERE m.fixture_source IN ('hkjc','pinnacle') AND p.notified_at IS NULL AND p.detected_at>=? ${filter}
+      WHERE m.fixture_source IN ('hkjc','pinnacle')
+        AND p.notified_at IS NULL
+        AND p.detected_at>=? ${futureFilter} ${targetFilter}
       ORDER BY p.detected_at`,
-  ).all(activatedAt, ...targetIds) as StoredPrealertRow[];
+  ).all(activatedAt, ...(futureOnly ? [now] : []), ...targetIds) as StoredPrealertRow[];
   return rows
+    .filter((row) => !futureOnly || !NON_PREEVENT_MATCH_STATUS.test(row.status ?? ""))
     .map(toPrealert)
     // A legacy row stays null when it cannot be revalidated from its immutable
     // initial snapshot. Never send that potentially false-positive candidate.
     .filter((row) => row.initialSignalOdds !== null)
-    .filter((row) => !OU_T30_TG_DISABLED_RULE_IDS.has(row.ruleId));
+    .filter((row) => OU_TELEGRAM_RULE_IDS.has(row.ruleId));
+}
+
+export function unsentOuPrealerts(matchIds?: string[], now = Date.now()): OuSignalPrealert[] {
+  // Preserve the no-argument maintenance scan while making an explicit empty
+  // engine target list a no-op.
+  if (matchIds?.length === 0) return [];
+  const targetIds = matchIds ?? [];
+  syncOuSignalPrealerts(targetIds);
+  return selectUnsentOuPrealerts(targetIds, now, false);
+}
+
+/** Read the global T-30 retry queue without triggering a history sync. */
+export function pendingOuPrealerts(now = Date.now()): OuSignalPrealert[] {
+  return selectUnsentOuPrealerts([], now, true);
+}
+
+/**
+ * Persist a drain request. Only the designated milestone worker may consume
+ * these versions; every other worker is a producer only.
+ */
+export function requestOuNotificationDrain(): number {
+  return rawDb.transaction(() => {
+    rawDb.prepare(
+      `UPDATE ou_notification_drain_state
+          SET requested_version=requested_version+1
+        WHERE singleton=1`,
+    ).run();
+    return (rawDb.prepare(
+      `SELECT requested_version
+         FROM ou_notification_drain_state WHERE singleton=1`,
+    ).get() as { requested_version: number }).requested_version;
+  }).immediate();
+}
+
+/**
+ * Complete one queue snapshot. If another worker requested a drain meanwhile,
+ * return the newer version for an immediate second pass.
+ */
+export function completeOuNotificationDrainPass(
+  processedVersion: number,
+): number | null {
+  return rawDb.transaction(() => {
+    const state = rawDb.prepare(
+      `SELECT requested_version,completed_version
+         FROM ou_notification_drain_state WHERE singleton=1`,
+    ).get() as {
+      requested_version: number;
+      completed_version: number;
+    };
+    const completedVersion = Math.max(state.completed_version, processedVersion);
+    if (state.requested_version > completedVersion) {
+      rawDb.prepare(
+        `UPDATE ou_notification_drain_state
+            SET completed_version=?
+          WHERE singleton=1`,
+      ).run(completedVersion);
+      return state.requested_version;
+    }
+    rawDb.prepare(
+      `UPDATE ou_notification_drain_state
+          SET completed_version=?
+        WHERE singleton=1`,
+    ).run(completedVersion);
+    return null;
+  }).immediate();
 }
 
 export function markOuSignalNotified(uniqueKey: string, notifiedAt = Date.now()): void {

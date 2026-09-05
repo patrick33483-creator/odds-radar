@@ -27,6 +27,7 @@ import { PinnacleProvider } from "../providers/pinnacle";
 import { OpticOddsProvider } from "../providers/opticodds";
 import { PinnapiProvider, type PinnapiFixture } from "../providers/pinnapi";
 import { HkjcProvider } from "../providers/hkjc";
+import { isMainThread, workerData } from "node:worker_threads";
 import type { ProviderPrice } from "../providers/types";
 import { formatLine, isSameHandicapRoad, lineKeyOf } from "./lines";
 import { matchEvent, normalizeName, type AliasIndex, type CandidateEvent } from "./matching";
@@ -47,7 +48,14 @@ import {
   researchStageFor,
   savePinnacleResearchInitialSnapshots,
 } from "./research";
-import { unsentOuPrealerts, unsentOuSignals } from "./ou-signals";
+import {
+  completeOuNotificationDrainPass,
+  pendingOuPrealerts,
+  pendingOuSignals,
+  requestOuNotificationDrain,
+  syncOuSignalObservations,
+  syncOuSignalPrealerts,
+} from "./ou-signals";
 import { shouldFetchTranslation, translatePinnacleFixture } from "./pinnacleTranslation";
 import {
   createWikidataEntityLookup,
@@ -723,6 +731,14 @@ interface HealthPatch {
   mode?: "live" | "degraded" | "demo";
 }
 
+export function isOuNotificationSenderProcess(
+  nodeEnv: string | undefined,
+  mainThread: boolean,
+  role: string | undefined,
+): boolean {
+  return nodeEnv !== "production" || (!mainThread && role === "milestone");
+}
+
 export class RadarEngine {
   private readonly crownFeedByMatch = new Map<string, CrownFeedObservation>();
   private readonly hkjc = new HkjcProvider();
@@ -754,13 +770,20 @@ export class RadarEngine {
   private pinnacleTranslationRefreshRunning = false;
   private researchMilestoneRunning = false;
   private lowerTierResearchController: AbortController | null = null;
+  private ouNotificationDrainRunning = false;
+  private readonly ouNotificationSender: boolean;
   // The board is a read-only projection.  Build it after a refresh and reuse
   // that immutable object for API polls so a busy provider/scan cannot make a
   // client request synchronously rebuild every market calculation.
   private dashboardCache: DashboardResponse | null = null;
   private dashboardCacheAt = 0;
 
-  constructor() {
+  constructor(opts: { ouNotificationSender?: boolean } = {}) {
+    this.ouNotificationSender = opts.ouNotificationSender ?? isOuNotificationSenderProcess(
+      process.env.NODE_ENV,
+      isMainThread,
+      workerData?.role,
+    );
     const stored = getState("lastGoodAt");
     if (stored) this.lastGoodAt = Number(stored);
     if (this.lastGoodAt) this.coldStartStage = "done";
@@ -1648,20 +1671,10 @@ export class RadarEngine {
 
     // Pinnacle-only fixtures can qualify for the OU signal path via the
     // existing prealert/observation sync (rule provider='pinnacle' only).
-    try {
-      const prealerts = unsentOuPrealerts(targets.map((t) => t.matchId));
-      const sent = await notifyOuPrealerts(prealerts);
-      if (sent) log("telegram_ou_t30_prealerts_pinnacle_only", { detected: prealerts.length, sent });
-    } catch (err) {
-      log("telegram_ou_t30_prealert_pinnacle_only_error", { error: (err as Error).message });
-    }
-    try {
-      const signals = unsentOuSignals(targets.map((t) => t.matchId));
-      const sent = await notifyOuSignals(signals);
-      if (sent) log("telegram_ou_signals_pinnacle_only", { detected: signals.length, sent });
-    } catch (err) {
-      log("telegram_ou_signal_pinnacle_only_error", { error: (err as Error).message });
-    }
+    void this.syncAndDrainOuNotifications(
+      targets.map((target) => target.matchId),
+      "pinnacle_only",
+    );
 
     log("pinnacle_only_research", {
       fixtures: targets.length,
@@ -2086,21 +2099,76 @@ export class RadarEngine {
     });
     await Promise.all(workers);
     this.pinnacleRowsSeen = rows;
-    try {
-      const prealerts = unsentOuPrealerts(targets.map((target) => target.id));
-      const sent = await notifyOuPrealerts(prealerts);
-      if (sent) log("telegram_ou_t30_prealerts", { detected: prealerts.length, sent });
-    } catch (err) {
-      log("telegram_ou_t30_prealert_error", { error: (err as Error).message });
-    }
-    try {
-      const signals = unsentOuSignals(targets.map((target) => target.id));
-      const sent = await notifyOuSignals(signals);
-      if (sent) log("telegram_ou_signals", { detected: signals.length, sent });
-    } catch (err) {
-      log("telegram_ou_signal_error", { error: (err as Error).message });
-    }
+    void this.syncAndDrainOuNotifications(
+      targets.map((target) => target.id),
+      "dense_refresh",
+    );
     return { fetched, failed, rows };
+  }
+
+  /** Materialize signals only for matches touched by the current collector. */
+  private syncOuNotifications(matchIds: string[], source: string): void {
+    const targetIds = [...new Set(matchIds)];
+    if (!targetIds.length) return;
+    try {
+      syncOuSignalPrealerts(targetIds);
+    } catch (err) {
+      log("ou_t30_prealert_sync_error", { source, error: (err as Error).message });
+    }
+    try {
+      syncOuSignalObservations(targetIds);
+    } catch (err) {
+      log("ou_signal_sync_error", { source, error: (err as Error).message });
+    }
+  }
+
+  /**
+   * Every worker materializes its own signals and durably requests a queue pass,
+   * but only the milestone worker sends. A non-takeover single-sender topology
+   * prevents a second worker from sending while the first Telegram request is
+   * suspended or in flight.
+   */
+  private async syncAndDrainOuNotifications(matchIds: string[], source: string): Promise<void> {
+    this.syncOuNotifications(matchIds, source);
+    let requestedVersion: number | null;
+    try {
+      requestedVersion = requestOuNotificationDrain();
+    } catch (err) {
+      log("ou_notification_drain_request_error", { source, error: (err as Error).message });
+      return;
+    }
+    if (!this.ouNotificationSender) return;
+    if (this.ouNotificationDrainRunning) return;
+    this.ouNotificationDrainRunning = true;
+    try {
+      do {
+        try {
+          const prealerts = pendingOuPrealerts();
+          const sent = await notifyOuPrealerts(prealerts);
+          if (sent) log("telegram_ou_t30_prealerts", { source, detected: prealerts.length, sent });
+        } catch (err) {
+          log("telegram_ou_t30_prealert_error", { source, error: (err as Error).message });
+        }
+        try {
+          const signals = pendingOuSignals();
+          const sent = await notifyOuSignals(signals);
+          if (sent) log("telegram_ou_signals", { source, detected: signals.length, sent });
+        } catch (err) {
+          log("telegram_ou_signal_error", { source, error: (err as Error).message });
+        }
+        try {
+          requestedVersion = completeOuNotificationDrainPass(requestedVersion);
+        } catch (err) {
+          log("ou_notification_drain_complete_error", {
+            source,
+            error: (err as Error).message,
+          });
+          requestedVersion = null;
+        }
+      } while (requestedVersion !== null);
+    } finally {
+      this.ouNotificationDrainRunning = false;
+    }
   }
 
   /** Matches eligible for detail polling in the given mode. */
@@ -2486,6 +2554,7 @@ export class RadarEngine {
     let fetched = 0;
     let failed = 0;
     let rows = 0;
+    const attemptedMatchIds = new Set<string>();
     const attemptedByStage = { T30: 0, T15: 0, T5: 0 };
     const attemptedBySource = { "hkjc-pinnacle": 0, "pinnacle-crown": 0 };
     const runBatch = async (
@@ -2507,6 +2576,7 @@ export class RadarEngine {
           const target = dispatchQueue[cursor++];
           if (!target) return;
           attempted++;
+          attemptedMatchIds.add(target.id);
           attemptedByStage[target.stage]++;
           attemptedBySource[target.sourceTier]++;
           const [titan, pinnapi] = await Promise.allSettled([
@@ -2591,6 +2661,10 @@ export class RadarEngine {
     };
     await runBatch(hkjcPinnacleTargets, true);
     await runBatch(pinnacleCrownTargets, hkjcPinnacleTargets.length === 0);
+    // Signal materialization happens synchronously before this async method's
+    // first await. Do not wait for Telegram delivery here: a slow notification
+    // must never keep the 30-second core milestone scheduler in flight.
+    void this.syncAndDrainOuNotifications([...attemptedMatchIds], "research_milestone");
     const selectedByStage = {
       T30: targets.filter((target) => target.stage === "T30").length,
       T15: targets.filter((target) => target.stage === "T15").length,
