@@ -41,9 +41,17 @@ const before = selectApproved.all(...pairParams) as Array<{
   backfilled_at: number | null;
   notified_at: number | null;
 }>;
-if (before.some((row) => row.backfilled_at === null)) {
-  throw new Error("Refusing to relabel a pre-existing live observation as historical");
-}
+const existingSentBefore = before.filter((row) => row.notified_at !== null).length;
+const existingBackfilledBefore = before.filter((row) => row.backfilled_at !== null).length;
+const existingUnsentBefore = before.filter(
+  (row) => row.notified_at === null && row.backfilled_at === null,
+).length;
+const existingSentPairs = before
+  .filter((row) => row.notified_at !== null)
+  .map((row) => `${row.match_id}|${row.rule_id}`);
+const adoptedUnsentPairs = before
+  .filter((row) => row.notified_at === null && row.backfilled_at === null)
+  .map((row) => `${row.match_id}|${row.rule_id}`);
 
 const backfilledAt = Date.now();
 const inserted = backfillOuSignalObservations(approved, backfilledAt);
@@ -55,8 +63,8 @@ const missing = pairs
 if (missing.length > 0 || after.length !== pairs.length) {
   throw new Error(`Backfill verification failed; missing=${missing.join(",") || "none"} total=${after.length}`);
 }
-if (after.some((row) => row.backfilled_at === null)) {
-  throw new Error("Backfill verification failed; an approved row has no backfilled_at marker");
+if (after.some((row) => row.backfilled_at === null && row.notified_at === null)) {
+  throw new Error("Backfill verification failed; an approved row remains pending");
 }
 
 const pending = rawDb.prepare(
@@ -96,7 +104,13 @@ console.log(JSON.stringify({
   batch: "confirmed-t5-20260905",
   requested: pairs.length,
   existingBefore: before.length,
+  existingSentBefore,
+  existingBackfilledBefore,
+  existingUnsentBefore,
+  existingSentPairs,
   inserted,
+  adoptedUnsent: existingUnsentBefore,
+  adoptedUnsentPairs,
   totalAfter: after.length,
   telegramPending: pending.count,
   counts,
