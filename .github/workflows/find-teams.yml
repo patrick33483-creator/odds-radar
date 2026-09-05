@@ -63,6 +63,27 @@ jobs:
           for r in pending:
               t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%Y-%m-%d %H:%M')
               print(f"  {r['id']}\t{t}\t{r['league']}\t{r['home_team']}\t{r['away_team']}\t{r['rule_ids']}\t{r['line_keys']}")
+          print("== OU_SIGNAL_RULE_SUMMARIES ==")
+          summaries = db.execute("""
+            SELECT o.rule_id,
+                   COUNT(*) observations,
+                   SUM(CASE WHEN r.home_score IS NOT NULL THEN 1 ELSE 0 END) settled,
+                   SUM(CASE WHEN r.home_score IS NOT NULL
+                                  AND (r.home_score+r.away_score) != CAST(o.line_key AS REAL)
+                            THEN 1 ELSE 0 END) decided,
+                   SUM(CASE WHEN r.home_score IS NOT NULL
+                                  AND (r.home_score+r.away_score) != CAST(o.line_key AS REAL)
+                                  AND ((o.signal_selection='O' AND (r.home_score+r.away_score) > CAST(o.line_key AS REAL))
+                                    OR (o.signal_selection='U' AND (r.home_score+r.away_score) < CAST(o.line_key AS REAL)))
+                            THEN 1 ELSE 0 END) hits
+              FROM ou_signal_observations o
+              LEFT JOIN research_results r ON r.match_id=o.match_id
+             GROUP BY o.rule_id
+             ORDER BY o.rule_id
+          """).fetchall()
+          for r in summaries:
+              rate = None if not r['decided'] else round(100*r['hits']/r['decided'], 1)
+              print(f"  {r['rule_id']}\t累積={r['observations']}\t已結算={r['settled']}\t已判定={r['decided']}\t命中={r['hits']}\t命中率={rate}")
           PYEOF
           scp /tmp/f.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/f.py"
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/f.py'
