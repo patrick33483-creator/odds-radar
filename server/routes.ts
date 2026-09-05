@@ -416,9 +416,10 @@ function buildSimulations(): SimulationsResponse {
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-  // Boot warm-up is LIGHTWEIGHT ONLY (HKJC single call + cached fixture list).
-  // It never polls per-match Pinnacle odds detail. Set RADAR_BOOTSTRAP=0 to skip.
-  if (process.env.RADAR_BOOTSTRAP !== "0") {
+  // The 30-second research scheduler performs the first refresh. Keep startup
+  // responsive by default so health checks and dashboard reads cannot collide
+  // with thousands of synchronous SQLite upserts. Bootstrap is opt-in only.
+  if (process.env.RADAR_BOOTSTRAP === "1") {
     void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
   }
   installResearchTimelineCollection();
@@ -435,11 +436,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(dash.status);
   });
 
-  // Read-only: the dashboard's automated 20 s polling must never trigger an
-  // all-match Pinnacle detail scan. A throttled lightweight fixture/HKJC
-  // refresh is allowed because it makes zero per-match detail requests.
-  app.get("/api/dashboard", async (_req, res) => {
-    void engine.refresh({ mode: "lightweight" }).catch(() => undefined);
+  // Strictly read-only: the dashboard polls every 20 seconds. Refresh work is
+  // owned by the background schedulers and explicit POST endpoints; starting
+  // it here can block the Node event loop long enough for nginx to return 504.
+  app.get("/api/dashboard", (_req, res) => {
     res.json(engine.dashboardData());
   });
 
