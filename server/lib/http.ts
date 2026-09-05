@@ -17,6 +17,7 @@ export interface FetchOpts {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
+  signal?: AbortSignal;
   timeoutMs?: number;
   retries?: number;
   retryDelayMs?: number;
@@ -26,6 +27,9 @@ export interface FetchOpts {
 
 async function once(url: string, opts: FetchOpts): Promise<{ status: number; buffer: Buffer }> {
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(opts.signal?.reason);
+  if (opts.signal?.aborted) abortFromCaller();
+  else opts.signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20_000);
   try {
     const res = await fetch(url, {
@@ -39,6 +43,7 @@ async function once(url: string, opts: FetchOpts): Promise<{ status: number; buf
     return { status: res.status, buffer };
   } finally {
     clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
@@ -53,8 +58,23 @@ export async function fetchText(url: string, opts: FetchOpts = {}): Promise<stri
       return opts.charset ? iconv.decode(buffer, opts.charset) : buffer.toString("utf8");
     } catch (err) {
       lastErr = err;
+      if (opts.signal?.aborted) throw err;
       if (attempt < retries) {
-        await new Promise((r) => setTimeout(r, (opts.retryDelayMs ?? 700) * (attempt + 1)));
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => {
+            clearTimeout(timer);
+            opts.signal?.removeEventListener("abort", onAbort);
+            reject(opts.signal?.reason instanceof Error
+              ? opts.signal.reason
+              : new DOMException("Aborted", "AbortError"));
+          };
+          const timer = setTimeout(() => {
+            opts.signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, (opts.retryDelayMs ?? 700) * (attempt + 1));
+          if (opts.signal?.aborted) onAbort();
+          else opts.signal?.addEventListener("abort", onAbort, { once: true });
+        });
       }
     }
   }

@@ -221,7 +221,14 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
 
     const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
     expect(outcome.fetched).toBe(1);
-    expect(fetchResearchPrices).toHaveBeenCalledWith("3085657");
+    expect(fetchResearchPrices).toHaveBeenCalledWith(
+      "3085657",
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        timeoutMs: 4_000,
+        retries: 0,
+      }),
+    );
     expect(rawDb.prepare(
       "SELECT league,home_team,away_team FROM matches WHERE id='pinnacle:titan:3085657'",
     ).get()).toEqual({
@@ -296,7 +303,14 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
 
     const t30 = await radar.refreshPinnacleOnlyResearch(NOW);
     expect(t30).toMatchObject({ fixtures: 1, fetched: 1, failed: 0, rows: 1 });
-    expect(fetchPinnapi).toHaveBeenCalledWith("pinnapi-safe-event");
+    expect(fetchPinnapi).toHaveBeenCalledWith(
+      "pinnapi-safe-event",
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        timeoutMs: 4_000,
+        retries: 0,
+      }),
+    );
     expect(rawDb.prepare(
       "SELECT pinnapi_id,pinnapi_reversed,titan_id FROM pinnacle_source_map WHERE match_id=?",
     ).get(matchId)).toEqual({
@@ -441,7 +455,14 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
 
     const outcome = await radar.refreshPinnacleOnlyResearch(NOW);
     expect(outcome).toMatchObject({ fixtures: 1, fetched: 1, failed: 0, rows: 1 });
-    expect(fetchPinnapi).toHaveBeenCalledWith(pinnapiId);
+    expect(fetchPinnapi).toHaveBeenCalledWith(
+      pinnapiId,
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        timeoutMs: 4_000,
+        retries: 0,
+      }),
+    );
     expect(rawDb.prepare(
       `SELECT fixture_source,titan_id,league,home_team,away_team
          FROM matches WHERE id=?`,
@@ -497,7 +518,14 @@ describe("Pinnacle-only fixture identity + snapshots", () => {
     };
     await radar.refreshPinnacleOnlyResearch(NOW + 15 * 60_000);
     expect(fetchPinnapi).toHaveBeenCalledTimes(2);
-    expect(fetchPinnapi).toHaveBeenLastCalledWith(pinnapiId);
+    expect(fetchPinnapi).toHaveBeenLastCalledWith(
+      pinnapiId,
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        timeoutMs: 4_000,
+        retries: 0,
+      }),
+    );
     expect(rawDb.prepare(
       `SELECT DISTINCT stage FROM research_timeline_snapshots
         WHERE match_id=? ORDER BY stage`,
