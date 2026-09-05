@@ -29,6 +29,9 @@ jobs:
           sudo docker compose exec -T radar node dist/export-signal-features-20260906.cjs
           REMOTE
           wc -c export.log
+          # Also stream to the job log: artifact download needs a token scope
+          # the analysis side does not have.
+          cat export.log
 
       - name: 上載匯出結果
         uses: actions/upload-artifact@v4
