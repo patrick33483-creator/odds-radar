@@ -52,6 +52,7 @@ async function buildAll() {
       "export-signal-features-20260906": "scripts/export-signal-features-20260906.ts",
       "audit-corner-results-20260906": "scripts/audit-corner-results-20260906.ts",
       "backfill-corner-results-20260906": "scripts/backfill-corner-results-20260906.ts",
+      "backfill-corner-results-titan": "scripts/backfill-corner-results-titan.ts",
     },
     platform: "node",
     bundle: true,

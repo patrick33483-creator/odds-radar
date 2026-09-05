@@ -11,8 +11,10 @@ on:
         options:
           - audit
           - backfill
+          - titan-audit
+          - titan-backfill
       confirmation:
-        description: "回補確認碼（backfill 時必填）"
+        description: "回補確認碼（backfill / titan-backfill 時必填）"
         required: false
         default: ""
       days:
@@ -68,4 +70,45 @@ jobs:
             -e CORNER_BACKFILL_CONFIRMATION="$CONFIRMATION" \
             -e CORNER_BACKFILL_DAYS="$DAYS" \
             radar node dist/backfill-corner-results-20260906.cjs
+          REMOTE
+
+      - name: 稽核球探角球可回補率（只讀）
+        if: ${{ inputs.mode == 'titan-audit' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DAYS: ${{ inputs.days }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+            "$DEPLOY_USER@$DEPLOY_HOST" "DAYS='$DAYS' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          sudo docker compose exec -T \
+            -e CORNER_TITAN_MODE=audit \
+            -e CORNER_TITAN_DAYS="$DAYS" \
+            radar node dist/backfill-corner-results-titan.cjs
+          REMOTE
+
+      - name: 由球探網回補角球賽果
+        if: ${{ inputs.mode == 'titan-backfill' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DAYS: ${{ inputs.days }}
+        run: |
+          if [ "$CONFIRMATION" != "BACKFILL_CONFIRMED_TITAN_CORNERS_20260906" ]; then
+            echo "缺少或錯誤的確認碼" >&2
+            exit 1
+          fi
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "CONFIRMATION='$CONFIRMATION' DAYS='$DAYS' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+          sudo docker compose exec -T \
+            -e CORNER_TITAN_MODE=backfill \
+            -e CORNER_TITAN_CONFIRMATION="$CONFIRMATION" \
+            -e CORNER_TITAN_DAYS="$DAYS" \
+            radar node dist/backfill-corner-results-titan.cjs
           REMOTE
