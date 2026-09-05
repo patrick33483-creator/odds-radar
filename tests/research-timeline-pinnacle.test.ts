@@ -365,17 +365,72 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     });
 
     await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
-      selected: 2,
+      selected: 1,
       selectedHkjcPinnacle: 1,
+      selectedPinnacleCrown: 0,
+      attempted: 1,
+      fetched: 1,
+    });
+    await expect(engine.runResearchLowerMilestoneTick()).resolves.toMatchObject({
+      selectedHkjcPinnacle: 0,
       selectedPinnacleCrown: 1,
-      attempted: 2,
-      fetched: 2,
+      attempted: 1,
+      fetched: 1,
     });
     expect(requested).toEqual(["hkjc:priority-t30", "crown:crown-t5"]);
+    expect(notificationDrain).toHaveBeenCalledWith(["hkjc:priority-t30"], "research_milestone");
     expect(notificationDrain).toHaveBeenCalledWith(
-      expect.arrayContaining(["hkjc:priority-t30", "pinnacle:crown-t5"]),
-      "research_milestone",
+      ["pinnacle:crown-t5"],
+      "research_milestone_lower_tier",
+      true,
     );
+  });
+
+  it("guarantees a bounded Pinnacle + Crown wave after tier 1 exhausts the normal deadline", async () => {
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(NOW)
+      .mockReturnValue(NOW + 20_001);
+    addHkjcFixture("hkjc:deadline-priority", NOW + 20 * 60_000, "pinnapi:deadline-priority", {
+      pinnapiId: "deadline-priority",
+    });
+    for (let i = 0; i < RESEARCH_MILESTONE_CONCURRENCY + 2; i++) {
+      addPinnacleFixture(
+        `pinnacle:deadline-crown-${i}`,
+        NOW + 4 * 60_000,
+        `deadline-crown-${i}`,
+      );
+    }
+    const engine = new RadarEngine();
+    vi.spyOn(engine as any, "syncAndDrainOuNotifications").mockResolvedValue(undefined);
+    (engine as any).pinnapi.fetchMatchPrices = vi.fn().mockResolvedValue(currentAhOu());
+    const fetchTitan = vi.fn().mockResolvedValue({
+      opening: [],
+      current: currentAhOu(),
+      sourceUrls: { AH: "ah", OU: "ou" },
+    });
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = fetchTitan;
+
+    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selectedHkjcPinnacle: 1,
+      selectedPinnacleCrown: 0,
+      attemptedBySource: {
+        "hkjc-pinnacle": 1,
+        "pinnacle-crown": 0,
+      },
+      deadlineSkippedBySource: {
+        "hkjc-pinnacle": 0,
+        "pinnacle-crown": 0,
+      },
+    });
+    await expect(engine.runResearchLowerMilestoneTick()).resolves.toMatchObject({
+      selectedHkjcPinnacle: 0,
+      selectedPinnacleCrown: RESEARCH_MILESTONE_CONCURRENCY,
+      attemptedBySource: {
+        "hkjc-pinnacle": 0,
+        "pinnacle-crown": RESEARCH_MILESTONE_CONCURRENCY,
+      },
+    });
+    expect(fetchTitan).toHaveBeenCalledTimes(RESEARCH_MILESTONE_CONCURRENCY);
   });
 
   it("aborts an in-flight lower-tier Titan request when the core milestone starts", async () => {
@@ -432,7 +487,7 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     await started;
     await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
       selectedHkjcPinnacle: 1,
-      fetched: 2,
+      fetched: 1,
     });
     await expect(lowerTierRun).resolves.toMatchObject({ fetched: 0 });
     expect(lowerSignal?.aborted).toBe(true);
@@ -497,7 +552,7 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     await started;
     await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
       selectedHkjcPinnacle: 1,
-      fetched: 2,
+      fetched: 1,
     });
     await expect(lowerTierRun).resolves.toMatchObject({ fetched: 0 });
     expect(fallbackSignal?.aborted).toBe(true);
@@ -517,7 +572,7 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
     const refreshHkjc = vi.spyOn(engine as any, "refreshHkjc");
     const refreshFixtures = vi.spyOn(engine as any, "refreshPinnacleFixtures");
 
-    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+    await expect(engine.runResearchLowerMilestoneTick()).resolves.toMatchObject({
       selected: 1,
       attempted: 1,
       fetched: 1,
@@ -525,10 +580,10 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
       rows: 4,
     });
 
-    expect(fetchTitan).toHaveBeenCalledWith("fast-t5", {
+    expect(fetchTitan).toHaveBeenCalledWith("fast-t5", expect.objectContaining({
       timeoutMs: 4_000,
-      retries: 1,
-    });
+      retries: 0,
+    }));
     expect(refreshHkjc).not.toHaveBeenCalled();
     expect(refreshFixtures).not.toHaveBeenCalled();
     expect(capturedMarkets(matchId)).toEqual([
@@ -550,7 +605,7 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
       sourceUrls: { AH: "ah", OU: "ou" },
     });
 
-    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+    await expect(engine.runResearchLowerMilestoneTick()).resolves.toMatchObject({
       selected: 1,
       attempted: 1,
       fetched: 0,
@@ -617,10 +672,10 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
       };
     });
 
-    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
+    await expect(engine.runResearchLowerMilestoneTick()).resolves.toMatchObject({
       selected: 15,
-      attempted: 15,
-      fetched: 15,
+      attempted: RESEARCH_MILESTONE_CONCURRENCY - 1,
+      fetched: RESEARCH_MILESTONE_CONCURRENCY - 1,
     });
     // T5 keeps the largest dispatch share, while T15/T30 are interleaved into
     // the first worker wave so an upstream slowdown cannot strand them.
@@ -643,11 +698,166 @@ describe("runResearchMilestoneTick fast checkpoint collector", () => {
       sourceUrls: { AH: "ah", OU: "ou" },
     });
 
-    await expect(engine.runResearchMilestoneTick()).resolves.toMatchObject({
-      selected: 60,
-      attempted: 60,
-      fetched: 60,
+    await expect(engine.runResearchLowerMilestoneTick()).resolves.toMatchObject({
+      selected: RESEARCH_MILESTONE_CONCURRENCY,
+      attempted: RESEARCH_MILESTONE_CONCURRENCY,
+      fetched: RESEARCH_MILESTONE_CONCURRENCY,
     });
+    expect((engine as any).pinnacle.fetchPinnacleResearchPrices)
+      .toHaveBeenCalledTimes(RESEARCH_MILESTONE_CONCURRENCY);
+  });
+
+  it("rotates disposable one-worker lower-tier waves across T5, T15 and T30", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const previous = process.env.RADAR_MILESTONE_CONCURRENCY;
+    process.env.RADAR_MILESTONE_CONCURRENCY = "1";
+    addPinnacleFixture("pinnacle:rotate-t5-a", NOW + 3 * 60_000, "rotate-t5-a");
+    addPinnacleFixture("pinnacle:rotate-t5-b", NOW + 4 * 60_000, "rotate-t5-b");
+    addPinnacleFixture("pinnacle:rotate-t15", NOW + 10 * 60_000, "rotate-t15");
+    addPinnacleFixture("pinnacle:rotate-t30", NOW + 20 * 60_000, "rotate-t30");
+    const requested: string[] = [];
+
+    try {
+      for (let i = 0; i < 4; i++) {
+        // Production creates a fresh disposable worker for each lower cycle,
+        // so fairness must come from the owner-provided offset rather than
+        // mutable state retained by one RadarEngine instance.
+        const engine = new RadarEngine();
+        (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn(async (id: string) => {
+          requested.push(id);
+          throw new Error("simulated provider failure");
+        });
+        await engine.runResearchLowerMilestoneTick(i);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.RADAR_MILESTONE_CONCURRENCY;
+      else process.env.RADAR_MILESTONE_CONCURRENCY = previous;
+    }
+    expect(requested).toEqual([
+      "rotate-t5-a",
+      "rotate-t5-b",
+      "rotate-t15",
+      "rotate-t30",
+    ]);
+  });
+
+  it("advances disposable lower-tier offsets by a whole concurrent wave", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const previous = process.env.RADAR_MILESTONE_CONCURRENCY;
+    process.env.RADAR_MILESTONE_CONCURRENCY = "4";
+    for (let i = 0; i < 8; i++) {
+      addPinnacleFixture(
+        `pinnacle:wave-${i}`,
+        NOW + (3 * 60_000) + i * 1_000,
+        `wave-${i}`,
+      );
+    }
+    const requested: string[] = [];
+
+    try {
+      for (let sequence = 0; sequence < 2; sequence++) {
+        const engine = new RadarEngine();
+        (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn(async (id: string) => {
+          requested.push(id);
+          throw new Error("simulated provider failure");
+        });
+        await engine.runResearchLowerMilestoneTick(sequence);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.RADAR_MILESTONE_CONCURRENCY;
+      else process.env.RADAR_MILESTONE_CONCURRENCY = previous;
+    }
+
+    expect(requested).toEqual([
+      "wave-0",
+      "wave-1",
+      "wave-2",
+      "wave-3",
+      "wave-4",
+      "wave-5",
+      "wave-6",
+      "wave-7",
+    ]);
+  });
+
+  it("keeps a stalled lower worker from blocking an independent core worker", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    addPinnacleFixture("pinnacle:detached-stall", NOW + 4 * 60_000, "detached-stall");
+    const lowerEngine = new RadarEngine();
+    const coreEngine = new RadarEngine();
+    vi.spyOn(lowerEngine as any, "syncAndDrainOuNotifications").mockResolvedValue(undefined);
+    vi.spyOn(coreEngine as any, "syncAndDrainOuNotifications").mockResolvedValue(undefined);
+    let markStarted!: () => void;
+    const lowerStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    const fetchTitan = vi.fn()
+      .mockImplementationOnce(() => {
+        markStarted();
+        return new Promise(() => undefined);
+      })
+      .mockResolvedValue({
+        opening: [],
+        current: currentAhOu(),
+        sourceUrls: { AH: "ah", OU: "ou" },
+      });
+    (lowerEngine as any).pinnacle.fetchPinnacleResearchPrices = fetchTitan;
+    (coreEngine as any).pinnapi.fetchMatchPrices = vi.fn().mockResolvedValue(currentAhOu());
+
+    void lowerEngine.runResearchLowerMilestoneTick();
+    await lowerStarted;
+
+    addHkjcFixture("hkjc:next-core", NOW + 20 * 60_000, "pinnapi:next-core", {
+      pinnapiId: "next-core",
+    });
+    await expect(coreEngine.runResearchMilestoneTick()).resolves.toMatchObject({
+      selectedHkjcPinnacle: 1,
+      attempted: 1,
+      fetched: 1,
+    });
+  });
+
+  it("fails lower-tier SQLite capture fast under writer contention and restores the timeout", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    addPinnacleFixture("pinnacle:locked-write", NOW + 4 * 60_000, "locked-write");
+    const BetterSqlite3 = (await import("better-sqlite3")).default;
+    const blocker = new BetterSqlite3(dbPath);
+    blocker.pragma("journal_mode = WAL");
+    blocker.pragma("busy_timeout = 1");
+    const engine = new RadarEngine();
+    let releaseProvider!: (value: {
+      opening: never[];
+      current: ReturnType<typeof currentAhOu>;
+      sourceUrls: { AH: string; OU: string };
+    }) => void;
+    let markProviderStarted!: () => void;
+    const providerStarted = new Promise<void>((resolve) => { markProviderStarted = resolve; });
+    (engine as any).pinnacle.fetchPinnacleResearchPrices = vi.fn().mockReturnValue(new Promise(
+      (resolve) => {
+        releaseProvider = resolve;
+        markProviderStarted();
+      },
+    ));
+
+    try {
+      const lowerRun = engine.runResearchLowerMilestoneTick();
+      await providerStarted;
+      blocker.exec("BEGIN IMMEDIATE");
+      const started = process.hrtime.bigint();
+      releaseProvider({
+        opening: [],
+        current: currentAhOu(),
+        sourceUrls: { AH: "ah", OU: "ou" },
+      });
+      await lowerRun;
+      const elapsedMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+      expect(elapsedMs).toBeLessThan(1_000);
+      expect(rawDb.pragma("busy_timeout", { simple: true })).toBe(5_000);
+      expect(rawDb.prepare(
+        "SELECT COUNT(*) count FROM research_timeline_snapshots WHERE match_id=?",
+      ).get("pinnacle:locked-write")).toEqual({ count: 0 });
+    } finally {
+      if (blocker.inTransaction) blocker.exec("ROLLBACK");
+      blocker.close();
+    }
   });
 });
 
@@ -744,6 +954,23 @@ describe("source-tier allocation", () => {
       "pinnacle-crown",
       "pinnacle-crown",
     ]);
+  });
+
+  it("adds a lower-tier floor without taking capacity away from HKJC + Pinnacle", () => {
+    const targets = [
+      ...make("hkjc-pinnacle", "T5", 10),
+      ...make("pinnacle-crown", "T5", 2),
+      ...make("pinnacle-crown", "T15", 2),
+      ...make("pinnacle-crown", "T30", 1),
+    ];
+    const picked = allocateMilestoneTargetsBySource(targets, 10, 4);
+    const core = picked.filter((target) => target.sourceTier === "hkjc-pinnacle");
+    const lower = picked.filter((target) => target.sourceTier === "pinnacle-crown");
+
+    expect(core).toHaveLength(10);
+    expect(lower).toHaveLength(4);
+    expect(lower.map((target) => target.stage))
+      .toEqual(expect.arrayContaining(["T5", "T15", "T30"]));
   });
 
   it("dispatches T15 and T30 in the first worker wave", () => {

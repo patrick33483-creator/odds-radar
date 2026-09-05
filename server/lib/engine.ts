@@ -145,11 +145,13 @@ const MAX_RESEARCH_TIMELINE_DETAIL_TARGETS = 100;
 /**
  * One provider request inside a milestone tick. Kept short on purpose: a slow
  * upstream must not consume a capacity slot that another fixture in the same
- * T30/T15/T5 window still needs. A single retry recovers transient peak-hour
- * failures without letting the worst case exceed 2 x timeout per provider.
+ * T30/T15/T5 window still needs. The next 30-second scheduler tick is the
+ * retry, so one slow target cannot occupy a worker for two timeout periods.
  */
 export const RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS = 4_000;
-export const RESEARCH_MILESTONE_REQUEST_RETRIES = 1;
+// The 30-second scheduler is the retry. Retrying inside one target can double
+// its occupancy and make a whole stage expire before another fixture starts.
+export const RESEARCH_MILESTONE_REQUEST_RETRIES = 0;
 /**
  * Capacity floor for one milestone tick. The previous hard cap of 12 fixtures
  * per 30-second tick throttled the whole collector to 24 fixtures/minute,
@@ -240,8 +242,10 @@ export type ResearchMilestoneSourceTier = "hkjc-pinnacle" | "pinnacle-crown";
  *   1. HKJC + Pinnacle common fixtures
  *   2. Pinnacle + Crown common fixtures
  *
- * Stage fairness is still preserved inside each source tier. A lower tier can
- * only consume capacity left after the higher tier has been fully allocated.
+ * Stage fairness is still preserved inside each source tier. A lower tier
+ * normally consumes only capacity left after the higher tier has been fully
+ * allocated. Callers may add a supplemental lower-tier floor that does not
+ * remove any higher-tier selection.
  */
 export function allocateMilestoneTargetsBySource<
   T extends {
@@ -251,16 +255,34 @@ export function allocateMilestoneTargetsBySource<
 >(
   targets: readonly T[],
   capacity: number,
+  lowerTierFloor = 0,
 ): T[] {
   if (capacity <= 0) return [];
   const selected: T[] = [];
-  for (const sourceTier of ["hkjc-pinnacle", "pinnacle-crown"] as const) {
-    const remaining = capacity - selected.length;
-    if (remaining <= 0) break;
-    selected.push(...allocateMilestoneTargets(
-      targets.filter((target) => target.sourceTier === sourceTier),
-      remaining,
-    ));
+  const coreTargets = targets.filter((target) => target.sourceTier === "hkjc-pinnacle");
+  const lowerTargets = targets.filter((target) => target.sourceTier === "pinnacle-crown");
+  selected.push(...allocateMilestoneTargets(coreTargets, capacity));
+
+  const normalLowerCapacity = Math.max(0, capacity - selected.length);
+  const normalLower = allocateMilestoneTargets(lowerTargets, normalLowerCapacity);
+  selected.push(...normalLower);
+
+  // A supplemental lower-tier floor never takes a slot away from the core
+  // allocation. It only makes enough additional targets visible for the
+  // bounded post-core worker wave, preventing permanent starvation when the
+  // core alone fills the normal selection ceiling.
+  const desiredLower = Math.min(
+    lowerTargets.length,
+    Math.max(normalLower.length, Math.max(0, lowerTierFloor)),
+  );
+  if (normalLower.length < desiredLower) {
+    const selectedLower = new Set(normalLower);
+    for (const target of allocateMilestoneTargets(lowerTargets, desiredLower)) {
+      if (selectedLower.has(target)) continue;
+      selected.push(target);
+      selectedLower.add(target);
+      if (selectedLower.size >= desiredLower) break;
+    }
   }
   return selected;
 }
@@ -770,6 +792,8 @@ export class RadarEngine {
   private pinnacleTranslationRefreshRunning = false;
   private researchMilestoneRunning = false;
   private lowerTierResearchController: AbortController | null = null;
+  /** Rotates the single lower-tier wave so low concurrency cannot starve T15/T30. */
+  private lowerMilestoneDispatchOffset = 0;
   private ouNotificationDrainRunning = false;
   private readonly ouNotificationSender: boolean;
   // The board is a read-only projection.  Build it after a refresh and reuse
@@ -2128,14 +2152,26 @@ export class RadarEngine {
    * prevents a second worker from sending while the first Telegram request is
    * suspended or in flight.
    */
-  private async syncAndDrainOuNotifications(matchIds: string[], source: string): Promise<void> {
-    this.syncOuNotifications(matchIds, source);
+  private async syncAndDrainOuNotifications(
+    matchIds: string[],
+    source: string,
+    failFastDb = false,
+  ): Promise<void> {
+    const originalBusyTimeout = failFastDb
+      ? rawDb.pragma("busy_timeout", { simple: true }) as number
+      : null;
+    if (originalBusyTimeout !== null) rawDb.pragma("busy_timeout = 0");
     let requestedVersion: number | null;
     try {
+      this.syncOuNotifications(matchIds, source);
       requestedVersion = requestOuNotificationDrain();
     } catch (err) {
       log("ou_notification_drain_request_error", { source, error: (err as Error).message });
       return;
+    } finally {
+      if (originalBusyTimeout !== null) {
+        rawDb.pragma(`busy_timeout = ${originalBusyTimeout}`);
+      }
     }
     if (!this.ouNotificationSender) return;
     if (this.ouNotificationDrainRunning) return;
@@ -2418,13 +2454,21 @@ export class RadarEngine {
     this.lowerTierResearchController?.abort();
     this.lowerTierResearchController = null;
     try {
-      return await this.collectResearchMilestoneTick();
+      return await this.collectResearchMilestoneTick("core");
     } finally {
       this.researchMilestoneRunning = false;
     }
   }
 
-  private async collectResearchMilestoneTick(): Promise<{
+  /** Runs in the isolated lower-milestone worker in production. */
+  async runResearchLowerMilestoneTick(dispatchOffset?: number) {
+    return this.collectResearchMilestoneTick("lower", dispatchOffset);
+  }
+
+  private async collectResearchMilestoneTick(
+    mode: "core" | "lower",
+    lowerDispatchOffset?: number,
+  ): Promise<{
     selected: number;
     selectedHkjcPinnacle: number;
     selectedPinnacleCrown: number;
@@ -2543,56 +2587,95 @@ export class RadarEngine {
         missingMarkets,
       }];
     });
-    const targets = allocateMilestoneTargetsBySource(
-      eligible.sort((a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc),
-      researchMilestoneCapacity(candidates.length),
+    const sortedEligible = eligible.sort(
+      (a, b) => priority[a.stage] - priority[b.stage] || a.kickoffUtc - b.kickoffUtc,
     );
+    const capacity = researchMilestoneCapacity(candidates.length);
+    let targets: Target[];
+    if (mode === "core") {
+      targets = allocateMilestoneTargets(
+        sortedEligible.filter((target) => target.sourceTier === "hkjc-pinnacle"),
+        capacity,
+      );
+    } else {
+      const lowerQueue = orderMilestoneTargetsForDispatch(
+        sortedEligible.filter((target) => target.sourceTier === "pinnacle-crown"),
+      );
+      const waveSize = researchMilestoneConcurrency(lowerQueue.length);
+      const offsetBase = lowerDispatchOffset === undefined
+        ? this.lowerMilestoneDispatchOffset
+        : lowerDispatchOffset * Math.max(1, waveSize);
+      const offset = lowerQueue.length
+        ? offsetBase % lowerQueue.length
+        : 0;
+      const rotated = [...lowerQueue.slice(offset), ...lowerQueue.slice(0, offset)];
+      targets = rotated.slice(0, waveSize);
+      if (lowerDispatchOffset === undefined) {
+        this.lowerMilestoneDispatchOffset += targets.length;
+      }
+    }
     const hkjcPinnacleTargets = targets.filter((target) => target.sourceTier === "hkjc-pinnacle");
     const pinnacleCrownTargets = targets.filter((target) => target.sourceTier === "pinnacle-crown");
 
-    let attempted = 0;
-    let fetched = 0;
-    let failed = 0;
-    let rows = 0;
-    const attemptedMatchIds = new Set<string>();
-    const attemptedByStage = { T30: 0, T15: 0, T5: 0 };
-    const attemptedBySource = { "hkjc-pinnacle": 0, "pinnacle-crown": 0 };
+    type BatchStats = {
+      attempted: number;
+      fetched: number;
+      failed: number;
+      rows: number;
+      attemptedMatchIds: Set<string>;
+      attemptedByStage: Record<"T30" | "T15" | "T5", number>;
+    };
     const runBatch = async (
       batch: readonly Target[],
-      allowFirstPastDeadline: boolean,
-    ): Promise<void> => {
+      minimumStartsAfterDeadline: number,
+      signal?: AbortSignal,
+    ): Promise<BatchStats> => {
+      const stats: BatchStats = {
+        attempted: 0,
+        fetched: 0,
+        failed: 0,
+        rows: 0,
+        attemptedMatchIds: new Set<string>(),
+        attemptedByStage: { T30: 0, T15: 0, T5: 0 },
+      };
       const dispatchQueue = orderMilestoneTargetsForDispatch(batch);
+      const workerCount = researchMilestoneConcurrency(batch.length);
       let cursor = 0;
       const worker = async (): Promise<void> => {
         while (true) {
+          if (signal?.aborted) return;
           // HKJC + Pinnacle owns the first pass. The lower-priority
-          // Pinnacle + Crown batch is never allowed to start after the tick
-          // budget has expired, so slow Crown-linked work cannot extend or
-          // displace the core HKJC collection.
+          // Pinnacle + Crown batch starts only after that pass settles. Once
+          // the normal tick budget expires, cap dispatch at a bounded minimum
+          // instead of starving the lower tier forever. Its provider calls
+          // retain the same short hard timeout, so this guaranteed first wave
+          // cannot turn Crown-linked work into an unbounded blocker.
           if (
             Date.now() - startedAt > RESEARCH_MILESTONE_LOOP_MS
-            && (!allowFirstPastDeadline || cursor > 0)
+            && cursor >= minimumStartsAfterDeadline
           ) return;
           const target = dispatchQueue[cursor++];
           if (!target) return;
-          attempted++;
-          attemptedMatchIds.add(target.id);
-          attemptedByStage[target.stage]++;
-          attemptedBySource[target.sourceTier]++;
+          stats.attempted++;
+          stats.attemptedMatchIds.add(target.id);
+          stats.attemptedByStage[target.stage]++;
           const [titan, pinnapi] = await Promise.allSettled([
             target.titanId
               ? this.pinnacle.fetchPinnacleResearchPrices(target.titanId, {
+                  signal,
                   timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
                   retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
                 }).then((value) => ({ prices: value.current, completedAt: Date.now() }))
               : Promise.resolve(null),
             target.pinnapiId
               ? this.pinnapi.fetchMatchPrices(target.pinnapiId, {
+                  signal,
                   timeoutMs: RESEARCH_MILESTONE_REQUEST_TIMEOUT_MS,
                   retries: RESEARCH_MILESTONE_REQUEST_RETRIES,
                 }).then((prices) => ({ prices, completedAt: Date.now() }))
               : Promise.resolve(null),
           ]);
+          if (signal?.aborted) return;
           const titanResult = titan.status === "fulfilled" && titan.value
             ? {
                 prices: target.titanReversed
@@ -2617,54 +2700,83 @@ export class RadarEngine {
             ? [pinnapiResult, titanResult]
             : [titanResult, pinnapiResult];
           let insertedForTarget = 0;
-          for (const market of target.missingMarkets) {
-            const chosen = preferred.find((result) => {
-              if (!result) return false;
-              const selections = new Set(
-                result.prices
-                  .filter((price) => price.market === market)
-                  .map((price) => price.selection),
+          const originalBusyTimeout = target.sourceTier === "pinnacle-crown"
+            ? rawDb.pragma("busy_timeout", { simple: true }) as number
+            : null;
+          if (originalBusyTimeout !== null) rawDb.pragma("busy_timeout = 0");
+          try {
+            for (const market of target.missingMarkets) {
+              const chosen = preferred.find((result) => {
+                if (!result) return false;
+                const selections = new Set(
+                  result.prices
+                    .filter((price) => price.market === market)
+                    .map((price) => price.selection),
+                );
+                return market === "AH"
+                  ? selections.has("H") && selections.has("A")
+                  : selections.has("O") && selections.has("U");
+              });
+              if (!chosen) continue;
+              const completedStage = researchStageFor(target.kickoffUtc, chosen.completedAt);
+              if (
+                !completedStage
+                || completePairs.has(`${target.id}:${completedStage}:${market}`)
+              ) continue;
+              insertedForTarget += captureResearchTimelinePrices(
+                target.id,
+                "pinnacle",
+                chosen.prices.filter((price) => price.market === market),
+                target.kickoffUtc,
+                chosen.completedAt,
+                {
+                  sourceName: chosen.sourceName,
+                  sourceMatchId: chosen.sourceMatchId,
+                },
               );
-              return market === "AH"
-                ? selections.has("H") && selections.has("A")
-                : selections.has("O") && selections.has("U");
+            }
+          } catch (err) {
+            log("research_milestone_capture_error", {
+              matchId: target.id,
+              sourceTier: target.sourceTier,
+              error: (err as Error).message,
             });
-            if (!chosen) continue;
-            const completedStage = researchStageFor(target.kickoffUtc, chosen.completedAt);
-            if (
-              !completedStage
-              || completePairs.has(`${target.id}:${completedStage}:${market}`)
-            ) continue;
-            insertedForTarget += captureResearchTimelinePrices(
-              target.id,
-              "pinnacle",
-              chosen.prices.filter((price) => price.market === market),
-              target.kickoffUtc,
-              chosen.completedAt,
-              {
-                sourceName: chosen.sourceName,
-                sourceMatchId: chosen.sourceMatchId,
-              },
-            );
+          } finally {
+            if (originalBusyTimeout !== null) {
+              rawDb.pragma(`busy_timeout = ${originalBusyTimeout}`);
+            }
           }
           if (!insertedForTarget) {
-            failed++;
+            stats.failed++;
             continue;
           }
-          fetched++;
-          rows += insertedForTarget;
+          stats.fetched++;
+          stats.rows += insertedForTarget;
         }
       }
       await Promise.all(
-        Array.from({ length: researchMilestoneConcurrency(batch.length) }, () => worker()),
+        Array.from({ length: workerCount }, () => worker()),
       );
+      return stats;
     };
-    await runBatch(hkjcPinnacleTargets, true);
-    await runBatch(pinnacleCrownTargets, hkjcPinnacleTargets.length === 0);
-    // Signal materialization happens synchronously before this async method's
-    // first await. Do not wait for Telegram delivery here: a slow notification
-    // must never keep the 30-second core milestone scheduler in flight.
-    void this.syncAndDrainOuNotifications([...attemptedMatchIds], "research_milestone");
+    const minimumStarts = mode === "core"
+      ? researchMilestoneConcurrency(targets.length)
+      : targets.length;
+    const stats = await runBatch(targets, minimumStarts);
+    const notificationSource = mode === "core"
+      ? "research_milestone"
+      : "research_milestone_lower_tier";
+    if (mode === "core") {
+      // Do not await Telegram delivery in the latency-sensitive core worker.
+      void this.syncAndDrainOuNotifications([...stats.attemptedMatchIds], notificationSource);
+    } else {
+      // This process is not a sender in production; fail fast on DB contention.
+      await this.syncAndDrainOuNotifications(
+        [...stats.attemptedMatchIds],
+        notificationSource,
+        true,
+      );
+    }
     const selectedByStage = {
       T30: targets.filter((target) => target.stage === "T30").length,
       T15: targets.filter((target) => target.stage === "T15").length,
@@ -2676,21 +2788,26 @@ export class RadarEngine {
       selectedPinnacleCrown: pinnacleCrownTargets.length,
       unmapped,
       alreadyComplete,
-      attempted,
-      fetched,
-      failed,
-      rows,
+      attempted: stats.attempted,
+      fetched: stats.fetched,
+      failed: stats.failed,
+      rows: stats.rows,
       runtimeMs: Date.now() - startedAt,
-      attemptedByStage,
+      attemptedByStage: stats.attemptedByStage,
       deadlineSkippedByStage: {
-        T30: selectedByStage.T30 - attemptedByStage.T30,
-        T15: selectedByStage.T15 - attemptedByStage.T15,
-        T5: selectedByStage.T5 - attemptedByStage.T5,
+        T30: selectedByStage.T30 - stats.attemptedByStage.T30,
+        T15: selectedByStage.T15 - stats.attemptedByStage.T15,
+        T5: selectedByStage.T5 - stats.attemptedByStage.T5,
       },
-      attemptedBySource,
+      attemptedBySource: {
+        "hkjc-pinnacle": mode === "core" ? stats.attempted : 0,
+        "pinnacle-crown": mode === "lower" ? stats.attempted : 0,
+      },
       deadlineSkippedBySource: {
-        "hkjc-pinnacle": hkjcPinnacleTargets.length - attemptedBySource["hkjc-pinnacle"],
-        "pinnacle-crown": pinnacleCrownTargets.length - attemptedBySource["pinnacle-crown"],
+        "hkjc-pinnacle": hkjcPinnacleTargets.length
+          - (mode === "core" ? stats.attempted : 0),
+        "pinnacle-crown": pinnacleCrownTargets.length
+          - (mode === "lower" ? stats.attempted : 0),
       },
     };
   }
