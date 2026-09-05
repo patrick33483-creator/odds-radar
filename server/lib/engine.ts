@@ -792,8 +792,11 @@ export class RadarEngine {
         : await this.hkjc.fetchPreMatch({});
       this.setHealth("hkjc", { ok: true, latencyMs: res.latencyMs, itemCount: res.events.length, mode: DEMO ? "demo" : "live" });
       const persistBatch = rawDb.transaction((events: typeof res.events) => {
-        const clearLatest = rawDb.prepare(
-          "DELETE FROM odds_latest WHERE match_id=? AND provider='hkjc'",
+        const listLatestKeys = rawDb.prepare(
+          "SELECT key FROM odds_latest WHERE match_id=? AND provider='hkjc'",
+        );
+        const deleteLatestKey = rawDb.prepare(
+          "DELETE FROM odds_latest WHERE key=?",
         );
         const upsertMatch = rawDb.prepare(
           `INSERT INTO matches(id,hkjc_id,pinnacle_match_id,league,league_en,home_team,away_team,home_team_en,away_team_en,kickoff_utc,status,inplay,updated_at)
@@ -817,12 +820,25 @@ export class RadarEngine {
             ev.status,
             now,
           );
-          // This endpoint is a complete pre-match snapshot for each returned
-          // event. Remove lines that disappeared or became suspended before
-          // inserting the currently tradable set, otherwise odds_latest can
-          // keep an unexecutable old line alive until its local TTL expires.
-          clearLatest.run(id);
+          // Compare against the previous card before removing suspended lines.
+          // Clearing odds_latest first made persistPrices see every quote as
+          // new, appending the complete card to odds_snapshots every 30 seconds
+          // even when no price had changed.
+          const previousKeys = (
+            listLatestKeys.all(id) as Array<{ key: string }>
+          ).map((row) => row.key);
           this.persistPrices(id, "hkjc", ev.prices, now, ev.kickoffUtc);
+          const currentKeys = new Set(
+            ev.prices.map((price) => {
+              const lineKey = lineKeyOf(price.market, price.lineValue);
+              return `${id}|hkjc|${price.market}|${lineKey}|${price.selection}`;
+            }),
+          );
+          // The provider response is a complete card. Remove only lines that
+          // actually disappeared or became suspended.
+          for (const key of previousKeys) {
+            if (!currentKeys.has(key)) deleteLatestKey.run(key);
+          }
         }
       });
       // better-sqlite3 is synchronous. A full HKJC card can contain enough
