@@ -104,7 +104,7 @@ let liveCapture: Record<string, unknown> = { table_present: false };
 try {
   const total = db.prepare(`SELECT COUNT(*) AS n FROM hkjc_live_corners`).get() as { n: number };
   const matched = db.prepare(
-    `SELECT COUNT(*) AS n
+    `SELECT COUNT(DISTINCT c.match_id) AS n
        FROM hkjc_live_corners c
        JOIN research_timeline_snapshots s ON s.match_id = c.match_id AND s.market = 'COU'`,
   ).get() as { n: number };
