@@ -39,30 +39,78 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: 從生產串流最新壓縮備份
+      - name: 建立 audit schema
+        env:
+          RADAR_DB: ${{ github.workspace }}/audit-ou-workdir/data.db
+        run: |
+          umask 077
+          mkdir -p audit-ou-workdir
+          npx tsx -e 'import("./server/lib/store.ts").then((m) => m.migrate())'
+
+      - name: 從生產串流啟動日後所需資料
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           umask 077
-          mkdir -p audit-ou-workdir
           SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=60 -o TCPKeepAlive=yes"
           # Remove only stale files created by earlier failed audit runs.
           ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
             "sudo rm -f /tmp/audit-ou-*.db /tmp/audit-ou-*.db.gz"
-          # Reuse an existing compressed deploy/hourly backup; do not create
-          # another multi-GB copy on the production host.
-          LATEST="$(
-            ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
-              "sudo find /opt/odds-radar/backups -maxdepth 1 -type f -name '*.sql.gz' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-"
-          )"
-          test -n "$LATEST"
-          echo "Using $(basename "$LATEST")"
+          # Stream only the four tables and rows needed for the activated
+          # historical window. The live database is opened mode=ro.
           ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo cat '$LATEST'" > audit-ou-workdir/data.sql.gz
-          gzip -t audit-ou-workdir/data.sql.gz
-          gunzip -c audit-ou-workdir/data.sql.gz | sqlite3 audit-ou-workdir/data.db
-          rm -f audit-ou-workdir/data.sql.gz
+            "sudo python3 -" > audit-ou-workdir/data.sql <<'PY'
+          import sqlite3
+          import time
+
+          SINCE = 1_788_350_822_000
+          NOW = int(time.time() * 1000)
+          db = sqlite3.connect(
+              "file:/opt/odds-radar/data/data.db?mode=ro", uri=True
+          )
+
+          def literal(value):
+              if value is None:
+                  return "NULL"
+              if isinstance(value, bytes):
+                  return "X'" + value.hex() + "'"
+              if isinstance(value, (int, float)):
+                  return repr(value)
+              return "'" + str(value).replace("'", "''") + "'"
+
+          def dump(table, where, params):
+              columns = [
+                  row[1] for row in db.execute(f"PRAGMA table_info({table})")
+              ]
+              quoted_columns = ",".join(f'"{column}"' for column in columns)
+              query = f"SELECT {quoted_columns} FROM {table} WHERE {where}"
+              for row in db.execute(query, params):
+                  values = ",".join(literal(value) for value in row)
+                  print(
+                      f'INSERT OR IGNORE INTO "{table}"'
+                      f"({quoted_columns}) VALUES({values});"
+                  )
+
+          match_window = "kickoff_utc>=? AND kickoff_utc<=?"
+          related_window = (
+              "match_id IN (SELECT id FROM matches "
+              "WHERE kickoff_utc>=? AND kickoff_utc<=?)"
+          )
+          print("BEGIN;")
+          dump("matches", match_window, (SINCE, NOW))
+          dump(
+              "research_timeline_snapshots",
+              related_window + " AND market='OU' AND stage IN ('initial','T30','T5')",
+              (SINCE, NOW),
+          )
+          dump("ou_signal_prealerts", related_window, (SINCE, NOW))
+          dump("ou_signal_observations", related_window, (SINCE, NOW))
+          print("COMMIT;")
+          db.close()
+          PY
+          sqlite3 audit-ou-workdir/data.db < audit-ou-workdir/data.sql
+          rm -f audit-ou-workdir/data.sql
           ls -lh audit-ou-workdir/data.db
 
       - name: 用最新引擎重放 syncOuSignal*（只寫副本）
