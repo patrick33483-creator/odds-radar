@@ -549,6 +549,46 @@ describe("OU signal monitor", () => {
     ).get(matchId)).toEqual({ count: 0 });
   });
 
+  it("infers a uniquely balanced unflagged HKJC initial main without weakening later stages", () => {
+    const now = afterWatchActivation + 210_000;
+    const matchId = "hkjc-unflagged-balanced-initial";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "hkjc", "initial", "2.5", 1.83, 1.87, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "initial", "2.75", 2.07, 1.67, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "initial", "3.5", 3.05, 1.32, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "T30", "2.5", 1.79, 1.91, now - 20 * 60_000);
+    addStage(matchId, "hkjc", "T5", "2.5", 1.76, 1.94, now - 60_000);
+
+    expect(syncOuSignalPrealerts([matchId])).toBe(3);
+    expect(syncOuSignalObservations([matchId])).toBe(1);
+    expect(rawDb.prepare(
+      `SELECT rule_id,initial_line_key,t30_line_key,t5_line_key,
+              direction_path,signal_selection,signal_t5_odds
+         FROM ou_signal_observations WHERE match_id=?`,
+    ).get(matchId)).toEqual({
+      rule_id: "hkjc-ooo-t5-selected-le-180-under-watch",
+      initial_line_key: "2.5",
+      t30_line_key: "2.5",
+      t5_line_key: "2.5",
+      direction_path: "O→O→O",
+      signal_selection: "U",
+      signal_t5_odds: 1.94,
+    });
+  });
+
+  it("fails closed when an unflagged HKJC initial main is not clearly unique", () => {
+    const now = afterWatchActivation + 225_000;
+    const matchId = "hkjc-ambiguous-balanced-initial";
+    addMatch(matchId, now + 30 * 60_000);
+    addStage(matchId, "hkjc", "initial", "2.5", 1.83, 1.87, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "initial", "2.75", 1.84, 1.88, now - 25 * 60_000, false);
+    addStage(matchId, "hkjc", "T30", "2.5", 1.79, 1.91, now - 20 * 60_000);
+    addStage(matchId, "hkjc", "T5", "2.5", 1.76, 1.94, now - 60_000);
+
+    expect(syncOuSignalPrealerts([matchId])).toBe(0);
+    expect(syncOuSignalObservations([matchId])).toBe(0);
+  });
+
   it("does not fabricate a drift rule from prices on different lines", () => {
     const now = afterWatchActivation + 240_000;
     const matchId = "moved-no-fabricated-drift";
