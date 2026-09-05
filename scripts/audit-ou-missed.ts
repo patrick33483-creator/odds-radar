@@ -50,8 +50,8 @@ const unsentT30 = rawDb
   .prepare(
     `SELECT p.unique_key, p.match_id, p.rule_id, p.direction_path,
             p.line_key, p.initial_line_key, p.t30_line_key, p.line_path,
-            p.signal_selection, p.initial_signal_odds,
-            p.signal_t30_odds, p.detected_at, p.notified_at,
+            p.initial_signal_odds, p.signal_t30_odds,
+            p.detected_at, p.notified_at,
             m.league, m.home_team, m.away_team, m.kickoff_utc, m.status
        FROM ou_signal_prealerts p
        JOIN matches m ON m.id = p.match_id
