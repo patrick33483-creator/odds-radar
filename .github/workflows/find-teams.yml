@@ -45,6 +45,24 @@ jobs:
                   t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
                   print(f"  [{r['fixture_source']}] {r['id']} {t} {r['home_team']} vs {r['away_team']} => {r['result']}")
               if not rows: print("  (none)")
+          print("== OU_SIGNAL_PENDING_RESULTS ==")
+          now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp()*1000)
+          pending = db.execute("""
+            SELECT m.id, m.fixture_source, m.league, m.home_team, m.away_team,
+                   m.kickoff_utc, GROUP_CONCAT(DISTINCT o.rule_id) rule_ids,
+                   GROUP_CONCAT(DISTINCT o.line_key) line_keys
+              FROM ou_signal_observations o
+              JOIN matches m ON m.id=o.match_id
+              LEFT JOIN research_results r ON r.match_id=m.id
+             WHERE r.match_id IS NULL
+               AND m.kickoff_utc <= ?
+             GROUP BY m.id, m.fixture_source, m.league, m.home_team, m.away_team, m.kickoff_utc
+             ORDER BY m.kickoff_utc
+          """,(now_ms - 3*3600*1000,)).fetchall()
+          print(f"TOTAL={len(pending)}")
+          for r in pending:
+              t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%Y-%m-%d %H:%M')
+              print(f"  {r['id']}\t{t}\t{r['league']}\t{r['home_team']}\t{r['away_team']}\t{r['rule_ids']}\t{r['line_keys']}")
           PYEOF
           scp /tmp/f.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/f.py"
           ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/f.py'
