@@ -1,0 +1,50 @@
+name: hit-diag
+on: workflow_dispatch
+jobs:
+  d:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          cat > /tmp/hd.py <<'PYEOF'
+          import sqlite3, datetime, time
+          db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
+          db.row_factory = sqlite3.Row
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          now_ms = int(time.time()*1000)
+          # 剛啱 fill 嘅 15 場（用 fetched_at 過去 1 小時）
+          lo = now_ms - 3600*1000
+          fills = db.execute("SELECT match_id, home_score, away_score, fetched_at FROM research_results WHERE result_source='manual' AND fetched_at>=?", (lo,)).fetchall()
+          print(f"== 過去 1 小時 manual fills: {len(fills)} ==")
+          for r in fills:
+              # join ou_signal_observations
+              obs = db.execute("SELECT rule_id, line_key, signal_selection FROM ou_signal_observations WHERE match_id=?",(r['match_id'],)).fetchall()
+              m = db.execute("SELECT home_team, away_team, fixture_source FROM matches WHERE id=?",(r['match_id'],)).fetchone()
+              obs_str = f"{len(obs)} obs" if obs else "NO OBS"
+              print(f"  {r['match_id']} [{m['fixture_source'] if m else '?'}] {m['home_team'] if m else '?'} vs {m['away_team'] if m else '?'} score={r['home_score']}-{r['away_score']} => {obs_str}")
+              for o in obs[:3]:
+                  print(f"      rule={o['rule_id']} line={o['line_key']} sel={o['signal_selection']}")
+          # 每條 rule 而家 hit rate
+          print("\n== 每 rule prospective ==")
+          rules = db.execute("SELECT DISTINCT rule_id FROM ou_signal_observations ORDER BY rule_id").fetchall()
+          for rr in rules:
+              rid = rr['rule_id']
+              q = db.execute("""
+                SELECT COUNT(*) tot,
+                       SUM(CASE WHEN r.home_score IS NOT NULL THEN 1 ELSE 0 END) settled
+                  FROM ou_signal_observations o
+                  LEFT JOIN research_results r ON r.match_id=o.match_id
+                 WHERE o.rule_id=?
+              """,(rid,)).fetchone()
+              print(f"  {rid}: total={q['tot']} settled={q['settled']}")
+          PYEOF
+          scp /tmp/hd.py "$DEPLOY_USER@$DEPLOY_HOST:/tmp/hd.py"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -E python3 /tmp/hd.py'
