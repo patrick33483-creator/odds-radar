@@ -20,23 +20,26 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          echo "$NAMES" > /tmp/names.txt
+          scp /tmp/names.txt "$DEPLOY_USER@$DEPLOY_HOST:/tmp/names.txt"
           cat > /tmp/f.py <<'PYEOF'
-          import sqlite3, os, datetime
+          import sqlite3, datetime
           db = sqlite3.connect("/opt/odds-radar/data/data.db", timeout=30)
           db.row_factory = sqlite3.Row
           hkt = datetime.timezone(datetime.timedelta(hours=8))
-          names = [n.strip() for n in os.environ["NAMES"].split(",") if n.strip()]
+          raw = open("/tmp/names.txt").read()
+          names = [n.strip() for n in raw.split(",") if n.strip()]
+          lo = int(datetime.datetime(2026,9,3,0,0,tzinfo=hkt).timestamp()*1000)
+          hi = int(datetime.datetime(2026,9,6,0,0,tzinfo=hkt).timestamp()*1000)
           for n in names:
               rows = db.execute("""
                 SELECT m.id, m.fixture_source, m.home_team, m.away_team, m.kickoff_utc,
                        CASE WHEN r.match_id IS NULL THEN 'AWAITING' ELSE r.home_score||'-'||r.away_score END result
                   FROM matches m LEFT JOIN research_results r ON r.match_id=m.id
                  WHERE (m.home_team LIKE ? OR m.away_team LIKE ?)
-                   AND m.kickoff_utc >= ? AND m.kickoff_utc <= ?
+                   AND m.kickoff_utc>=? AND m.kickoff_utc<=?
                  ORDER BY m.kickoff_utc DESC LIMIT 10
-              """,(f"%{n}%",f"%{n}%",
-                   int(datetime.datetime(2026,9,3,0,0,tzinfo=hkt).timestamp()*1000),
-                   int(datetime.datetime(2026,9,6,0,0,tzinfo=hkt).timestamp()*1000))).fetchall()
+              """,(f"%{n}%",f"%{n}%",lo,hi)).fetchall()
               print(f"== {n} ==")
               for r in rows:
                   t = datetime.datetime.fromtimestamp(r['kickoff_utc']/1000, hkt).strftime('%m-%d %H:%M')
