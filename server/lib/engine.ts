@@ -2313,6 +2313,36 @@ export class RadarEngine {
     }
   }
 
+  /**
+   * Sender-side poller entry: drain any queued prealerts/observations that
+   * were materialized by another worker without waiting for the next
+   * milestone tick. T-5 windows are only ~5 minutes wide and a 15-minute
+   * milestone cadence otherwise strands them past kickoff.
+   */
+  async pollOuNotificationDrain(): Promise<void> {
+    if (!this.ouNotificationSender) return;
+    if (this.ouNotificationDrainRunning) return;
+    this.ouNotificationDrainRunning = true;
+    try {
+      try {
+        const prealerts = pendingOuPrealerts();
+        const sent = prealerts.length ? await notifyOuPrealerts(prealerts) : 0;
+        if (sent) log("telegram_ou_t30_prealerts", { source: "sender_poll", detected: prealerts.length, sent });
+      } catch (err) {
+        log("telegram_ou_t30_prealert_error", { source: "sender_poll", error: (err as Error).message });
+      }
+      try {
+        const signals = pendingOuSignals();
+        const sent = signals.length ? await notifyOuSignals(signals) : 0;
+        if (sent) log("telegram_ou_signals", { source: "sender_poll", detected: signals.length, sent });
+      } catch (err) {
+        log("telegram_ou_signal_error", { source: "sender_poll", error: (err as Error).message });
+      }
+    } finally {
+      this.ouNotificationDrainRunning = false;
+    }
+  }
+
   /** Matches eligible for detail polling in the given mode. */
   private detailTargets(mode: RefreshMode, cfg: ScanConfig) {
     const now = Date.now();

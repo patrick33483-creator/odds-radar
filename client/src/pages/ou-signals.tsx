@@ -51,13 +51,17 @@ function SignalRow({ row, activatedAt }: { row: OuSignalObservation; activatedAt
               {STATUS_LABEL[row.matchStatus]}
             </span>
             <span className="text-[10px] text-muted-foreground">{row.providerLabel}</span>
-            <span className={cn(
+<span className={cn(
               "rounded border px-1.5 py-0.5 text-[10px]",
-              row.mode === "direct"
-                ? "border-positive/30 bg-positive/10 text-positive"
-                : "border-warning/30 bg-warning/10 text-warning",
+              row.ruleId.endsWith("-watch")
+                ? "border-muted-foreground/30 bg-muted text-muted-foreground"
+                : row.mode === "direct"
+                  ? "border-positive/30 bg-positive/10 text-positive"
+                  : "border-warning/30 bg-warning/10 text-warning",
             )}>
-              {row.mode === "direct" ? "正向" : "反向"}
+              {row.ruleId.endsWith("-watch")
+                ? (row.mode === "direct" ? "正向留意" : "反向留意")
+                : (row.mode === "direct" ? "正向" : "反向")}
             </span>
           </div>
           <h2 className="mt-1 truncate text-sm font-semibold">{row.homeTeam} vs {row.awayTeam}</h2>

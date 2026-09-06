@@ -138,6 +138,38 @@ jobs:
               by_day[hkt(r["detected_at"])[:10]] = by_day.get(hkt(r["detected_at"])[:10], 0) + 1
           sent_rows = [r for r in rows if r["notified_at"] is not None]
 
+          # Delivery latency (notify - detect) for eligible sent HKJC rows.
+          # >60s = drain queue is being starved and the deploy patch is
+          # needed. T-5 windows are only ~5 min wide; late = missed.
+          latencies = []
+          slow_examples = []
+          for r in eligible:
+              if r["notified_at"] is None:
+                  continue
+              lat = (r["notified_at"] - r["detected_at"]) / 1000.0
+              latencies.append(lat)
+              if lat > 60 and len(slow_examples) < 5:
+                  slow_examples.append({
+                      "match_id": r["match_id"],
+                      "rule_id": r["rule_id"],
+                      "latency_s": round(lat, 1),
+                      "detected_hkt": hkt(r["detected_at"]),
+                  })
+          latencies.sort()
+          def pct(vs, p):
+              if not vs: return None
+              i = min(len(vs)-1, int(len(vs)*p))
+              return round(vs[i], 1)
+          latency_stats = {
+              "count": len(latencies),
+              "over_60s": sum(1 for v in latencies if v > 60),
+              "over_5min": sum(1 for v in latencies if v > 300),
+              "p50_s": pct(latencies, 0.5),
+              "p95_s": pct(latencies, 0.95),
+              "max_s": round(latencies[-1], 1) if latencies else None,
+              "slow_examples": slow_examples,
+          }
+
           # Per notify-rule, per detection day: did the row send, or was it
           # dropped for a missing initial price? This separates a defect that
           # is still producing silent rows from residue of an older formula.
@@ -158,6 +190,7 @@ jobs:
               "notify_rules_by_day": {
                   k: dict(sorted(v.items())) for k, v in per_rule_day.items()
               },
+              "delivery_latency": latency_stats,
               "suppressed_missing_initial_odds": {
                   "count": len(suppressed),
                   "by_rule": {

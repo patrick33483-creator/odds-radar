@@ -8,6 +8,7 @@ import {
   startResearchLowerMilestoneCollector,
   startResearchMilestoneCollector,
 } from "./routes";
+import { engine } from "./lib/engine";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
@@ -198,6 +199,15 @@ if (
       },
     });
     log("research milestone collector started in isolated worker", "milestone");
+    // Independent 30s sender-side drain. Without this, prealerts/observations
+    // materialized by the collector wait for the next milestone tick to send;
+    // T-5 windows are only ~5 minutes wide and get stranded past kickoff.
+    const ouDrainPoller = setInterval(() => {
+      void engine.pollOuNotificationDrain().catch((err) => {
+        console.error("OU notification drain poller error:", err);
+      });
+    }, 30_000);
+    ouDrainPoller.unref();
   } else if (processRole === "milestone-lower-once") {
     const sendToOwner = (message: unknown) => new Promise<void>((resolve, reject) => {
       if (parentPort) {
