@@ -1,0 +1,50 @@
+name: Bootstrap crown-radar SSH key
+
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey:
+        description: "Public key to append to authorized_keys"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crown-radar-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Append pubkey to authorized_keys (idempotent)
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          PUBKEY: ${{ inputs.pubkey }}
+        run: |
+          ssh -o ServerAliveInterval=30 "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -e
+             KEY='$PUBKEY'
+             sudo install -d -m 700 /root/.ssh
+             sudo touch /root/.ssh/authorized_keys
+             sudo chmod 600 /root/.ssh/authorized_keys
+             if ! sudo grep -qF \"\$KEY\" /root/.ssh/authorized_keys; then
+               echo \"\$KEY\" | sudo tee -a /root/.ssh/authorized_keys > /dev/null
+               echo appended
+             else
+               echo already-present
+             fi
+             sudo tail -1 /root/.ssh/authorized_keys | cut -d' ' -f3"
