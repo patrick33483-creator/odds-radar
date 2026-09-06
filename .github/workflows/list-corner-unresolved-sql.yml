@@ -28,23 +28,28 @@ jobs:
           # kickoff_utc is stored in MILLISECONDS. Use "now" in ms and require the
           # kickoff was more than 150 minutes ago so we skip in-play / just-finished
           # fixtures, mirroring the backfill script's `ended_after_min` guard.
-          sudo docker compose -f /opt/odds-radar/compose.yaml exec -T radar \
-            sqlite3 -readonly /app/data/data.db -header -csv "
-              SELECT m.id AS match_id,
-                     datetime(m.kickoff_utc/1000, 'unixepoch') AS kickoff_utc_iso,
-                     m.league,
-                     m.home_team,
-                     m.away_team,
+          sudo docker compose -f /opt/odds-radar/compose.yaml exec -T radar node -e "
+            const Database = require('better-sqlite3');
+            const db = new Database('/app/data/data.db', { readonly: true });
+            const rows = db.prepare(\`
+              SELECT m.id AS match_id, m.kickoff_utc, m.league, m.home_team, m.away_team,
                      CASE WHEN m.titan_id IS NOT NULL THEN 'yes' ELSE 'no' END AS titan_id_present
                 FROM matches m
-                JOIN research_timeline_snapshots s
-                  ON s.match_id = m.id AND s.market = 'COU'
+                JOIN research_timeline_snapshots s ON s.match_id = m.id AND s.market = 'COU'
                 LEFT JOIN research_corner_results c ON c.match_id = m.id
-               WHERE m.kickoff_utc < (strftime('%s','now') - 150*60) * 1000
+               WHERE m.kickoff_utc < (unixepoch() - 150*60) * 1000
                  AND c.match_id IS NULL
                GROUP BY m.id
-               ORDER BY m.kickoff_utc DESC;
-            "
+               ORDER BY m.kickoff_utc DESC
+            \`).all();
+            const q = (v) => '\"' + String(v ?? '').replace(/\"/g, '\"\"') + '\"';
+            process.stdout.write('match_id,kickoff_utc_iso,league,home_team,away_team,titan_id_present\n');
+            for (const r of rows) {
+              const iso = new Date(r.kickoff_utc).toISOString();
+              process.stdout.write([q(r.match_id), q(iso), q(r.league), q(r.home_team), q(r.away_team), r.titan_id_present].join(',') + '\n');
+            }
+            process.stderr.write('# rows: ' + rows.length + '\n');
+          "
           REMOTE
           echo "---- rows ----"
           wc -l corner-unresolved.csv
