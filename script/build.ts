@@ -53,6 +53,7 @@ async function buildAll() {
       "audit-corner-results-20260906": "scripts/audit-corner-results-20260906.ts",
       "backfill-corner-results-20260906": "scripts/backfill-corner-results-20260906.ts",
       "backfill-corner-results-titan": "scripts/backfill-corner-results-titan.ts",
+      "list-corner-unresolved": "scripts/list-corner-unresolved.ts",
     },
     platform: "node",
     bundle: true,
