@@ -1,0 +1,53 @@
+name: 診斷 T-5 買入通知窗口 v2（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Read events for T-5 window
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set +e; set -u
+          cd /opt/odds-radar
+          cid="$(sudo docker compose ps -aq radar)"
+          logdir="$(dirname "$(sudo docker inspect "$cid" --format '{{.LogPath}}')")"
+          logs="$logdir/$(basename "$(sudo docker inspect "$cid" --format '{{.LogPath}}')")"
+
+          echo "=== event counts, last 4h ==="
+          for pat in telegram_ou_signals telegram_ou_signal_error telegram_ou_delivery telegram_ou_delivery_error telegram_ou_t30_prealerts telegram_ou_t30_prealert_error ou_notification_drain_request ou_notification_drain_complete_error; do
+            n=$(sudo grep -c "$pat" "$logs" 2>/dev/null)
+            echo "$pat: ${n:-0}"
+          done
+
+          echo
+          echo "=== every T5-relevant telegram_ou event line, 13:00-14:15 UTC ==="
+          sudo awk '/"ts":"2026-09-06T1[34]:/ && /telegram_ou/' "$logs" | head -40
+
+          echo
+          echo "=== every 50074928 non-http line ==="
+          sudo grep 50074928 "$logs" | grep -v '\[express\]' | head -20
+
+          echo
+          echo "=== drain request events, latest 10 ==="
+          sudo grep 'ou_notification_drain' "$logs" | tail -10
+          REMOTE
