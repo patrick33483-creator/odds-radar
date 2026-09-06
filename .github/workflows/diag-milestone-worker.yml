@@ -27,7 +27,8 @@ jobs:
         run: |
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
             "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
-          set -euo pipefail
+          set +e
+          set -u
           cd /opt/odds-radar
 
           echo '=== container uptime / restart ==='
@@ -39,16 +40,12 @@ jobs:
           echo
           echo '=== last 6h milestone / worker exit events ==='
           logs="$(sudo docker compose logs --since 6h radar 2>&1 || true)"
-          printf '%s\n' "$logs" | grep -cE 'research_milestone\b' \
-            | awk '{print "research_milestone events (6h): "$0}'
-          printf '%s\n' "$logs" | grep -cE 'research_milestone_error' \
-            | awk '{print "research_milestone_error (6h): "$0}'
-          printf '%s\n' "$logs" | grep -cE 'research_milestone_lower_tier\b' \
-            | awk '{print "research_milestone_lower_tier (6h): "$0}'
-          printf '%s\n' "$logs" | grep -cE 'research_milestone_lower_tier_error' \
-            | awk '{print "research_milestone_lower_tier_error (6h): "$0}'
-          printf '%s\n' "$logs" | grep -cE 'Research milestone worker exited|Lower research cycle worker exited|Background collector worker exited' \
-            | awk '{print "worker exit lines (6h): "$0}'
+          count() { local pat="$1"; local n; n=$(printf '%s\n' "$logs" | grep -cE "$pat"); echo "${n:-0}"; }
+          echo "research_milestone events (6h): $(count 'research_milestone\b')"
+          echo "research_milestone_error (6h): $(count 'research_milestone_error')"
+          echo "research_milestone_lower_tier (6h): $(count 'research_milestone_lower_tier\b')"
+          echo "research_milestone_lower_tier_error (6h): $(count 'research_milestone_lower_tier_error')"
+          echo "worker exit lines (6h): $(count 'Research milestone worker exited|Lower research cycle worker exited|Background collector worker exited')"
           echo
           echo '--- last 15 worker/exit/error lines ---'
           printf '%s\n' "$logs" | grep -E 'research_milestone|worker exited|Lower research cycle|starvation|milestone collector started' \
