@@ -1,0 +1,48 @@
+name: 診斷 T-5 買入通知窗口（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Read raw log for T-5 window and drains
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set +e
+          set -u
+          cd /opt/odds-radar
+          cid="$(sudo docker compose ps -aq radar)"
+          logpath="$(sudo docker inspect "$cid" --format '{{.LogPath}}')"
+          logdir="$(dirname "$logpath")"
+
+          echo "=== T-5 window 21:50-22:10 HKT (13:50-14:10 UTC) events ==="
+          sudo bash -c "zcat -f $logdir/*.log* 2>/dev/null | grep -E '\"ts\":\"2026-09-06T1[34]:(5[0-9]|0[0-9]):' | grep -oE '\"ts\":\"[^\"]+\",\"scope\":\"radar\",\"event\":\"[^\"]+\"[^}]*' | grep -E 'telegram_ou_signals|telegram_ou_delivery|telegram_ou_signal_error|telegram_ou_delivery_error|ou_notification_drain' | head -60" 2>&1
+          echo
+          echo "=== T-5 events mentioning 50074928 (any kind) ==="
+          sudo bash -c "zcat -f $logdir/*.log* 2>/dev/null | grep 50074928 | grep -v 'GET /api' | head -30"
+          echo
+          echo "=== all telegram_ou_signals events in the last 4 hours ==="
+          sudo bash -c "zcat -f $logdir/*.log* 2>/dev/null | grep 'telegram_ou_signals' | grep -oE '\"ts\":\"[^\"]+\"[^}]*event\":\"telegram_ou_signals[^}]*' | tail -20"
+          echo
+          echo "=== drain complete events ==="
+          sudo bash -c "zcat -f $logdir/*.log* 2>/dev/null | grep -E 'ou_notification_drain_complete|ou_notification_drain_request' | tail -20"
+          REMOTE
