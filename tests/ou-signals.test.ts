@@ -916,4 +916,56 @@ describe("OU signal monitor", () => {
     expect(swept).not.toContain(upcoming);
   });
 
+  it("takes the opening's flagged line when a Pinnacle checkpoint carries no main flag", () => {
+    const now = afterWatchActivation;
+    // Reproduces the live Pinnacle response that returned only alternates:
+    // every checkpoint line is unflagged, so the fixture previously failed
+    // closed and produced no prealert or observation for any rule.
+    const id = "pinnacle-unflagged-checkpoint";
+    addMatch(id, now + 30 * 60_000);
+    addStage(id, "pinnacle", "initial", "2.5", 1.81, 1.95, now - 20 * 60 * 60_000, true);
+    for (const stage of ["T30", "T5"] as const) {
+      const capturedAt = stage === "T30" ? now - 25 * 60_000 : now - 4 * 60_000;
+      addStage(id, "pinnacle", stage, "1.5", 1.23, 4.12, capturedAt, false);
+      addStage(id, "pinnacle", stage, "2.5", 1.71, 2.09, capturedAt, false);
+      addStage(id, "pinnacle", stage, "2.75", 1.96, 1.88, capturedAt, false);
+    }
+
+    expect(syncOuSignalPrealerts([id])).toBeGreaterThan(0);
+    const prealerts = rawDb.prepare(
+      "SELECT line_key,line_path,evaluator_version FROM ou_signal_prealerts WHERE match_id=?",
+    ).all(id) as Array<{ line_key: string; line_path: string; evaluator_version: string }>;
+    // The opening's flagged 2.50 is carried through, so the comparison stays
+    // on one line rather than drifting onto the balanced-looking 2.75 pair.
+    expect(prealerts.every((row) => row.line_key === "2.5")).toBe(true);
+    expect(prealerts.every((row) => row.evaluator_version === "same-line-v1")).toBe(true);
+
+    syncOuSignalObservations([id]);
+    const observations = rawDb.prepare(
+      "SELECT rule_id,line_path,odds_gap FROM ou_signal_observations WHERE match_id=?",
+    ).all(id) as Array<{ rule_id: string; line_path: string; odds_gap: number }>;
+    expect(observations.length).toBeGreaterThan(0);
+    expect(observations.every((row) => row.line_path === "2.5→2.5→2.5")).toBe(true);
+    // 1.81 opening against a 1.71 T-5 selection is a 0.10 tightening.
+    expect(observations.every((row) => Math.abs(row.odds_gap - 0.1) < 1e-9)).toBe(true);
+    expect(observations.map((row) => row.rule_id)).toContain("pinnacle-ooo-short-010-020");
+  });
+
+  it("still refuses to guess when no stage carries a main flag", () => {
+    const now = afterWatchActivation;
+    const id = "pinnacle-no-flag-anywhere";
+    addMatch(id, now + 30 * 60_000);
+    for (const stage of ["initial", "T30", "T5"] as const) {
+      addStage(id, "pinnacle", stage, "2.5", 1.81, 2.09, now - 30 * 60_000, false);
+      addStage(id, "pinnacle", stage, "2.75", 1.96, 1.88, now - 30 * 60_000, false);
+    }
+    syncOuSignalPrealerts([id]);
+    syncOuSignalObservations([id]);
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM ou_signal_prealerts WHERE match_id=?",
+    ).get(id)).toMatchObject({ c: 0 });
+    expect(rawDb.prepare(
+      "SELECT COUNT(*) c FROM ou_signal_observations WHERE match_id=?",
+    ).get(id)).toMatchObject({ c: 0 });
+  });
 });

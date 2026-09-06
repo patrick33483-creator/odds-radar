@@ -471,19 +471,36 @@ function selectStageMain(
     return { lineKey, rows };
   }
   if (complete.length === 1) return { lineKey: complete[0][0], rows: complete[0][1] };
-  if (provider !== "hkjc" || stage !== "initial" || complete.length < 2) return null;
 
-  // Later checkpoints carry HKJC's own main flag. When the opening snapshot
-  // omits every flag, that single flagged line is auditable evidence of which
-  // pair was the opening main - strictly better than inferring from price
-  // balance, which picks whichever line happens to look balanced. A 2.50
-  // opening carried as the flagged main at T-30/T-15 was previously discarded
-  // because the unflagged 2.75 pair looked more balanced than the threshold
-  // allowed, so the whole fixture never reached rule evaluation.
-  if (flaggedMainHint) {
+  // A flag carried by any other stage is auditable evidence of which pair the
+  // source itself treated as main, and it applies in both directions: an
+  // unflagged opening takes the checkpoint's flagged line, and an unflagged
+  // checkpoint takes the opening's. That is exactly what a same-line rule
+  // needs, since it measures one line's price drift across stages.
+  //
+  // This must not be restricted to HKJC openings. Pinnacle marks its main
+  // total by the absence of altLineId, so a response carrying only alt lines
+  // leaves every checkpoint row unflagged. selectStageMain then failed closed
+  // and the whole fixture never reached rule evaluation, losing every rule at
+  // once rather than failing one price check.
+  // Direction matters. Carrying a flagged opening forward to an unflagged
+  // checkpoint is safe for every provider: the rule measures that one line's
+  // drift, so the opening's own main is the correct pair to price.
+  //
+  // Carrying a flagged checkpoint backward onto an ambiguous opening is only
+  // evidence when the same source flagged both. HKJC flags its own main at
+  // every stage. A Pinnacle opening comes from a third-party record of the
+  // true opening, and Pinnacle's main total legitimately moves, so a later
+  // Pinnacle flag says nothing about which opening pair was main. That case
+  // still fails closed.
+  if (flaggedMainHint && (stage !== "initial" || provider === "hkjc")) {
     const hinted = lines.get(flaggedMainHint);
     if (hinted?.has("O") && hinted.has("U")) return { lineKey: flaggedMainHint, rows: hinted };
   }
+  // Price-balance inference stays limited to the HKJC opening. It guesses,
+  // where the hint above is evidence, so it must never widen to a provider or
+  // stage that can legitimately quote a different main line.
+  if (provider !== "hkjc" || stage !== "initial" || complete.length < 2) return null;
 
   const ranked = complete
     .map(([lineKey, rows]) => ({
@@ -572,9 +589,12 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
       const [, provider] = groupKey.split("|") as [string, Provider];
-      const initialMainHint = flaggedMainLineKey(stages, "initial");
-      const initial = selectStageMain(stages.get("initial"), provider, "initial", initialMainHint);
-      const t30 = selectStageMain(stages.get("T30"), provider, "T30");
+      const initial = selectStageMain(
+        stages.get("initial"), provider, "initial", flaggedMainLineKey(stages, "initial"),
+      );
+      const t30 = selectStageMain(
+        stages.get("T30"), provider, "T30", flaggedMainLineKey(stages, "T30"),
+      );
       if (!initial || !t30) continue;
       const stageMains = [initial, t30];
       const decisions = stageMains.map((stage) =>
@@ -678,10 +698,15 @@ export function syncOuSignalObservations(
   const tx = rawDb.transaction(() => {
     for (const [groupKey, stages] of groups) {
       const [, provider] = groupKey.split("|") as [string, Provider];
-      const initialMainHint = flaggedMainLineKey(stages, "initial");
-      const initial = selectStageMain(stages.get("initial"), provider, "initial", initialMainHint);
-      const t30 = selectStageMain(stages.get("T30"), provider, "T30");
-      const t5 = selectStageMain(stages.get("T5"), provider, "T5");
+      const initial = selectStageMain(
+        stages.get("initial"), provider, "initial", flaggedMainLineKey(stages, "initial"),
+      );
+      const t30 = selectStageMain(
+        stages.get("T30"), provider, "T30", flaggedMainLineKey(stages, "T30"),
+      );
+      const t5 = selectStageMain(
+        stages.get("T5"), provider, "T5", flaggedMainLineKey(stages, "T5"),
+      );
       if (!initial || !t30 || !t5) continue;
       const stageMains = [initial, t30, t5];
       const decisions = stageMains.map((stage) =>

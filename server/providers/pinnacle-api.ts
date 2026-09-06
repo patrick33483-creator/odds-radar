@@ -158,5 +158,22 @@ export async function fetchApiPrices(providerMatchId: string): Promise<ProviderP
       });
     }
   }
+  // A response carrying only alternates destroys main-line identity for every
+  // downstream same-line rule. Failing closed later is invisible, so surface
+  // the response shape here instead.
+  for (const market of ["AH", "OU"] as const) {
+    const rows = prices.filter((price) => price.market === market);
+    if (rows.length >= 4 && !rows.some((price) => price.isMain)) {
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        scope: "radar",
+        event: "pinnacle_main_line_missing",
+        eventId: id,
+        market,
+        lines: [...new Set(rows.map((price) => price.lineValue))]
+          .sort((a, b) => (a ?? 0) - (b ?? 0)),
+      }));
+    }
+  }
   return prices;
 }
