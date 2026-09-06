@@ -1,0 +1,48 @@
+name: 診斷 TG 原始 log 檔（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Read raw docker log file
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set +e
+          set -u
+          cd /opt/odds-radar
+          cid="$(sudo docker compose ps -aq radar)"
+          echo "=== log-driver config ==="
+          sudo docker inspect "$cid" --format '{{json .HostConfig.LogConfig}}'
+          echo
+          logpath="$(sudo docker inspect "$cid" --format '{{.LogPath}}')"
+          echo "logpath=$logpath"
+          echo
+          echo "=== log dir listing ==="
+          sudo ls -lh "$(dirname "$logpath")"
+          echo
+          echo "=== window 21:00 - 22:00 HKT (13:00-14:00 UTC) events ==="
+          sudo bash -c "zcat -f $(dirname "$logpath")/*.log* 2>/dev/null | grep -E '2026-09-06T1[34]:' | grep -E 'telegram_ou|ou_notification_drain|hkjc:50074928' | head -80"
+          echo
+          echo "=== window 21:00-22:00 HKT total lines ==="
+          sudo bash -c "zcat -f $(dirname "$logpath")/*.log* 2>/dev/null | grep -cE '2026-09-06T1[34]:'"
+          REMOTE
