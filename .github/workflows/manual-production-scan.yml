@@ -36,4 +36,39 @@ jobs:
               --max-time 30 \
               --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
               http://127.0.0.1:5001/api/scan/window
+            echo
+            python3 - <<'PY'
+            import json, sqlite3, time
+            now = int(time.time() * 1000)
+            db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            fixtures = db.execute("""
+              SELECT m.id,m.home_team,m.away_team,m.kickoff_utc,
+                     p.pinnapi_id,p.titan_id,p.active_source
+                FROM matches m
+                LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+               WHERE m.fixture_source='hkjc'
+                 AND m.kickoff_utc>? AND m.kickoff_utc<=?
+               ORDER BY m.kickoff_utc,m.id
+            """, (now - 5 * 60_000, now + 60 * 60_000)).fetchall()
+            ids = [row["id"] for row in fixtures]
+            snapshots = []
+            if ids:
+              marks = ",".join("?" for _ in ids)
+              snapshots = db.execute(f"""
+                SELECT match_id,stage,provider,market,COUNT(*) rows,
+                       MAX(captured_at) captured_at
+                  FROM research_timeline_snapshots
+                 WHERE match_id IN ({marks})
+                   AND stage IN ('initial','T30','T15','T5')
+                 GROUP BY match_id,stage,provider,market
+                 ORDER BY match_id,stage,provider,market
+              """, ids).fetchall()
+            print(json.dumps({
+              "checked_at": now,
+              "upcoming_hkjc": [dict(row) for row in fixtures],
+              "snapshots": [dict(row) for row in snapshots],
+            }, ensure_ascii=False))
+            db.close()
+            PY
           REMOTE
