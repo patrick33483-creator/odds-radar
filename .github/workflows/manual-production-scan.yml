@@ -31,7 +31,7 @@ jobs:
             test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
             docker compose ps
             curl --fail --silent --show-error \
-              --max-time 240 \
+              --max-time 30 \
               --user "$RADAR_ACCESS_USER:$RADAR_ACCESS_PASSWORD" \
-              -X POST http://127.0.0.1:5001/api/scan/window
+              http://127.0.0.1:5001/api/scan/window
           REMOTE
