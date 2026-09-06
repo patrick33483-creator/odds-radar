@@ -214,8 +214,11 @@ CREATE INDEX IF NOT EXISTS hkjc_live_corners_observed_idx ON hkjc_live_corners(o
 -- readable after kickoff and are reachable through matches.titan_id. This is
 -- the only route to a past fixture's corner count. Kept out of
 -- research_results so corner settlement still requires HKJC's own figure.
+-- titan_id nullable: name+date fallback stores rows for fixtures without a
+-- direct matches.titan_id link. Source column disambiguates recovery path
+-- ('titan007' | 'titan007-namedate').
 CREATE TABLE IF NOT EXISTS research_corner_results (
-  match_id TEXT PRIMARY KEY, titan_id TEXT NOT NULL,
+  match_id TEXT PRIMARY KEY, titan_id TEXT,
   home_corners INTEGER NOT NULL, away_corners INTEGER NOT NULL,
   corners_total INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'titan007',
   fetched_at INTEGER NOT NULL);
@@ -223,6 +226,8 @@ CREATE INDEX IF NOT EXISTS research_corner_results_titan_idx
   ON research_corner_results(titan_id);
 CREATE INDEX IF NOT EXISTS research_corner_results_fetched_idx
   ON research_corner_results(fetched_at);
+CREATE INDEX IF NOT EXISTS research_corner_results_source_idx
+  ON research_corner_results(source);
 
 CREATE TABLE IF NOT EXISTS pinnapi_live_scores (
   event_id TEXT PRIMARY KEY, match_id TEXT NOT NULL, home_score INTEGER NOT NULL,

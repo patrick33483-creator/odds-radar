@@ -25,7 +25,7 @@
  * - Sequential fetches with a delay, so a backfill does not hammer titan007.
  * - backfill requires an explicit confirmation phrase and the production path.
  */
-import { fetchTitanCorners } from "../server/providers/titan-corners";
+import { fetchTitanCorners, resolveTitanIdByNameDate } from "../server/providers/titan-corners";
 import { rawDb } from "../server/lib/store";
 
 const REQUIRED_CONFIRMATION = "BACKFILL_CONFIRMED_TITAN_CORNERS_20260906";
@@ -42,7 +42,9 @@ if (mode === "backfill") {
   }
 }
 
-const LOOKBACK_DAYS = Number(process.env.CORNER_TITAN_DAYS ?? 90);
+// 0 = no lower bound (backfill every past fixture with corner odds). Kept as an
+// env override in case an operator wants to bound a one-off pass.
+const LOOKBACK_DAYS = Number(process.env.CORNER_TITAN_DAYS ?? 0);
 const LIMIT = Number(process.env.CORNER_TITAN_LIMIT ?? 0);
 const DELAY_MS = Number(process.env.CORNER_TITAN_DELAY_MS ?? 400);
 const now = Date.now();
@@ -58,6 +60,8 @@ const hktDate = (ms: number): string => new Date(ms + 8 * 3600_000).toISOString(
 interface Row {
   match_id: string;
   titan_id: string | null;
+  home_team: string;
+  away_team: string;
   kickoff_utc: number;
   league: string;
   already: number | null;
@@ -66,21 +70,28 @@ interface Row {
 /**
  * Every past fixture that carries corner odds, with whatever corner result we
  * already recovered. `market='COU'` is the corner total market.
+ *
+ * `LOOKBACK_DAYS = 0` disables the lower bound so a first-time run recovers
+ * the full corner history, not just the last 90 days.
  */
-const rows = rawDb.prepare(
-  `SELECT m.id AS match_id, m.titan_id, m.kickoff_utc, m.league,
+const rowsSql =
+  `SELECT m.id AS match_id, m.titan_id, m.home_team, m.away_team, m.kickoff_utc, m.league,
           c.corners_total AS already
      FROM matches m
      JOIN research_timeline_snapshots s ON s.match_id = m.id AND s.market = 'COU'
      LEFT JOIN research_corner_results c ON c.match_id = m.id
-    WHERE m.kickoff_utc < ?
-      AND m.kickoff_utc >= ?
+    WHERE m.kickoff_utc < ?` +
+  (LOOKBACK_DAYS > 0 ? ` AND m.kickoff_utc >= ?` : ``) +
+  `
     GROUP BY m.id
-    ORDER BY m.kickoff_utc DESC`,
-).all(endedBefore, windowStart) as Row[];
+    ORDER BY m.kickoff_utc DESC`;
+const rows = (LOOKBACK_DAYS > 0
+  ? rawDb.prepare(rowsSql).all(endedBefore, windowStart)
+  : rawDb.prepare(rowsSql).all(endedBefore)) as Row[];
 
-const withTitan = rows.filter((r) => r.titan_id);
-const pending = withTitan.filter((r) => r.already === null);
+const pending = rows.filter((r) => r.already === null);
+const withTitan = pending.filter((r) => r.titan_id);
+const withoutTitan = pending.filter((r) => !r.titan_id);
 const targets = LIMIT > 0 ? pending.slice(0, LIMIT) : pending;
 
 const summary = {
@@ -88,13 +99,15 @@ const summary = {
   lookback_days: LOOKBACK_DAYS,
   ended_after_min: ENDED_AFTER_MIN,
   fixtures_with_corner_odds: rows.length,
-  with_titan_id: withTitan.length,
-  without_titan_id: rows.length - withTitan.length,
-  already_recovered: withTitan.length - pending.length,
+  already_recovered: rows.length - pending.length,
   recoverable_pending: pending.length,
+  recoverable_via_titan_id: withTitan.length,
+  recoverable_via_name_date: withoutTitan.length,
   attempted: 0,
   written: 0,
   no_statistic: 0,
+  namedate_resolved: 0,
+  namedate_unresolved: 0,
   failed: 0,
 };
 const failures: Array<{ match_id: string; titan_id: string; error: string }> = [];
@@ -103,19 +116,39 @@ const samples: Array<{ date: string; league: string; corners: string }> = [];
 const insert = rawDb.prepare(
   `INSERT OR IGNORE INTO research_corner_results
      (match_id,titan_id,home_corners,away_corners,corners_total,source,fetched_at)
-   VALUES (?,?,?,?,?,'titan007',?)`,
+   VALUES (?,?,?,?,?,?,?)`,
 );
+
+/** Resolve a Titan sId for a row. Returns the stored titan_id when set, or
+ *  looks it up by team name + kickoff. Null when neither route works. */
+async function resolveTitanId(row: Row): Promise<{ id: string; source: string } | null> {
+  if (row.titan_id) return { id: row.titan_id, source: "titan007" };
+  const resolved = await resolveTitanIdByNameDate({
+    homeTeam: row.home_team,
+    awayTeam: row.away_team,
+    kickoffUtc: row.kickoff_utc,
+  });
+  if (!resolved) {
+    summary.namedate_unresolved += 1;
+    return null;
+  }
+  summary.namedate_resolved += 1;
+  return { id: resolved.titanId, source: "titan007-namedate" };
+}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function run(): Promise<void> {
   if (mode === "audit") {
-    // Probe a small sample so the audit proves the source still parses without
-    // touching the database.
-    for (const target of targets.slice(0, 5)) {
+    // Probe a small sample so the audit proves each recovery path still
+    // parses, without touching the database.
+    const probe = [...withTitan.slice(0, 3), ...withoutTitan.slice(0, 2)];
+    for (const target of probe) {
       summary.attempted += 1;
       try {
-        const corners = await fetchTitanCorners(target.titan_id!);
+        const id = await resolveTitanId(target);
+        if (!id) continue;
+        const corners = await fetchTitanCorners(id.id);
         if (!corners) summary.no_statistic += 1;
         else {
           samples.push({
@@ -128,7 +161,7 @@ async function run(): Promise<void> {
         summary.failed += 1;
         failures.push({
           match_id: target.match_id,
-          titan_id: target.titan_id!,
+          titan_id: target.titan_id ?? "(namedate)",
           error: (err as Error).message,
         });
       }
@@ -138,10 +171,18 @@ async function run(): Promise<void> {
     return;
   }
 
-  for (const target of targets) {
+  let progressAt = Date.now();
+  for (const [i, target] of targets.entries()) {
     summary.attempted += 1;
+    // Emit a progress line every 60 s so a long backfill is observable in logs.
+    if (Date.now() - progressAt > 60_000) {
+      console.log(JSON.stringify({ event: "progress", i, total: targets.length, ...summary }));
+      progressAt = Date.now();
+    }
     try {
-      const corners = await fetchTitanCorners(target.titan_id!);
+      const id = await resolveTitanId(target);
+      if (!id) continue;
+      const corners = await fetchTitanCorners(id.id);
       if (!corners) {
         summary.no_statistic += 1;
       } else {
@@ -151,6 +192,7 @@ async function run(): Promise<void> {
           corners.homeCorners,
           corners.awayCorners,
           corners.cornersTotal,
+          id.source,
           Date.now(),
         );
         if (res.changes > 0) summary.written += 1;
@@ -167,7 +209,7 @@ async function run(): Promise<void> {
       if (failures.length < 20) {
         failures.push({
           match_id: target.match_id,
-          titan_id: target.titan_id!,
+          titan_id: target.titan_id ?? "(namedate)",
           error: (err as Error).message,
         });
       }

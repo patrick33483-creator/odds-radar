@@ -7,6 +7,7 @@ import { storage } from "./storage";
 import { formatLine, formatSelectionLine } from "./lib/lines";
 import { AUTO_SCAN_CHECK_MS, autoScanEnabled, createAutoScanTickGate } from "./lib/scan";
 import { readCornerValidationReport, runPinnapiCornerValidation } from "./lib/corner-validation";
+import { runCornerBackfillTick } from "./lib/corner-backfill-tick";
 import { PinnapiProvider } from "./providers/pinnapi";
 import { HkjcProvider } from "./providers/hkjc";
 import {
@@ -646,6 +647,17 @@ export async function runResearchLowerCycleOnce(
         60 * 60_000,
         () => collectResearchResults(researchHkjc),
       );
+  // Corner backfill piggy-backs on the same hourly rhythm as result
+  // collection. Isolated writes (research_corner_results only) mean no
+  // simulated bet or Wilson metric can settle on a third-party corner
+  // count. Disable with RADAR_CORNER_BACKFILL=0.
+  const corners = process.env.RADAR_CORNER_BACKFILL === "0"
+    ? null
+    : await runIfDue(
+        "research_corner_backfill_last_run",
+        60 * 60_000,
+        () => runCornerBackfillTick(),
+      );
   const prewarm = process.env.RADAR_HOURLY_PREWARM === "0"
     ? null
     : await runIfDue(
@@ -673,6 +685,7 @@ export async function runResearchLowerCycleOnce(
     timeline,
     openings,
     results,
+    corners,
     prewarm: prewarm
       ? {
           started: prewarm.started,
