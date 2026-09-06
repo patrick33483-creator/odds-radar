@@ -1,0 +1,85 @@
+name: 清理指定舊備份（v2，逐個獨立 SSH）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-clean-old-backups
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 清理前 df
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 "$DEPLOY_USER@$DEPLOY_HOST" 'df -h /'
+
+      - name: 刪 pre-recompute 807M
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'ls -lh /opt/odds-radar/data/pre-recompute-20260905T163645Z.db.gz && sudo rm -v /opt/odds-radar/data/pre-recompute-20260905T163645Z.db.gz'
+
+      - name: 刪 pre-recompute wal 85M
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'ls -lh /opt/odds-radar/data/pre-recompute-20260905T163645Z.db-wal.gz && sudo rm -v /opt/odds-radar/data/pre-recompute-20260905T163645Z.db-wal.gz'
+
+      - name: 刪容器 pre-deploy 293M
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'cd /opt/odds-radar && sudo docker compose exec -T radar sh -c "ls -lh /app/backups/pre-deploy-20260904T182419Z.sql.gz && rm -v /app/backups/pre-deploy-20260904T182419Z.sql.gz"'
+
+      - name: 刪容器 working-tree 16K
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'cd /opt/odds-radar && sudo docker compose exec -T radar sh -c "ls -lh /app/backups/pre-deploy-working-tree-20260809T023546Z.tgz && rm -v /app/backups/pre-deploy-working-tree-20260809T023546Z.tgz"'
+
+      - name: 清理後 df 同目錄
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'df -h /; echo; sudo du -sh /opt/odds-radar/data; echo; sudo ls -lh /opt/odds-radar/data'
+
+      - name: 服務狀態
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'cd /opt/odds-radar && sudo docker compose ps radar'

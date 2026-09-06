@@ -1,0 +1,91 @@
+name: 清理舊備份檔（一次性）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-clean-old-backups
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 清 pre-recompute 同 pre-deploy 備份
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -uo pipefail
+
+          echo "=== 清理前 df -h ==="
+          df -h /
+
+          echo
+          echo "=== 主資料庫保護:確保 data.db 唔會被誤刪 ==="
+          ls -lh /opt/odds-radar/data/data.db /opt/odds-radar/data/data.db-wal 2>/dev/null
+
+          echo
+          echo "=== 刪主機 pre-recompute 備份 ==="
+          # Explicit paths, no globs, no recursion; each rm is independent so
+          # a missing file cannot skip the rest.
+          for f in \
+            /opt/odds-radar/data/pre-recompute-20260905T163645Z.db.gz \
+            /opt/odds-radar/data/pre-recompute-20260905T163645Z.db-wal.gz
+          do
+            if [ -f "$f" ]; then
+              echo "removing $(sudo du -h "$f" | cut -f1) $f"
+              sudo rm -- "$f"
+            else
+              echo "not found $f"
+            fi
+          done
+
+          echo
+          echo "=== 刪容器內 pre-deploy 備份 ==="
+          cd /opt/odds-radar
+          for f in \
+            /app/backups/pre-deploy-20260904T182419Z.sql.gz \
+            /app/backups/pre-deploy-working-tree-20260809T023546Z.tgz
+          do
+            if sudo docker compose exec -T radar test -f "$f"; then
+              size="$(sudo docker compose exec -T radar du -h "$f" | cut -f1)"
+              echo "removing $size $f"
+              sudo docker compose exec -T radar rm -- "$f"
+            else
+              echo "not found $f"
+            fi
+          done
+
+          echo
+          echo "=== 清理後 df -h ==="
+          df -h /
+
+          echo
+          echo "=== 清理後 data 目錄 ==="
+          sudo du -sh /opt/odds-radar/data 2>/dev/null
+          sudo ls -lh /opt/odds-radar/data 2>/dev/null | tail -10
+
+          echo
+          echo "=== 清理後容器 backups 目錄 ==="
+          sudo docker compose exec -T radar sh -c 'du -sh /app/backups; ls -lh /app/backups' || true
+
+          echo
+          echo "=== 服務仍在 ==="
+          sudo docker compose ps radar
+          REMOTE
