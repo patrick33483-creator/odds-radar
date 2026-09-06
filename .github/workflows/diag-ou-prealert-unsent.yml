@@ -122,7 +122,35 @@ jobs:
               if r["notified_at"] is not None:
                   d["sent"] += 1
 
+          # Age of each suppressed row decides whether this is a historical
+          # residue from an older formula or a defect still producing rows.
+          def hkt(ms):
+              return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ms / 1000 + 8 * 3600))
+
+          suppressed = [
+              r for r in rows
+              if r["notified_at"] is None and r["rule_id"] in NOTIFY_RULES
+              and r["fixture_source"] == "hkjc" and r["initial_signal_odds"] is None
+          ]
+          suppressed.sort(key=lambda r: r["detected_at"])
+          by_day = {}
+          for r in suppressed:
+              by_day[hkt(r["detected_at"])[:10]] = by_day.get(hkt(r["detected_at"])[:10], 0) + 1
+          sent_rows = [r for r in rows if r["notified_at"] is not None]
+
           print(json.dumps({
+              "suppressed_missing_initial_odds": {
+                  "count": len(suppressed),
+                  "by_rule": {
+                      k: sum(1 for r in suppressed if r["rule_id"] == k)
+                      for k in {r["rule_id"] for r in suppressed}
+                  },
+                  "by_detection_day_hkt": dict(sorted(by_day.items())),
+                  "earliest_hkt": hkt(suppressed[0]["detected_at"]) if suppressed else None,
+                  "latest_hkt": hkt(suppressed[-1]["detected_at"]) if suppressed else None,
+              },
+              "last_sent_hkt": hkt(max(r["notified_at"] for r in sent_rows))
+              if sent_rows else None,
               "prealert_rows_since_activation": len(rows),
               "reasons": dict(sorted(buckets.items(), key=lambda kv: -kv[1])),
               "notify_eligible_hkjc": {
