@@ -726,11 +726,13 @@ export async function collectResearchResults(
       tx();
     }
     }
-    // titan007 fallback：非 HKJC 場（fixture_source != 'hkjc'）用 matches.titan_id
+    // Standalone Crown/Pinnacle results are retained in SQLite but this radar
+    // no longer refreshes them. The explicit production flag is pinned in
+    // compose.yaml so only HKJC-owned fixtures can receive new result writes.
     // 對 http://bf.titan007.com/football/Over_YYYYMMDD.htm 每日一頁攞比分。
     let titanCandidateCount = 0;
     let titanCollected = 0;
-    try {
+    if (process.env.RADAR_HKJC_ONLY === "0") try {
       const titanCandidates = rawDb
         .prepare(
           `SELECT m.id, m.titan_id, m.kickoff_utc,
@@ -999,7 +1001,7 @@ function windowBounds(filters: ResearchFilters, now: number): { lo: number; hi: 
 function filterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
   const clauses = [
-    "m.fixture_source IN ('hkjc','pinnacle')",
+    "m.fixture_source='hkjc'",
     "q.provider IN ('hkjc','pinnacle')",
     "m.kickoff_utc>=?",
     "m.kickoff_utc<=?",
@@ -1025,7 +1027,7 @@ function filterSql(filters: ResearchFilters, now: number): { clause: string; par
 function matchFilterSql(filters: ResearchFilters, now: number): { clause: string; params: unknown[] } {
   const bounds = windowBounds(filters, now);
   const clauses = [
-    "m.fixture_source IN ('hkjc','pinnacle')",
+    "m.fixture_source='hkjc'",
     "m.kickoff_utc>=?",
     "m.kickoff_utc<=?",
     "(m.fixture_source='hkjc' OR m.titan_id IS NOT NULL OR m.kickoff_utc<?)",
@@ -1035,13 +1037,11 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
     // A directly discovered Titan/Pinnacle fixture must remain visible while
     // its first quote is pending; filtering on the LEFT JOIN alone used to
     // hide the whole fixture until collection had already succeeded.
-    clauses.push(filters.provider === "pinnacle"
-      ? "(q.provider=? OR m.fixture_source='pinnacle')"
-      : "q.provider=?");
+    clauses.push("q.provider=?");
     params.push(filters.provider);
   }
   if (filters.market !== "all") {
-    clauses.push("(q.market=? OR m.fixture_source='pinnacle')");
+    clauses.push("q.market=?");
     params.push(filters.market);
   }
   // Both HKJC and direct Titan fixtures remain visible before capture. The
@@ -1049,7 +1049,7 @@ function matchFilterSql(filters: ResearchFilters, now: number): { clause: string
   // UI must not silently remove discovered fixtures merely because a provider
   // request is still queued, slow or temporarily unavailable.
   clauses.push(
-    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source IN ('hkjc','pinnacle'))",
+    "(q.id IS NOT NULL OR rr.match_id IS NOT NULL OR r.match_id IS NOT NULL OR m.fixture_source='hkjc')",
   );
   return { clause: clauses.join(" AND "), params };
 }
@@ -1135,7 +1135,9 @@ export function researchDataset(
   const collection = rawDb
     .prepare(
       `SELECT MIN(COALESCE(first_captured_at,created_at)) collection_started_at
-         FROM research_timeline_points`,
+         FROM research_timeline_points p
+         JOIN matches m ON m.id=p.match_id
+        WHERE m.fixture_source='hkjc'`,
     )
     .get() as { collection_started_at: number | null };
   const collectionStartedAt = collection.collection_started_at === null

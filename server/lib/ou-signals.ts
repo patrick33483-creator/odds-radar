@@ -544,7 +544,7 @@ export function syncOuSignalPrealerts(matchIds: string[] = []): number {
        FROM research_timeline_snapshots s
        JOIN matches m ON m.id=s.match_id
       WHERE s.market='OU'
-        AND m.fixture_source IN ('hkjc','pinnacle')
+        AND m.fixture_source='hkjc'
         AND s.provider IN ('hkjc','pinnacle')
         AND (m.fixture_source='hkjc' OR s.provider='pinnacle')
         AND s.stage IN ('initial','T30')
@@ -655,7 +655,7 @@ export function syncOuSignalObservations(
        FROM research_timeline_snapshots s
        JOIN matches m ON m.id=s.match_id
       WHERE s.market='OU'
-        AND m.fixture_source IN ('hkjc','pinnacle')
+        AND m.fixture_source='hkjc'
         AND s.provider IN ('hkjc','pinnacle')
         AND (m.fixture_source='hkjc' OR s.provider='pinnacle')
         AND s.stage IN ('initial','T30','T5')
@@ -931,7 +931,7 @@ export function ouSignalDataset(now = Date.now()): OuSignalDatasetResponse {
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
-      WHERE m.fixture_source IN ('hkjc','pinnacle')
+      WHERE m.fixture_source='hkjc'
       ORDER BY CASE
         WHEN r.match_id IS NULL AND m.kickoff_utc<=? AND m.kickoff_utc>=? THEN 0
         WHEN m.kickoff_utc>? THEN 1
@@ -978,7 +978,7 @@ function selectUnsentOuSignals(
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
        LEFT JOIN research_results r ON r.match_id=o.match_id
-      WHERE m.fixture_source IN ('hkjc','pinnacle')
+      WHERE m.fixture_source='hkjc'
         AND o.notified_at IS NULL
         AND o.backfilled_at IS NULL
         AND o.detected_at>=? ${futureFilter} ${targetFilter}
@@ -1030,7 +1030,7 @@ function selectUnsentOuPrealerts(
        JOIN matches m ON m.id=p.match_id
        LEFT JOIN pinnacle_translations pt
          ON m.fixture_source='pinnacle' AND pt.pinnapi_id=SUBSTR(m.id,10)
-      WHERE m.fixture_source IN ('hkjc','pinnacle')
+      WHERE m.fixture_source='hkjc'
         AND p.notified_at IS NULL
         AND p.detected_at>=? ${futureFilter} ${targetFilter}
       ORDER BY p.detected_at`,

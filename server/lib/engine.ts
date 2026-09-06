@@ -1205,8 +1205,10 @@ export class RadarEngine {
       (m) => m.fixtureSource === "hkjc" && m.kickoffUtc > now - 5 * 60_000,
     );
     let mapped = 0;
-    const mapTx = rawDb.transaction(() => {
-      for (const m of pending) {
+    for (const m of pending) {
+      let mappedThisFixture = false;
+      try {
+        rawDb.transaction(() => {
         const target = { id: m.id, league: m.league, homeTeam: m.homeTeam, awayTeam: m.awayTeam, kickoffUtc: m.kickoffUtc };
         const englishTarget = {
           ...target,
@@ -1221,7 +1223,10 @@ export class RadarEngine {
           ? null
           : matchWithVerifiedTimeFallback(englishTarget, opticCandidates);
         const titanDecision = matchWithVerifiedTimeFallback(target, titanCandidates, aliases);
-        if (titanDecision.pinnacleMatchId) {
+        if (
+          process.env.RADAR_HKJC_ONLY === "0"
+          && titanDecision.pinnacleMatchId
+        ) {
           reconcileCrownFixtureIntoHkjc(m.id, titanDecision.pinnacleMatchId);
         }
         const decision = pinnapiDecision.pinnacleMatchId
@@ -1248,7 +1253,7 @@ export class RadarEngine {
               ? "opticodds"
               : "titan007";
         }
-        if (activeId) mapped++;
+        if (activeId) mappedThisFixture = true;
         const savedDecision = activeId && !decision.pinnacleMatchId
           ? {
               confidence: db.select().from(matchMapping).where(eq(matchMapping.matchId, m.id)).get()?.confidence ?? 0.62,
@@ -1286,8 +1291,16 @@ export class RadarEngine {
             activeSource,
             now,
           );
-        rawDb.prepare("UPDATE matches SET pinnacle_match_id=?,titan_id=COALESCE(?,titan_id) WHERE id=?")
-          .run(activeId, titanDecision.pinnacleMatchId, m.id);
+        // In HKJC-only mode standalone rows are immutable historical records.
+        // Keep the Titan identity on pinnacle_source_map instead of claiming
+        // matches.titan_id, which may already belong to a retained old row.
+        if (process.env.RADAR_HKJC_ONLY === "0") {
+          rawDb.prepare("UPDATE matches SET pinnacle_match_id=?,titan_id=COALESCE(?,titan_id) WHERE id=?")
+            .run(activeId, titanDecision.pinnacleMatchId, m.id);
+        } else {
+          rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?")
+            .run(activeId, m.id);
+        }
         for (const a of [...pinnapiDecision.learnedAliases, ...(opticDecision?.learnedAliases ?? []), ...titanDecision.learnedAliases]) {
           if (!a.alias) continue;
           rawDb
@@ -1296,9 +1309,15 @@ export class RadarEngine {
             )
             .run(a.canonical, a.alias, a.provider, now);
         }
+        })();
+        if (mappedThisFixture) mapped++;
+      } catch (err) {
+        log("pinnacle_fixture_mapping_error", {
+          matchId: m.id,
+          error: (err as Error).message,
+        });
       }
-    });
-    mapTx();
+    }
     log("pinnacle_fixtures", {
       pinnapiFixtures: pinnapiFixtures.length,
       opticFixtures: opticFixtures.length,
@@ -1325,6 +1344,12 @@ export class RadarEngine {
     captureMilestones = true,
     sharedLowerTierController?: AbortController,
   ): Promise<{ fixtures: number; fetched: number; failed: number; rows: number }> {
+    // This radar is intentionally HKJC-fixture-only. Keep the legacy method
+    // inert so no scheduler, maintenance call or future refactor can resume
+    // inserting standalone Titan/Pinnacle/Crown fixtures by accident.
+    if (process.env.RADAR_HKJC_ONLY !== "0") {
+      return { fixtures: 0, fetched: 0, failed: 0, rows: 0 };
+    }
     const refreshStartedAt = Date.now();
     // Requires the caller to have already populated fixtureCache via
     // refreshPinnacleFixtures().  We do not re-invoke it so unit tests that
@@ -2549,6 +2574,9 @@ export class RadarEngine {
       activeSource: "titan007" | "pinnapi" | null;
       missingMarkets: Array<"AH" | "OU">;
     };
+    const fixtureScope = process.env.RADAR_HKJC_ONLY === "0"
+      ? "m.fixture_source IN ('hkjc','pinnacle')"
+      : "m.fixture_source='hkjc'";
     const candidates = rawDb.prepare(
       `SELECT m.id,m.fixture_source,m.kickoff_utc,m.titan_id,m.pinnacle_match_id,
               p.titan_id mapped_titan_id,COALESCE(p.titan_reversed,0) titan_reversed,
@@ -2556,7 +2584,7 @@ export class RadarEngine {
               p.active_source,m.status
          FROM matches m
          LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
-        WHERE m.fixture_source IN ('hkjc','pinnacle')
+        WHERE ${fixtureScope}
           AND m.inplay=0
           AND m.kickoff_utc>?
           AND m.kickoff_utc<=?
@@ -3044,14 +3072,9 @@ export class RadarEngine {
         }
       }
     }
-    // Pinnacle-only research runs after the shared fixture cache is warm.
-    // It writes only research-timeline rows and never touches HKJC execution
-    // or the T-30 window scanner.
-    try {
-      await this.refreshPinnacleOnlyResearch(Date.now(), captureMilestones, lowerTierController);
-    } catch (err) {
-      log("pinnacle_only_research_error", { error: (err as Error).message });
-    }
+    // Standalone Titan/Pinnacle fixture ingestion is intentionally disabled.
+    // The warm cache above remains necessary for mapping Pinnacle prices onto
+    // HKJC's fixture universe.
     return { selected: targets.length, detailCalls };
   }
 

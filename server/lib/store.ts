@@ -616,27 +616,38 @@ function migrateFixtureSources(): void {
     })();
   }
 
-  sqlite.exec(`
-    UPDATE matches
-       SET titan_id=(
-         SELECT p.titan_id FROM pinnacle_source_map p
-          WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
-       )
-     WHERE titan_id IS NULL
-       AND EXISTS (
-         SELECT 1 FROM pinnacle_source_map p
-          WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
-       );
-  `);
-  dedupeTitanFixtureIdentity();
+  const hkjcOnly = process.env.RADAR_HKJC_ONLY !== "0";
+  if (!hkjcOnly) {
+    sqlite.exec(`
+      UPDATE matches
+         SET titan_id=(
+           SELECT p.titan_id FROM pinnacle_source_map p
+            WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
+         )
+       WHERE titan_id IS NULL
+         AND EXISTS (
+           SELECT 1 FROM pinnacle_source_map p
+            WHERE p.match_id=matches.id AND p.titan_id IS NOT NULL
+         );
+    `);
+    dedupeTitanFixtureIdentity();
+  }
   const duplicate = sqlite.prepare(
     `SELECT titan_id,COUNT(*) count FROM matches
       WHERE titan_id IS NOT NULL GROUP BY titan_id HAVING COUNT(*)>1 LIMIT 1`,
   ).get() as { titan_id: string; count: number } | undefined;
   if (duplicate) {
-    throw new Error(`Duplicate Titan fixture identity ${duplicate.titan_id} (${duplicate.count} rows)`);
+    if (!hkjcOnly) {
+      throw new Error(`Duplicate Titan fixture identity ${duplicate.titan_id} (${duplicate.count} rows)`);
+    }
+    console.warn(JSON.stringify({
+      event: "hkjc_only_retained_titan_duplicate",
+      titanId: duplicate.titan_id,
+      rows: duplicate.count,
+    }));
+  } else {
+    sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS matches_titan_uniq ON matches(titan_id) WHERE titan_id IS NOT NULL");
   }
-  sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS matches_titan_uniq ON matches(titan_id) WHERE titan_id IS NOT NULL");
 }
 
 function normalizedFixtureTeam(value: string): string {

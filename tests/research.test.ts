@@ -4,6 +4,9 @@ import { rmSync } from "node:fs";
 const dbPath = `/tmp/odds-radar-research-${process.pid}.db`;
 process.env.RADAR_DB = dbPath;
 process.env.RADAR_RESEARCH_RESULTS = "1";
+// Preserve direct coverage of the dormant Titan result fallback. Production
+// scope is covered separately with RADAR_HKJC_ONLY=1.
+process.env.RADAR_HKJC_ONLY = "0";
 
 let rawDb: typeof import("../server/lib/store").rawDb;
 let collectResearchResults: typeof import("../server/lib/research").collectResearchResults;

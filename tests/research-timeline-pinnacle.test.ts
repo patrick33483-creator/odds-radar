@@ -3,6 +3,9 @@ import { rmSync } from "node:fs";
 
 const dbPath = `/tmp/odds-radar-research-timeline-pinnacle-${process.pid}.db`;
 process.env.RADAR_DB = dbPath;
+// This legacy suite exercises the dormant standalone collector in isolation.
+// Production is pinned to RADAR_HKJC_ONLY=1; dedicated scope tests cover that mode.
+process.env.RADAR_HKJC_ONLY = "0";
 
 let RadarEngine: typeof import("../server/lib/engine").RadarEngine;
 let rawDb: typeof import("../server/lib/store").rawDb;

@@ -26,7 +26,11 @@ afterAll(() => {
   }
 });
 
-function addFixture(id: string, source: "crown" | "hkjc", kickoffUtc: number): void {
+function addFixture(
+  id: string,
+  source: "crown" | "hkjc" | "pinnacle",
+  kickoffUtc: number,
+): void {
   rawDb.prepare(
     `INSERT INTO matches(
       id,hkjc_id,fixture_source,titan_id,league,home_team,away_team,kickoff_utc,status,inplay,updated_at
@@ -35,7 +39,7 @@ function addFixture(id: string, source: "crown" | "hkjc", kickoffUtc: number): v
     id,
     source === "hkjc" ? id : null,
     source,
-    source === "crown" ? id.replace("crown:", "") : null,
+    source === "hkjc" ? null : id,
     "研究聯賽",
     "主隊",
     "客隊",
@@ -56,20 +60,28 @@ function addOuPair(matchId: string, provider: "crown" | "hkjc" | "pinnacle"): vo
   insert.run(matchId, provider, "U", 1.99, NOW);
 }
 
-describe("research dataset excludes Crown without hiding HKJC", () => {
-  it("keeps 100 HKJC fixtures visible with a 300-row limit despite 3,500 Crown futures, and excludes Crown from summary, matches and CSV", () => {
+describe("research dataset is HKJC-fixture-only", () => {
+  it("keeps HKJC fixtures and their Pinnacle quotes visible while hiding standalone Crown/Pinnacle rows from dashboard, summary and CSV", () => {
     for (let i = 0; i < 3500; i++) {
       addFixture(`crown:bulk-${i}`, "crown", NOW + ((i % 7) + 1) * 60 * 60_000);
+    }
+    for (let i = 0; i < 500; i++) {
+      addFixture(`pinnacle:bulk-${i}`, "pinnacle", NOW + ((i % 7) + 1) * 60 * 60_000);
     }
     for (let i = 0; i < 100; i++) {
       addFixture(`hkjc:bulk-${i}`, "hkjc", NOW + ((i % 7) + 1) * 60 * 60_000);
     }
     addOuPair("crown:bulk-0", "crown");
+    addOuPair("pinnacle:bulk-0", "pinnacle");
     addOuPair("hkjc:bulk-0", "hkjc");
     addOuPair("hkjc:bulk-0", "pinnacle");
     rawDb.prepare(
       `INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,fetched_at)
        VALUES('crown:bulk-0',NULL,2,1,NULL,'titan','titan007',?)`,
+    ).run(NOW);
+    rawDb.prepare(
+      `INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,fetched_at)
+       VALUES('pinnacle:bulk-0',NULL,3,2,NULL,'titan','titan007',?)`,
     ).run(NOW);
     rawDb.prepare(
       `INSERT INTO research_results(match_id,hkjc_id,home_score,away_score,corners_total,source,result_source,fetched_at)
@@ -82,6 +94,7 @@ describe("research dataset excludes Crown without hiding HKJC", () => {
     expect(dataset.matches.every((row) => row.fixtureSource === "hkjc")).toBe(true);
     expect(dataset.matches.map((row) => row.matchId)).toContain("hkjc:bulk-0");
     expect(dataset.matches.map((row) => row.matchId)).not.toContain("crown:bulk-0");
+    expect(dataset.matches.map((row) => row.matchId)).not.toContain("pinnacle:bulk-0");
     expect(dataset.summary.providerCounts.map((row) => row.name).sort()).toEqual(["hkjc", "pinnacle"]);
     expect(dataset.summary.marketCounts.map((row) => row.name)).toEqual(["OU"]);
     const hkjc = dataset.matches.find((row) => row.matchId === "hkjc:bulk-0")!;
@@ -93,8 +106,10 @@ describe("research dataset excludes Crown without hiding HKJC", () => {
     const resultsCsv = researchCsv("results", filters, NOW);
     expect(timelineCsv).toContain("hkjc:bulk-0");
     expect(timelineCsv).not.toContain("crown:bulk-0");
+    expect(timelineCsv).not.toContain("pinnacle:bulk-0");
     expect(resultsCsv).toContain("hkjc:bulk-0");
     expect(resultsCsv).not.toContain("crown:bulk-0");
+    expect(resultsCsv).not.toContain("pinnacle:bulk-0");
   });
 
   it("retains a snapshot-free HKJC fixture as pending", () => {
