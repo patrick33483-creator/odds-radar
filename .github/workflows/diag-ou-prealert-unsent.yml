@@ -1,0 +1,137 @@
+name: 診斷 T-30 預警未發原因（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diag-ou-prealert-unsent
+  cancel-in-progress: false
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 分類未發預警
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            "$DEPLOY_USER@$DEPLOY_HOST" "sudo python3 -" <<'PY'
+          # Read-only classification of why a T-30 prealert row was never sent.
+          # Opens the live database mode=ro and writes nothing.
+          import json, sqlite3, time
+
+          NOTIFY_RULES = {
+              "pinnacle-uoo-short-005-010",
+              "pinnacle-ooo-short-010-020",
+              "hkjc-ooo-t5-selected-le-180-under-watch",
+              "hkjc-ooo-flat-wide-reverse",
+          }
+          NOW = int(time.time() * 1000)
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+
+          activated = int(db.execute(
+              "SELECT value FROM app_state WHERE key='ou_signal_prealert_activated_at'"
+          ).fetchone()[0])
+
+          rows = db.execute(
+              """SELECT p.match_id, p.rule_id, p.detected_at, p.notified_at,
+                        p.initial_signal_odds, m.fixture_source, m.kickoff_utc,
+                        m.status, m.inplay
+                   FROM ou_signal_prealerts p
+                   JOIN matches m ON m.id = p.match_id
+                  WHERE p.detected_at >= ?""",
+              (activated,),
+          ).fetchall()
+
+          def classify(r):
+              """First blocking reason, in the order the sender applies them."""
+              if r["notified_at"] is not None:
+                  return "已發出"
+              if r["rule_id"] not in NOTIFY_RULES:
+                  return "規則不在 TG 通知名單"
+              if r["fixture_source"] != "hkjc":
+                  return "賽事來源非馬會，被 fixture_source 過濾"
+              if r["initial_signal_odds"] is None:
+                  return "初盤水位無法覆核"
+              if r["kickoff_utc"] is not None and r["kickoff_utc"] <= NOW:
+                  lead = (r["kickoff_utc"] - r["detected_at"]) / 1000.0
+                  if lead < 600:
+                      return "偵測到已太接近開賽（開賽前不足 10 分鐘），過期前無法送出"
+                  return "已開賽，未來場次過濾已排除"
+              if r["inplay"]:
+                  return "進行中"
+              return "應可發出但仍未發"
+
+          buckets = {}
+          leads = {}
+          examples = {}
+          for r in rows:
+              reason = classify(r)
+              buckets[reason] = buckets.get(reason, 0) + 1
+              if r["notified_at"] is None and r["kickoff_utc"] is not None:
+                  leads.setdefault(reason, []).append(
+                      round((r["kickoff_utc"] - r["detected_at"]) / 60000.0, 1)
+                  )
+              if reason != "已發出" and len(examples.setdefault(reason, [])) < 3:
+                  examples[reason].append({
+                      "match_id": r["match_id"],
+                      "rule_id": r["rule_id"],
+                      "source": r["fixture_source"],
+                      "lead_min": round((r["kickoff_utc"] - r["detected_at"]) / 60000.0, 1)
+                      if r["kickoff_utc"] is not None else None,
+                  })
+
+          # Lead-time distribution for the notify-eligible HKJC rows, to show
+          # whether prealerts are actually being detected near T-30 or near T-5.
+          eligible = [
+              r for r in rows
+              if r["rule_id"] in NOTIFY_RULES and r["fixture_source"] == "hkjc"
+              and r["kickoff_utc"] is not None
+          ]
+          def lead_min(r):
+              return (r["kickoff_utc"] - r["detected_at"]) / 60000.0
+          hist = {"<5":0, "5-10":0, "10-20":0, "20-35":0, ">35":0}
+          for r in eligible:
+              v = lead_min(r)
+              key = "<5" if v < 5 else "5-10" if v < 10 else "10-20" if v < 20 \
+                  else "20-35" if v < 35 else ">35"
+              hist[key] += 1
+          sent = sum(1 for r in eligible if r["notified_at"] is not None)
+
+          by_rule = {}
+          for r in rows:
+              k = r["rule_id"]
+              d = by_rule.setdefault(k, {"total": 0, "sent": 0})
+              d["total"] += 1
+              if r["notified_at"] is not None:
+                  d["sent"] += 1
+
+          print(json.dumps({
+              "prealert_rows_since_activation": len(rows),
+              "reasons": dict(sorted(buckets.items(), key=lambda kv: -kv[1])),
+              "notify_eligible_hkjc": {
+                  "total": len(eligible),
+                  "sent": sent,
+                  "unsent": len(eligible) - sent,
+                  "detection_lead_minutes_before_kickoff": hist,
+              },
+              "by_rule": by_rule,
+              "examples": examples,
+          }, ensure_ascii=False, indent=2))
+          PY
