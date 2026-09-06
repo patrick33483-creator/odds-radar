@@ -28,7 +28,7 @@ jobs:
           cat > /tmp/analyse.py <<'PY'
           import sqlite3, json, datetime, sys
 
-          db = sqlite3.connect('file:/tmp/data-ro.db?mode=ro', uri=True)
+          db = sqlite3.connect('file:/opt/odds-radar/data/data.db?mode=ro', uri=True)
           db.row_factory = sqlite3.Row
           db.execute('PRAGMA query_only=ON')
 
@@ -141,5 +141,5 @@ jobs:
           set +e
           B64=$(cat /tmp/analyse.b64)
           ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo cp /opt/odds-radar/data/data.db /tmp/data-ro.db && sudo chmod 644 /tmp/data-ro.db && echo $B64 | base64 -d > /tmp/analyse.py && python3 /tmp/analyse.py && rm -f /tmp/data-ro.db /tmp/analyse.py"
+            "echo $B64 | base64 -d > /tmp/analyse.py && sudo python3 /tmp/analyse.py; code=\$?; rm -f /tmp/analyse.py; exit \$code"
           echo "exit=$?"
