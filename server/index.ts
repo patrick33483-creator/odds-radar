@@ -14,6 +14,10 @@ import { timingSafeEqual } from "node:crypto";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { fork, type ChildProcess } from "node:child_process";
 import { apiLogBody } from "./lib/api-log";
+import {
+  MILESTONE_HEARTBEAT_TIMEOUT_MS,
+  milestoneHeartbeatExpired,
+} from "./lib/worker-health";
 
 const app = express();
 const httpServer = createServer(app);
@@ -186,7 +190,12 @@ if (
     };
     startResearchMilestoneCollector({
       beforeRun: stopLowerCycle,
-      afterRun: startLowerCycle,
+      afterRun: () => {
+        parentPort?.postMessage({
+          event: "research_milestone_heartbeat",
+        });
+        startLowerCycle();
+      },
     });
     log("research milestone collector started in isolated worker", "milestone");
   } else if (processRole === "milestone-lower-once") {
@@ -288,6 +297,29 @@ if (
         const milestone = new Worker(process.argv[1], {
           workerData: { role: "milestone" },
         });
+        let lastMilestoneHeartbeatAt = Date.now();
+        milestone.on("message", (message) => {
+          if (
+            message
+            && typeof message === "object"
+            && "event" in message
+            && message.event === "research_milestone_heartbeat"
+          ) {
+            // Use the supervisor's receipt time. A worker clock value must not
+            // be able to extend or prematurely expire its own health deadline.
+            lastMilestoneHeartbeatAt = Date.now();
+          }
+        });
+        const milestoneWatchdog = setInterval(() => {
+          if (!milestoneHeartbeatExpired(lastMilestoneHeartbeatAt, Date.now())) return;
+          console.error(
+            `Research milestone heartbeat stale for more than ${MILESTONE_HEARTBEAT_TIMEOUT_MS}ms`,
+          );
+          // Keep container health honest. Docker restarts the whole process
+          // rather than serving HTTP while checkpoint collection is stalled.
+          process.exit(1);
+        }, 30_000);
+        milestoneWatchdog.unref();
         collector.on("error", (err) => {
           console.error("Background collector worker error:", err);
         });
@@ -300,12 +332,11 @@ if (
           console.error("Research milestone worker error:", err);
         });
         milestone.on("exit", (code) => {
-          if (code !== 0) {
-            console.error(`Research milestone worker exited with code ${code}`);
-            // Keep container health honest: Docker restarts the whole process
-            // instead of leaving HTTP green with checkpoint collection dead.
-            process.exit(1);
-          }
+          console.error(`Research milestone worker exited with code ${code}`);
+          // A clean worker exit is still fatal: this worker is expected to run
+          // for the full container lifetime. Never leave HTTP healthy while
+          // T30/T15/T5 collection has silently stopped.
+          process.exit(1);
         });
       }
     },

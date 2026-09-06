@@ -77,6 +77,22 @@ if docker compose logs --since 15m radar 2>&1 | grep -Eq \
   exit 1
 fi
 echo "OK no recent automatic scan errors"
+
+recent_radar_logs="$(docker compose logs --since 5m radar 2>&1)"
+if grep -Eq \
+  'Research milestone worker exited|Research milestone heartbeat stale|"event":"research_milestone_error"' \
+  <<<"$recent_radar_logs"; then
+  echo "FAIL recent milestone worker failure" >&2
+  grep -E \
+    'Research milestone worker exited|Research milestone heartbeat stale|"event":"research_milestone_error"' \
+    <<<"$recent_radar_logs" >&2
+  exit 1
+fi
+grep -q '"event":"research_milestone"' <<<"$recent_radar_logs" || {
+  echo "FAIL no completed research milestone tick in current container logs" >&2
+  exit 1
+}
+echo "OK milestone worker completed a recent tick"
 echo "=== radar production health PASS ==="
 
 # The frontend's board is driven entirely by this authenticated response.  Test

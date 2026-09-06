@@ -339,9 +339,10 @@ function installResearchMilestoneCollection(hooks: ResearchMilestoneHooks = {}):
   researchMilestoneStartupTimer = setTimeout(() => {
     void run();
     researchMilestoneTimer = setInterval(() => void run(), AUTO_SCAN_CHECK_MS);
-    researchMilestoneTimer.unref();
   }, 5_000);
-  researchMilestoneStartupTimer.unref();
+  // This scheduler is the dedicated milestone worker's lifetime owner.
+  // Keeping both timers referenced prevents Node from cleanly exiting the
+  // worker after a disposable lower-tier child finishes.
 }
 
 /**
