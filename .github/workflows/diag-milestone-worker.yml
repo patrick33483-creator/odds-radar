@@ -1,0 +1,127 @@
+name: Diagnose milestone worker (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Read worker + candidate state
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/odds-radar
+
+          echo '=== container uptime / restart ==='
+          cid="$(sudo docker compose ps -aq radar)"
+          sudo docker inspect --format \
+            'started={{.State.StartedAt}} restarts={{.RestartCount}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' \
+            "$cid" || true
+
+          echo
+          echo '=== last 6h milestone / worker exit events ==='
+          logs="$(sudo docker compose logs --since 6h radar 2>&1 || true)"
+          printf '%s\n' "$logs" | grep -cE 'research_milestone\b' \
+            | awk '{print "research_milestone events (6h): "$0}'
+          printf '%s\n' "$logs" | grep -cE 'research_milestone_error' \
+            | awk '{print "research_milestone_error (6h): "$0}'
+          printf '%s\n' "$logs" | grep -cE 'research_milestone_lower_tier\b' \
+            | awk '{print "research_milestone_lower_tier (6h): "$0}'
+          printf '%s\n' "$logs" | grep -cE 'research_milestone_lower_tier_error' \
+            | awk '{print "research_milestone_lower_tier_error (6h): "$0}'
+          printf '%s\n' "$logs" | grep -cE 'Research milestone worker exited|Lower research cycle worker exited|Background collector worker exited' \
+            | awk '{print "worker exit lines (6h): "$0}'
+          echo
+          echo '--- last 15 worker/exit/error lines ---'
+          printf '%s\n' "$logs" | grep -E 'research_milestone|worker exited|Lower research cycle|starvation|milestone collector started' \
+            | tail -15 || true
+
+          echo
+          echo '=== candidate + snapshot state (screenshot window 6/9 10:00-12:00 HKT) ==='
+          sudo python3 - <<'PY'
+          import json, sqlite3, datetime
+          hkt = datetime.timezone(datetime.timedelta(hours=8))
+          # kickoff window = 2026-09-06 10:00-12:00 HKT (matches the screenshot)
+          lo = int(datetime.datetime(2026,9,6,10,0,tzinfo=hkt).timestamp()*1000)
+          hi = int(datetime.datetime(2026,9,6,12,0,tzinfo=hkt).timestamp()*1000)
+          db = sqlite3.connect("file:/opt/odds-radar/data/data.db?mode=ro", uri=True)
+          db.execute("PRAGMA query_only=ON")
+          db.row_factory = sqlite3.Row
+
+          total = db.execute(
+              "SELECT COUNT(*) FROM matches WHERE kickoff_utc>=? AND kickoff_utc<?",
+              (lo, hi)).fetchone()[0]
+          by_source = dict(db.execute(
+              """SELECT fixture_source, COUNT(*) FROM matches
+                  WHERE kickoff_utc>=? AND kickoff_utc<?
+                  GROUP BY fixture_source""", (lo, hi)).fetchall())
+          eligible_sql = db.execute(
+              """SELECT COUNT(*) FROM matches
+                  WHERE kickoff_utc>=? AND kickoff_utc<?
+                    AND fixture_source IN ('hkjc','pinnacle')
+                    AND inplay=0""", (lo, hi)).fetchone()[0]
+          with_pinnacle_map = db.execute(
+              """SELECT COUNT(*) FROM matches m
+                  LEFT JOIN pinnacle_source_map p ON p.match_id=m.id
+                  WHERE m.kickoff_utc>=? AND m.kickoff_utc<?
+                    AND m.fixture_source IN ('hkjc','pinnacle')
+                    AND (p.titan_id IS NOT NULL OR p.pinnapi_id IS NOT NULL
+                         OR m.titan_id IS NOT NULL
+                         OR m.pinnacle_match_id LIKE 'titan:%'
+                         OR m.pinnacle_match_id LIKE 'pinnapi:%')""",
+              (lo, hi)).fetchone()[0]
+
+          snap = db.execute(
+              """SELECT s.stage, s.provider, COUNT(DISTINCT s.match_id) matches
+                   FROM research_timeline_snapshots s
+                   JOIN matches m ON m.id=s.match_id
+                  WHERE m.kickoff_utc>=? AND m.kickoff_utc<?
+                    AND s.market IN ('AH','OU')
+                  GROUP BY s.stage, s.provider
+                  ORDER BY s.stage, s.provider""", (lo, hi)).fetchall()
+
+          # last research_timeline_snapshots insert time overall
+          last_snap = db.execute(
+              "SELECT MAX(fetched_at) FROM research_timeline_snapshots"
+          ).fetchone()[0]
+          last_snap_hkt = (datetime.datetime.fromtimestamp(last_snap/1000, hkt).isoformat()
+                          if last_snap else None)
+          # milestone snapshot in the last hour (any match)
+          now = int(datetime.datetime.now(hkt).timestamp()*1000)
+          milestone_last_hr = db.execute(
+              """SELECT stage, COUNT(*) FROM research_timeline_snapshots
+                  WHERE stage IN ('T30','T15','T5')
+                    AND fetched_at >= ?
+                  GROUP BY stage""", (now - 60*60_000,)).fetchall()
+          db.close()
+
+          print(json.dumps({
+              "window_hkt": "2026-09-06 10:00-12:00",
+              "matches_in_window": total,
+              "by_fixture_source": by_source,
+              "eligible_for_milestone_worker": eligible_sql,
+              "eligible_with_pinnacle_mapping": with_pinnacle_map,
+              "snapshot_counts_by_stage_provider": [dict(r) for r in snap],
+              "latest_snapshot_insert_hkt": last_snap_hkt,
+              "milestone_inserts_last_hour": [dict(r) for r in milestone_last_hr],
+          }, ensure_ascii=False, indent=2))
+          PY
+          REMOTE
