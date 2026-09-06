@@ -30,7 +30,7 @@ jobs:
             set +a
             test -n "${RADAR_ACCESS_USER:-}" -a -n "${RADAR_ACCESS_PASSWORD:-}"
             echo "commit=$(git rev-parse HEAD)"
-            echo "RADAR_HKJC_ONLY=$(docker compose exec -T radar printenv RADAR_HKJC_ONLY)"
+            echo "RADAR_HKJC_ONLY=$(docker compose exec -T radar printenv RADAR_HKJC_ONLY </dev/null)"
             docker compose ps
             curl --fail --silent --show-error \
               --max-time 30 \
