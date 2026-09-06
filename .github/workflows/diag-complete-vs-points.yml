@@ -1,0 +1,114 @@
+name: Diag complete-pairs vs points
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: diag-complete-vs-points
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install SSH client
+        run: sudo apt-get update -y && sudo apt-get install -y openssh-client
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Read-only comparison
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set +e
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo cp /opt/odds-radar/data/data.db /tmp/data-ro.db && sudo chmod 644 /tmp/data-ro.db && python3 - <<'PY'
+          import sqlite3, json, datetime, os
+          db = sqlite3.connect('file:/tmp/data-ro.db?mode=ro', uri=True)
+          db.row_factory = sqlite3.Row
+          db.execute('PRAGMA query_only=ON')
+
+          now = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+          # Screenshot window: 6/9 10:00-12:00 HKT = 6/9 02:00-04:00 UTC
+          # (Compaction summary says user showed 10:00-12:00 HKT missing rows.)
+          lo = int(datetime.datetime(2026, 9, 6, 2, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+          hi = int(datetime.datetime(2026, 9, 6, 4, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+          # Candidate SQL that the worker uses.
+          cand = db.execute(
+              \"SELECT id, fixture_source, kickoff_utc, status, titan_id, pinnacle_match_id \"
+              \"FROM matches WHERE fixture_source IN ('hkjc','pinnacle') AND inplay=0 \"
+              \"AND kickoff_utc>? AND kickoff_utc<=?\",
+              (lo, hi + 30 * 60_000),
+          ).fetchall()
+
+          # Engine 'complete pair' predicate (pinnacle AH/OU, count(distinct selection)>=2).
+          engine_complete = {}
+          for m in cand:
+              rows = db.execute(
+                  \"SELECT stage, market FROM research_timeline_snapshots \"
+                  \"WHERE match_id=? AND provider='pinnacle' AND market IN ('AH','OU') \"
+                  \"AND stage IN ('T30','T15','T5') \"
+                  \"GROUP BY stage, market, line_key \"
+                  \"HAVING COUNT(DISTINCT selection)>=2\",
+                  (m['id'],),
+              ).fetchall()
+              engine_complete[m['id']] = set(f\"{r['stage']}:{r['market']}\" for r in rows)
+
+          # Dashboard predicate: research_timeline_points.status='captured'.
+          dash_captured = {}
+          for m in cand:
+              rows = db.execute(
+                  \"SELECT stage, status FROM research_timeline_points \"
+                  \"WHERE match_id=? AND stage IN ('T30','T15','T5')\",
+                  (m['id'],),
+              ).fetchall()
+              dash_captured[m['id']] = {r['stage']: r['status'] for r in rows}
+
+          divergence = []
+          for m in cand:
+              eng = engine_complete[m['id']]
+              dash = dash_captured[m['id']]
+              # For each stage, engine says 'stop' if AH+OU both present.
+              # Dashboard says 'captured' only if points.status='captured'.
+              for stage in ('T30', 'T15', 'T5'):
+                  eng_done = (f'{stage}:AH' in eng) and (f'{stage}:OU' in eng)
+                  dash_status = dash.get(stage, '(no row)')
+                  if eng_done and dash_status != 'captured':
+                      divergence.append({
+                          'match_id': m['id'],
+                          'stage': stage,
+                          'engine_says': 'complete_stop',
+                          'dashboard_points_status': dash_status,
+                      })
+
+          print(json.dumps({
+              'candidates_in_window': len(cand),
+              'engine_complete_all_three_stages': sum(
+                  1 for m in cand
+                  if all((f'{s}:AH' in engine_complete[m['id']]) and (f'{s}:OU' in engine_complete[m['id']]) for s in ('T30','T15','T5'))
+              ),
+              'dashboard_captured_all_three_stages': sum(
+                  1 for m in cand
+                  if all(dash_captured[m['id']].get(s) == 'captured' for s in ('T30','T15','T5'))
+              ),
+              'divergence_count': len(divergence),
+              'divergence_sample': divergence[:20],
+              'points_status_breakdown': {
+                  stage: {
+                      status: sum(1 for m in cand if dash_captured[m['id']].get(stage) == status)
+                      for status in ('captured', 'partial', 'pending', '(no row)')
+                  } for stage in ('T30','T15','T5')
+              },
+          }, ensure_ascii=False, indent=2))
+          PY
+          "
+          echo "exit=$?"
