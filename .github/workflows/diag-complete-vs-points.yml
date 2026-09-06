@@ -86,6 +86,16 @@ jobs:
               (lo, hi + 30 * 60_000),
           ).fetchall()
 
+          candidate_state = db.execute(
+              "SELECT m.id, m.fixture_source, m.kickoff_utc, m.status, m.inplay, "
+              "m.titan_id, m.pinnacle_match_id, p.pinnapi_id, p.titan_id AS mapped_titan_id, "
+              "p.active_source, m.updated_at AS match_updated_at, p.updated_at AS map_updated_at "
+              "FROM matches m LEFT JOIN pinnacle_source_map p ON p.match_id=m.id "
+              "WHERE m.kickoff_utc>? AND m.kickoff_utc<=? "
+              "AND m.fixture_source IN ('hkjc','pinnacle') ORDER BY m.kickoff_utc, m.id",
+              (lo, hi + 30 * 60_000),
+          ).fetchall()
+
           now = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
           latest = db.execute(
               "SELECT stage, provider, COUNT(*) inserts, MAX(captured_at) last_ms "
@@ -105,6 +115,7 @@ jobs:
               'divergence_sample': divergence[:20],
               'points_status_breakdown': {},
               'snapshot_counts_in_window': [dict(r) for r in snap_counts],
+              'candidate_state': [dict(r) for r in candidate_state],
               'milestone_inserts_last_6h': [
                   {'stage': r['stage'], 'provider': r['provider'], 'inserts': r['inserts'],
                    'last_hkt': datetime.datetime.fromtimestamp(r['last_ms']/1000, datetime.timezone(datetime.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}
@@ -140,6 +151,13 @@ jobs:
         run: |
           set +e
           B64=$(cat /tmp/analyse.b64)
+          echo "=== live container process tree ==="
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd /opt/odds-radar && sudo docker compose top radar"
+          echo "=== latest milestone lifecycle lines ==="
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd /opt/odds-radar && sudo docker compose logs --since 7h radar 2>&1 | grep -E 'milestone collector started|research_milestone|Research milestone worker|Lower research cycle' | tail -100"
+          echo "=== read-only database state ==="
           ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
             "echo $B64 | base64 -d > /tmp/analyse.py && sudo python3 /tmp/analyse.py; code=\$?; rm -f /tmp/analyse.py; exit \$code"
           echo "exit=$?"
