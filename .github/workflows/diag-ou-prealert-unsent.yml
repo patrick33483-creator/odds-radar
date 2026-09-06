@@ -138,7 +138,26 @@ jobs:
               by_day[hkt(r["detected_at"])[:10]] = by_day.get(hkt(r["detected_at"])[:10], 0) + 1
           sent_rows = [r for r in rows if r["notified_at"] is not None]
 
+          # Per notify-rule, per detection day: did the row send, or was it
+          # dropped for a missing initial price? This separates a defect that
+          # is still producing silent rows from residue of an older formula.
+          per_rule_day = {}
+          for r in rows:
+              if r["rule_id"] not in NOTIFY_RULES:
+                  continue
+              day = hkt(r["detected_at"])[:10]
+              d = per_rule_day.setdefault(r["rule_id"], {}).setdefault(
+                  day, {"total": 0, "sent": 0, "no_initial_odds": 0})
+              d["total"] += 1
+              if r["notified_at"] is not None:
+                  d["sent"] += 1
+              elif r["initial_signal_odds"] is None:
+                  d["no_initial_odds"] += 1
+
           print(json.dumps({
+              "notify_rules_by_day": {
+                  k: dict(sorted(v.items())) for k, v in per_rule_day.items()
+              },
               "suppressed_missing_initial_odds": {
                   "count": len(suppressed),
                   "by_rule": {
