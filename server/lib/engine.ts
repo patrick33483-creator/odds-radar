@@ -53,6 +53,7 @@ import {
   pendingOuPrealerts,
   pendingOuSignals,
   requestOuNotificationDrain,
+  recentlyStartedOuMatchIds,
   syncOuSignalObservations,
   syncOuSignalPrealerts,
 } from "./ou-signals";
@@ -169,6 +170,12 @@ export const RESEARCH_MILESTONE_CONCURRENCY = 16;
  * regardless of how many fixtures were selected.
  */
 export const RESEARCH_MILESTONE_LOOP_MS = 20_000;
+/**
+ * How often the core worker re-evaluates fixtures that already kicked off.
+ * Short enough that a missed T-5 observation is recovered while its result is
+ * still pending, long enough that the 30-second tick is not slowed by it.
+ */
+export const OU_SWEEP_INTERVAL_MS = 5 * 60_000;
 /** SQLite caps bound parameters per statement; chunk id lists below that. */
 const SQLITE_PARAM_CHUNK = 500;
 
@@ -794,6 +801,7 @@ export class RadarEngine {
   private lowerTierResearchController: AbortController | null = null;
   /** Rotates the single lower-tier wave so low concurrency cannot starve T15/T30. */
   private lowerMilestoneDispatchOffset = 0;
+  private lastOuSweepAt = 0;
   private ouNotificationDrainRunning = false;
   private readonly ouNotificationSender: boolean;
   // The board is a read-only projection.  Build it after a refresh and reuse
@@ -2205,19 +2213,42 @@ export class RadarEngine {
     return { fetched, failed, rows };
   }
 
+  /**
+   * Recently started fixtures to re-evaluate, at most once per sweep interval.
+   * Kickoff removes a fixture from the collector's target set, so without this
+   * a T-5 quote captured minutes before kickoff can never reach rule
+   * evaluation. Returns an empty list until the interval elapses so the
+   * latency-sensitive core tick does not pay for the scan every 30 seconds.
+   */
+  private dueOuSweepMatchIds(now: number): string[] {
+    if (now - this.lastOuSweepAt < OU_SWEEP_INTERVAL_MS) return [];
+    this.lastOuSweepAt = now;
+    try {
+      return recentlyStartedOuMatchIds(now);
+    } catch (err) {
+      log("ou_signal_sweep_error", { error: (err as Error).message });
+      return [];
+    }
+  }
+
   /** Materialize signals only for matches touched by the current collector. */
   private syncOuNotifications(matchIds: string[], source: string): void {
     const targetIds = [...new Set(matchIds)];
     if (!targetIds.length) return;
-    try {
-      syncOuSignalPrealerts(targetIds);
-    } catch (err) {
-      log("ou_t30_prealert_sync_error", { source, error: (err as Error).message });
-    }
-    try {
-      syncOuSignalObservations(targetIds);
-    } catch (err) {
-      log("ou_signal_sync_error", { source, error: (err as Error).message });
+    // The post-kickoff sweep can push this list past the bound-parameter cap,
+    // so every id list is chunked rather than assumed small.
+    for (let offset = 0; offset < targetIds.length; offset += SQLITE_PARAM_CHUNK) {
+      const chunk = targetIds.slice(offset, offset + SQLITE_PARAM_CHUNK);
+      try {
+        syncOuSignalPrealerts(chunk);
+      } catch (err) {
+        log("ou_t30_prealert_sync_error", { source, error: (err as Error).message });
+      }
+      try {
+        syncOuSignalObservations(chunk);
+      } catch (err) {
+        log("ou_signal_sync_error", { source, error: (err as Error).message });
+      }
     }
   }
 
@@ -2846,7 +2877,10 @@ export class RadarEngine {
       : "research_milestone_lower_tier";
     if (mode === "core") {
       // Do not await Telegram delivery in the latency-sensitive core worker.
-      void this.syncAndDrainOuNotifications([...stats.attemptedMatchIds], notificationSource);
+      void this.syncAndDrainOuNotifications(
+        [...stats.attemptedMatchIds, ...this.dueOuSweepMatchIds(startedAt)],
+        notificationSource,
+      );
     } else {
       // This process is not a sender in production; fail fast on DB contention.
       await this.syncAndDrainOuNotifications(

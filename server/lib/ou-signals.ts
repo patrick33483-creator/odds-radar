@@ -1044,6 +1044,36 @@ function selectUnsentOuPrealerts(
     .filter((row) => OU_TELEGRAM_RULE_IDS.has(row.ruleId));
 }
 
+/**
+ * Fixtures whose kickoff already passed but whose checkpoint evaluation may
+ * never have run. `researchStageFor` stops returning T5 at kickoff, so the
+ * collector drops the fixture from its target set on the next tick and no
+ * later pass materializes its observation. A T-5 quote captured minutes before
+ * kickoff therefore leaves almost no window for the evaluating pass, and a
+ * qualifying signal can be lost permanently. Sweeping a bounded recent window
+ * recovers those rows. Notification queues filter on a future kickoff, so a
+ * row recovered after kickoff is recorded for history and never sent.
+ */
+export function recentlyStartedOuMatchIds(
+  now = Date.now(),
+  lookbackMs = 6 * 60 * 60_000,
+  limit = 600,
+): string[] {
+  const rows = rawDb.prepare(
+    `SELECT DISTINCT s.match_id
+       FROM research_timeline_snapshots s
+       JOIN matches m ON m.id=s.match_id
+      WHERE s.market='OU'
+        AND s.stage='T5'
+        AND m.fixture_source='hkjc'
+        AND m.kickoff_utc<=?
+        AND m.kickoff_utc>=?
+      ORDER BY m.kickoff_utc DESC
+      LIMIT ?`,
+  ).all(now, now - lookbackMs, limit) as Array<{ match_id: string }>;
+  return rows.map((row) => row.match_id);
+}
+
 export function unsentOuPrealerts(matchIds?: string[], now = Date.now()): OuSignalPrealert[] {
   // Preserve the no-argument maintenance scan while making an explicit empty
   // engine target list a no-op.

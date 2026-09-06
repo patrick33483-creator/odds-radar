@@ -19,6 +19,8 @@ let completeOuNotificationDrainPass:
   typeof import("../server/lib/ou-signals").completeOuNotificationDrainPass;
 let unsentOuPrealerts: typeof import("../server/lib/ou-signals").unsentOuPrealerts;
 let unsentOuSignals: typeof import("../server/lib/ou-signals").unsentOuSignals;
+let recentlyStartedOuMatchIds:
+  typeof import("../server/lib/ou-signals").recentlyStartedOuMatchIds;
 let OU_SIGNAL_RULES: typeof import("../server/lib/ou-signals").OU_SIGNAL_RULES;
 let OU_TELEGRAM_RULE_IDS: typeof import("../server/lib/ou-signals").OU_TELEGRAM_RULE_IDS;
 
@@ -39,6 +41,7 @@ beforeAll(async () => {
   completeOuNotificationDrainPass = signals.completeOuNotificationDrainPass;
   unsentOuPrealerts = signals.unsentOuPrealerts;
   unsentOuSignals = signals.unsentOuSignals;
+  recentlyStartedOuMatchIds = signals.recentlyStartedOuMatchIds;
   OU_SIGNAL_RULES = signals.OU_SIGNAL_RULES;
   OU_TELEGRAM_RULE_IDS = signals.OU_TELEGRAM_RULE_IDS;
   store.migrate();
@@ -873,4 +876,44 @@ describe("OU signal monitor", () => {
     rawDb.prepare("DELETE FROM research_timeline_points WHERE match_id=?").run(matchId);
     rawDb.prepare("DELETE FROM matches WHERE id=?").run(matchId);
   });
+  it("recovers a checkpoint observation after kickoff without queueing Telegram", () => {
+    const now = afterWatchActivation;
+    // Kickoff already passed, so the collector no longer selects this fixture
+    // and only the post-kickoff sweep can still evaluate its T-5 quote.
+    const id = "hkjc-started-sweep";
+    addMatch(id, now - 15 * 60_000);
+    addStage(id, "hkjc", "initial", "2.5", 1.74, 1.97, now - 20 * 60 * 60_000);
+    addStage(id, "hkjc", "T30", "2.5", 1.71, 2.01, now - 45 * 60_000);
+    addStage(id, "hkjc", "T5", "2.5", 1.71, 2.01, now - 19 * 60_000);
+
+    const swept = recentlyStartedOuMatchIds(now);
+    expect(swept).toContain(id);
+
+    syncOuSignalObservations([id]);
+    const stored = rawDb.prepare(
+      "SELECT rule_id,notified_at FROM ou_signal_observations WHERE match_id=?",
+    ).all(id) as Array<{ rule_id: string; notified_at: number | null }>;
+    expect(stored.map((row) => row.rule_id))
+      .toContain("hkjc-ooo-t5-selected-le-180-under-watch");
+    expect(stored.every((row) => row.notified_at === null)).toBe(true);
+
+    // A fixture recovered after kickoff enters history only; the send queue
+    // filters on a future kickoff so no late alert is delivered.
+    expect(pendingOuSignals(now).some((signal) => signal.matchId === id)).toBe(false);
+  });
+
+  it("excludes fixtures outside the sweep lookback window", () => {
+    const now = afterWatchActivation;
+    const stale = "hkjc-started-sweep-stale";
+    addMatch(stale, now - 9 * 60 * 60_000);
+    addStage(stale, "hkjc", "T5", "2.5", 1.71, 2.01, now - 9 * 60 * 60_000);
+    const upcoming = "hkjc-sweep-upcoming";
+    addMatch(upcoming, now + 20 * 60_000);
+    addStage(upcoming, "hkjc", "T5", "2.5", 1.71, 2.01, now - 60_000);
+
+    const swept = recentlyStartedOuMatchIds(now);
+    expect(swept).not.toContain(stale);
+    expect(swept).not.toContain(upcoming);
+  });
+
 });

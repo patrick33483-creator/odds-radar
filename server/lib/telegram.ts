@@ -294,6 +294,25 @@ export function buildOuSignalMessage(signals: OuSignalObservation[]): string {
   ].join("\n");
 }
 
+
+/**
+ * One failed message must not strand the rest of the queue. The previous
+ * senders threw on the first failure, so a single rejected payload left every
+ * later alert unsent until another drain pass happened to run. Each delivery
+ * is now independent, and the per-alert detection-to-delivery latency is
+ * logged so a queue that drains late is measurable rather than invisible.
+ */
+function logOuDelivery(kind: string, detectedAt: number, error?: string): void {
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    scope: "radar",
+    event: error ? "telegram_ou_delivery_error" : "telegram_ou_delivery",
+    kind,
+    latency_ms: Date.now() - detectedAt,
+    ...(error ? { error } : {}),
+  }));
+}
+
 export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<number> {
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
@@ -303,24 +322,35 @@ export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<n
   for (const signal of signals) {
     byMatch.set(signal.matchId, [...(byMatch.get(signal.matchId) ?? []), signal]);
   }
+  let lastError: string | null = null;
   for (const groupedSignals of byMatch.values()) {
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: buildOuSignalMessage(groupedSignals),
-        disable_web_page_preview: true,
-      }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
-    if (!response.ok || !payload.ok) {
-      throw new Error(`Telegram OU signal delivery failed: ${payload.description ?? response.status}`);
+    const detectedAt = Math.min(...groupedSignals.map((signal) => signal.detectedAt));
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: buildOuSignalMessage(groupedSignals),
+          disable_web_page_preview: true,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
+      if (!response.ok || !payload.ok) {
+        throw new Error(`Telegram OU signal delivery failed: ${payload.description ?? response.status}`);
+      }
+      for (const signal of groupedSignals) markOuSignalNotified(signal.uniqueKey);
+      sent += 1;
+      logOuDelivery("signal", detectedAt);
+    } catch (err) {
+      lastError = (err as Error).message;
+      logOuDelivery("signal", detectedAt, lastError);
     }
-    for (const signal of groupedSignals) markOuSignalNotified(signal.uniqueKey);
-    sent += 1;
   }
+  // An unsent row keeps notified_at NULL, so the next drain retries it. The
+  // error is still surfaced once the whole queue has been attempted.
+  if (lastError && !sent) throw new Error(lastError);
   return sent;
 }
 
@@ -365,24 +395,32 @@ export async function notifyOuPrealerts(signals: OuSignalPrealert[]): Promise<nu
   const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
   if (!token || !chatId || !signals.length) return 0;
   let sent = 0;
+  let lastError: string | null = null;
   for (const signal of signals) {
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: buildOuPrealertMessage(signal),
-        disable_web_page_preview: true,
-      }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
-    if (!response.ok || !payload.ok) {
-      throw new Error(`Telegram OU T-30 prealert delivery failed: ${payload.description ?? response.status}`);
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: buildOuPrealertMessage(signal),
+          disable_web_page_preview: true,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const payload = (await response.json().catch(() => ({}))) as TelegramApiResponse;
+      if (!response.ok || !payload.ok) {
+        throw new Error(`Telegram OU T-30 prealert delivery failed: ${payload.description ?? response.status}`);
+      }
+      markOuPrealertNotified(signal.uniqueKey);
+      sent += 1;
+      logOuDelivery("prealert", signal.detectedAt);
+    } catch (err) {
+      lastError = (err as Error).message;
+      logOuDelivery("prealert", signal.detectedAt, lastError);
     }
-    markOuPrealertNotified(signal.uniqueKey);
-    sent += 1;
   }
+  if (lastError && !sent) throw new Error(lastError);
   return sent;
 }
 
