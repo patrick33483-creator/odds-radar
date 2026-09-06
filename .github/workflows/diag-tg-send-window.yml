@@ -1,0 +1,69 @@
+name: 診斷 TG 發送延遲窗口（只讀）
+
+on:
+  workflow_dispatch:
+    inputs:
+      match_id:
+        description: 目標 match_id, e.g. hkjc:50074928
+        required: true
+      window_hkt:
+        description: HKT 起訖 e.g. 2026-09-06T21:20:00~2026-09-06T21:50:00
+        required: true
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Read TG send events
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          MATCH_ID: ${{ inputs.match_id }}
+          WINDOW_HKT: ${{ inputs.window_hkt }}
+        run: |
+          timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            'MATCH_ID='"$MATCH_ID"' bash -s' <<'REMOTE'
+          set +e
+          set -u
+          cd /opt/odds-radar
+
+          echo "=== container restart history (last 24h) ==="
+          cid="$(sudo docker compose ps -aq radar)"
+          sudo docker inspect --format \
+            'started={{.State.StartedAt}} restarts={{.RestartCount}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' \
+            "$cid"
+
+          echo
+          echo "=== telegram / drain / prealert log 6h ==="
+          logs="$(sudo docker compose logs --since 6h radar 2>&1)"
+
+          echo "-- lines mentioning MATCH_ID --"
+          printf '%s\n' "$logs" | grep -F "$MATCH_ID" | tail -40 || true
+
+          echo
+          echo "-- telegram_ou_t30_prealerts events --"
+          printf '%s\n' "$logs" | grep -E 'telegram_ou_t30_prealerts|telegram_ou_t30_prealert_error' | tail -30 || true
+
+          echo
+          echo "-- ou_notification_drain events --"
+          printf '%s\n' "$logs" | grep -E 'ou_notification_drain|ouNotificationSender|isOuNotificationSender' | tail -30 || true
+
+          echo
+          echo "-- telegram HTTP failures / rate-limit --"
+          printf '%s\n' "$logs" | grep -iE 'telegram.*(error|429|timeout|retry|failed)' | tail -30 || true
+
+          echo
+          echo "-- research_milestone cadence (last 40) --"
+          printf '%s\n' "$logs" | grep -E 'research_milestone\b|research_milestone_lower_tier\b' | tail -40 || true
+          REMOTE
