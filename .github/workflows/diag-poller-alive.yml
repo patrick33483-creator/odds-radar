@@ -33,11 +33,15 @@ jobs:
           echo "=== deployed commit ==="
           sudo git -C /opt/odds-radar log --oneline -3 2>/dev/null
 
-          echo "=== poller code present in built image ==="
-          sudo docker compose exec -T radar sh -c \
-            'grep -c "pollOuNotificationDrain" /app/dist/index.js 2>/dev/null || echo "0"'
-          sudo docker compose exec -T radar sh -c \
-            'grep -c "sender_poll" /app/dist/index.js 2>/dev/null || echo "0"'
+          echo "=== built bundle listing ==="
+          sudo docker compose exec -T radar sh -c 'ls -la /app/dist' < /dev/null 2>/dev/null
+
+          echo "=== poller code present in built bundle (index.cjs) ==="
+          for pat in pollOuNotificationDrain sender_poll ouDrainPoller; do
+            n=$(sudo docker compose exec -T radar sh -c \
+              "grep -c '$pat' /app/dist/index.cjs 2>/dev/null || echo 0" < /dev/null 2>/dev/null | tr -d '\r')
+            echo "$pat: ${n:-0}"
+          done
 
           echo "=== container start / restarts ==="
           cid="$(sudo docker compose ps -aq radar)"
@@ -51,8 +55,9 @@ jobs:
           echo "=== last 5 sender_poll lines ==="
           sudo grep 'sender_poll' "$logpath" 2>/dev/null | tail -5
 
-          echo "=== milestone worker boot line ==="
+          echo "=== milestone worker boot line (proves setInterval was reached) ==="
           sudo grep -c 'research milestone collector started' "$logpath" 2>/dev/null || echo 0
+          sudo grep 'research milestone collector started' "$logpath" 2>/dev/null | tail -3
 
           echo "=== poller error lines ==="
           sudo grep -c 'OU notification drain poller error' "$logpath" 2>/dev/null || echo 0
