@@ -804,6 +804,8 @@ export class RadarEngine {
   private lastOuSweepAt = 0;
   private ouNotificationDrainRunning = false;
   private readonly ouNotificationSender: boolean;
+  private ouSenderPollTicks = 0;
+  private ouSenderPollSkipped = 0;
   // The board is a read-only projection.  Build it after a refresh and reuse
   // that immutable object for API polls so a busy provider/scan cannot make a
   // client request synchronously rebuild every market calculation.
@@ -2320,23 +2322,58 @@ export class RadarEngine {
    * milestone cadence otherwise strands them past kickoff.
    */
   async pollOuNotificationDrain(): Promise<void> {
-    if (!this.ouNotificationSender) return;
-    if (this.ouNotificationDrainRunning) return;
+    // Liveness instrumentation. The previous revision only logged when it had
+    // actually sent something, which made "poller never fired" and "poller fired
+    // but found nothing" indistinguishable in the container log. Producers are
+    // non-sender workers, so a silent poller strands T-5 rows for a full
+    // milestone tick (~15 min) and the buy window closes.
+    this.ouSenderPollTicks += 1;
+    const tick = this.ouSenderPollTicks;
+    if (!this.ouNotificationSender) {
+      if (tick === 1) log("ou_sender_poll_disabled", { reason: "not_sender_process" });
+      return;
+    }
+    if (this.ouNotificationDrainRunning) {
+      this.ouSenderPollSkipped += 1;
+      log("ou_sender_poll_skipped", { tick, skipped: this.ouSenderPollSkipped });
+      return;
+    }
     this.ouNotificationDrainRunning = true;
     try {
+      let prealertCount = 0;
+      let signalCount = 0;
+      let prealertSent = 0;
+      let signalSent = 0;
       try {
         const prealerts = pendingOuPrealerts();
-        const sent = prealerts.length ? await notifyOuPrealerts(prealerts) : 0;
-        if (sent) log("telegram_ou_t30_prealerts", { source: "sender_poll", detected: prealerts.length, sent });
+        prealertCount = prealerts.length;
+        prealertSent = prealerts.length ? await notifyOuPrealerts(prealerts) : 0;
+        if (prealertSent) {
+          log("telegram_ou_t30_prealerts", { source: "sender_poll", detected: prealertCount, sent: prealertSent });
+        }
       } catch (err) {
         log("telegram_ou_t30_prealert_error", { source: "sender_poll", error: (err as Error).message });
       }
       try {
         const signals = pendingOuSignals();
-        const sent = signals.length ? await notifyOuSignals(signals) : 0;
-        if (sent) log("telegram_ou_signals", { source: "sender_poll", detected: signals.length, sent });
+        signalCount = signals.length;
+        signalSent = signals.length ? await notifyOuSignals(signals) : 0;
+        if (signalSent) {
+          log("telegram_ou_signals", { source: "sender_poll", detected: signalCount, sent: signalSent });
+        }
       } catch (err) {
         log("telegram_ou_signal_error", { source: "sender_poll", error: (err as Error).message });
+      }
+      // Always log when there was work, plus a bounded liveness beat every 10
+      // ticks (~5 min) so an idle-but-alive poller is still provable.
+      if (prealertCount || signalCount || tick % 10 === 1) {
+        log("ou_sender_poll_tick", {
+          tick,
+          pendingPrealerts: prealertCount,
+          pendingSignals: signalCount,
+          sentPrealerts: prealertSent,
+          sentSignals: signalSent,
+        });
       }
     } finally {
       this.ouNotificationDrainRunning = false;
