@@ -1,0 +1,126 @@
+name: 診斷 sender poller 是否運作（只讀）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Poller evidence from container log
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set +e; set -u
+          cd /opt/odds-radar
+
+          echo "=== deployed commit ==="
+          sudo git -C /opt/odds-radar log --oneline -3 2>/dev/null
+
+          echo "=== poller code present in built image ==="
+          sudo docker compose exec -T radar sh -c \
+            'grep -c "pollOuNotificationDrain" /app/dist/index.js 2>/dev/null || echo "0"'
+          sudo docker compose exec -T radar sh -c \
+            'grep -c "sender_poll" /app/dist/index.js 2>/dev/null || echo "0"'
+
+          echo "=== container start / restarts ==="
+          cid="$(sudo docker compose ps -aq radar)"
+          sudo docker inspect "$cid" --format \
+            'started={{.State.StartedAt}} restarts={{.RestartCount}} status={{.State.Status}}'
+
+          echo "=== sender_poll event count in log ==="
+          logpath="$(sudo docker inspect "$cid" --format '{{.LogPath}}')"
+          sudo grep -c 'sender_poll' "$logpath" 2>/dev/null || echo 0
+
+          echo "=== last 5 sender_poll lines ==="
+          sudo grep 'sender_poll' "$logpath" 2>/dev/null | tail -5
+
+          echo "=== milestone worker boot line ==="
+          sudo grep -c 'research milestone collector started' "$logpath" 2>/dev/null || echo 0
+
+          echo "=== poller error lines ==="
+          sudo grep -c 'OU notification drain poller error' "$logpath" 2>/dev/null || echo 0
+          REMOTE
+
+      - name: Latency rows relative to deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set +e; set -u
+          cd /opt/odds-radar
+          sudo cp data/data.db /tmp/diag-poller.db 2>/dev/null
+          sudo cp data/data.db-wal /tmp/diag-poller.db-wal 2>/dev/null
+          sudo chmod 644 /tmp/diag-poller.db* 2>/dev/null
+          python3 - <<'PY'
+          import sqlite3, json, time
+          db = sqlite3.connect("file:/tmp/diag-poller.db?mode=ro", uri=True)
+          db.row_factory = sqlite3.Row
+
+          def hkt(ms):
+              return time.strftime("%m-%d %H:%M:%S", time.gmtime(ms/1000 + 8*3600))
+
+          # Poller deploy completed 2026-09-06T15:45:04Z = 23:45:04 HKT.
+          DEPLOY_MS = 1788709504000
+
+          out = {"prealerts": [], "observations": []}
+          for table, key in (("ou_signal_prealerts", "prealerts"),
+                             ("ou_signal_observations", "observations")):
+              rows = db.execute(
+                  f"""SELECT match_id, rule_id, detected_at, notified_at
+                        FROM {table}
+                       WHERE detected_at >= ?
+                       ORDER BY detected_at""",
+                  (DEPLOY_MS - 6*3600*1000,),
+              ).fetchall()
+              for r in rows:
+                  lat = None
+                  if r["notified_at"] is not None:
+                      lat = round((r["notified_at"] - r["detected_at"]) / 1000.0, 1)
+                  out[key].append({
+                      "match": r["match_id"],
+                      "rule": r["rule_id"][:38],
+                      "det": hkt(r["detected_at"]),
+                      "post_deploy": r["detected_at"] >= DEPLOY_MS,
+                      "lat_s": lat,
+                  })
+
+          for key in out:
+              rows = out[key]
+              post = [r for r in rows if r["post_deploy"] and r["lat_s"] is not None]
+              pre = [r for r in rows if not r["post_deploy"] and r["lat_s"] is not None]
+              def summ(rs):
+                  if not rs: return None
+                  ls = sorted(r["lat_s"] for r in rs)
+                  return {"n": len(ls), "over60": sum(1 for v in ls if v > 60),
+                          "p50": ls[len(ls)//2], "max": ls[-1]}
+              print(f"=== {key} ===")
+              print("  pre-deploy :", json.dumps(summ(pre)))
+              print("  post-deploy:", json.dumps(summ(post)))
+              print("  post-deploy unsent:",
+                    sum(1 for r in rows if r["post_deploy"] and r["lat_s"] is None))
+              print("  post-deploy rows:")
+              for r in rows:
+                  if r["post_deploy"]:
+                      print("   ", json.dumps(r, ensure_ascii=False))
+          PY
+          sudo rm -f /tmp/diag-poller.db /tmp/diag-poller.db-wal
+          REMOTE
