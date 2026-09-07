@@ -208,6 +208,7 @@ if (
       });
     }, 30_000);
     ouDrainPoller.unref();
+    log("OU notification drain poller registered at 30s interval", "milestone");
   } else if (processRole === "milestone-lower-once") {
     const sendToOwner = (message: unknown) => new Promise<void>((resolve, reject) => {
       if (parentPort) {
