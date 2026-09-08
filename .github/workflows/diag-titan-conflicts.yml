@@ -1,0 +1,51 @@
+name: 診斷 titan_id 撞突
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 設定 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 讀 duplicate + recent radar log
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "===== duplicate titan_id in matches ====="
+          sudo docker compose -f /opt/odds-radar/compose.yaml exec -T radar node -e "
+            const Database = require('better-sqlite3');
+            const db = new Database('/app/data/data.db', { readonly: true });
+            const dups = db.prepare(\`
+              SELECT titan_id, COUNT(*) as n
+                FROM matches WHERE titan_id IS NOT NULL
+                GROUP BY titan_id HAVING COUNT(*)>1
+            \`).all();
+            console.log('duplicate groups:', dups.length);
+            console.log(JSON.stringify(dups.slice(0,20), null, 2));
+          "
+          echo ""
+          echo "===== unique index status ====="
+          sudo docker compose -f /opt/odds-radar/compose.yaml exec -T radar node -e "
+            const Database = require('better-sqlite3');
+            const db = new Database('/app/data/data.db', { readonly: true });
+            const idx = db.prepare(\"SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='matches' AND name LIKE '%titan%'\").all();
+            console.log(JSON.stringify(idx, null, 2));
+          "
+          echo ""
+          echo "===== last 200 radar log lines with UNIQUE / titan_id ====="
+          sudo docker compose -f /opt/odds-radar/compose.yaml logs --tail 500 radar 2>&1 | grep -iE "unique|titan_id|pinnacle" | tail -40
+          REMOTE
