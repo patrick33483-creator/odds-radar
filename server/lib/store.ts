@@ -729,6 +729,49 @@ export function dedupeTitanFixtureIdentity(): number {
   })();
 }
 
+/**
+ * Safe assignment of matches.titan_id that respects the partial UNIQUE index.
+ *
+ * A prior fixture may already own this titan_id (retained history in HKJC-only
+ * mode, or a legacy standalone Pinnacle row). Overwriting would raise
+ * `UNIQUE constraint failed: matches.titan_id` and, in production, has been
+ * observed to knock the Pinnacle fixture refresher into a persistent
+ * `degraded` mode. This helper checks ownership first and no-ops (with a
+ * structured log) when the target id is already taken by another row.
+ *
+ * `fixtureSource` (optional) mirrors the previous WHERE clause on
+ * `matches.fixture_source` so we do not accidentally re-write a non-HKJC row.
+ */
+export function safeAssignTitanId(
+  db: import("better-sqlite3").Database,
+  matchId: string,
+  titanId: string,
+  fixtureSource?: "hkjc" | "pinnacle" | "crown",
+): { ok: true } | { ok: false; reason: "target_missing" | "owned_by_other"; ownerId?: string } {
+  const target = db
+    .prepare("SELECT id, titan_id, fixture_source FROM matches WHERE id=?")
+    .get(matchId) as { id: string; titan_id: string | null; fixture_source: string } | undefined;
+  if (!target) return { ok: false, reason: "target_missing" };
+  if (fixtureSource && target.fixture_source !== fixtureSource) {
+    return { ok: false, reason: "target_missing" };
+  }
+  if (target.titan_id === titanId) return { ok: true };
+  const existing = db
+    .prepare("SELECT id FROM matches WHERE titan_id=? AND id<>? LIMIT 1")
+    .get(titanId, matchId) as { id: string } | undefined;
+  if (existing) {
+    console.warn(JSON.stringify({
+      event: "titan_id_assign_skipped",
+      matchId,
+      titanId,
+      ownerId: existing.id,
+    }));
+    return { ok: false, reason: "owned_by_other", ownerId: existing.id };
+  }
+  db.prepare("UPDATE matches SET titan_id=? WHERE id=?").run(titanId, matchId);
+  return { ok: true };
+}
+
 migrate();
 
 export function getState(key: string): string | null {

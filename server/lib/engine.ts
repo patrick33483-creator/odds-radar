@@ -105,6 +105,7 @@ import {
   providerHealth,
   pruneSnapshots,
   rawDb,
+  safeAssignTitanId,
   setState,
   simulationBets,
   simulationLegs,
@@ -428,7 +429,7 @@ export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): 
     if (claimed?.fixture_source === "hkjc") return false;
     const crown = claimed?.fixture_source === "crown" ? claimed : undefined;
     if (!crown) {
-      rawDb.prepare("UPDATE matches SET titan_id=? WHERE id=? AND fixture_source='hkjc'").run(titanId, hkjcId);
+      safeAssignTitanId(rawDb, hkjcId, titanId, "hkjc");
       return false;
     }
     const sourceRows = rawDb.prepare(
@@ -505,7 +506,7 @@ export function reconcileCrownFixtureIntoHkjc(hkjcId: string, titanId: string): 
     rawDb.prepare("DELETE FROM pinnacle_source_map WHERE match_id=?").run(crown.id);
     rawDb.prepare("DELETE FROM match_mapping WHERE match_id=?").run(crown.id);
     rawDb.prepare("DELETE FROM matches WHERE id=?").run(crown.id);
-    rawDb.prepare("UPDATE matches SET titan_id=? WHERE id=? AND fixture_source='hkjc'").run(titanId, hkjcId);
+    safeAssignTitanId(rawDb, hkjcId, titanId, "hkjc");
     const points = rawDb.prepare(
       "SELECT stage FROM research_timeline_points WHERE match_id=?",
     ).all(hkjcId) as Array<{ stage: string }>;
@@ -1305,8 +1306,10 @@ export class RadarEngine {
         // Keep the Titan identity on pinnacle_source_map instead of claiming
         // matches.titan_id, which may already belong to a retained old row.
         if (process.env.RADAR_HKJC_ONLY === "0") {
-          rawDb.prepare("UPDATE matches SET pinnacle_match_id=?,titan_id=COALESCE(?,titan_id) WHERE id=?")
-            .run(activeId, titanDecision.pinnacleMatchId, m.id);
+          rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?").run(activeId, m.id);
+          if (titanDecision.pinnacleMatchId) {
+            safeAssignTitanId(rawDb, m.id, titanDecision.pinnacleMatchId);
+          }
         } else {
           rawDb.prepare("UPDATE matches SET pinnacle_match_id=? WHERE id=?")
             .run(activeId, m.id);
