@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OuSignalObservation, OuSignalPrealert } from "@shared/types";
-import { buildOuPrealertMessage, buildOuSignalMessage } from "../server/lib/telegram";
+import {
+  buildOuPrealertMessage,
+  buildOuSignalMessage,
+  isOuTelegramEnabled,
+  notifyOuPrealerts,
+  notifyOuSignals,
+} from "../server/lib/telegram";
 
 function signal(ruleId: string): OuSignalObservation {
   return {
@@ -33,6 +39,34 @@ function signal(ruleId: string): OuSignalObservation {
     detectedAt: Date.now(),
     notifiedAt: null,
     result: null,
+  };
+}
+
+function prealertFixture(): OuSignalPrealert {
+  return {
+    uniqueKey: "prealert:disabled",
+    matchId: "M9",
+    league: "測試聯賽",
+    homeTeam: "主隊",
+    awayTeam: "客隊",
+    kickoffUtc: Date.UTC(2026, 8, 2, 13),
+    provider: "hkjc",
+    providerLabel: "馬會",
+    ruleId: "hkjc-ooo-flat-wide-reverse",
+    lineKey: "2.5",
+    initialLineKey: "2.5",
+    t30LineKey: "2.5",
+    linePath: "2.5→2.5",
+    evaluatorVersion: "stage-main-v2",
+    directionPath: "O→O",
+    signalSelection: "U",
+    mode: "reverse",
+    initialSelectedOdds: 1.72,
+    t30SelectedOdds: 1.72,
+    initialSignalOdds: 1.72,
+    signalT30Odds: 2.0,
+    detectedAt: Date.now(),
+    notifiedAt: null,
   };
 }
 
@@ -125,5 +159,35 @@ describe("Radar OU Telegram message", () => {
     expect(text).toContain("條件公式：初盤大球 1.840 − T-5 大球；差值 ≥ 0.050 且 < 0.100");
     expect(text).toContain("條件 T-5 大球賠率範圍：> 1.740 且 ≤ 1.790");
     expect(text).not.toContain("條件 T-5 大球賠率範圍：> 1.700");
+  });
+});
+
+describe("Radar OU Telegram delivery switch", () => {
+  const restore = process.env.OU_TELEGRAM_ENABLED;
+  afterEach(() => {
+    if (restore === undefined) delete process.env.OU_TELEGRAM_ENABLED;
+    else process.env.OU_TELEGRAM_ENABLED = restore;
+  });
+
+  it("is off unless OU_TELEGRAM_ENABLED is exactly 1", () => {
+    delete process.env.OU_TELEGRAM_ENABLED;
+    expect(isOuTelegramEnabled()).toBe(false);
+    process.env.OU_TELEGRAM_ENABLED = "0";
+    expect(isOuTelegramEnabled()).toBe(false);
+    process.env.OU_TELEGRAM_ENABLED = "true";
+    expect(isOuTelegramEnabled()).toBe(false);
+    process.env.OU_TELEGRAM_ENABLED = " 1 ";
+    expect(isOuTelegramEnabled()).toBe(true);
+  });
+
+  it("sends nothing and marks nothing while disabled", async () => {
+    delete process.env.OU_TELEGRAM_ENABLED;
+    process.env.TELEGRAM_BOT_TOKEN = "token";
+    process.env.TELEGRAM_CHAT_ID = "chat";
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    await expect(notifyOuSignals([signal("hkjc-ooo-flat-wide-reverse")])).resolves.toBe(0);
+    await expect(notifyOuPrealerts([prealertFixture()])).resolves.toBe(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
   });
 });

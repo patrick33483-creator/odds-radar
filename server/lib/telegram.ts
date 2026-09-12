@@ -313,7 +313,20 @@ function logOuDelivery(kind: string, detectedAt: number, error?: string): void {
   }));
 }
 
+/**
+ * Radar OU Telegram delivery is opt-in and off by default. The operator asked
+ * for both the T-30 candidate prealert and the T-5 qualified buy signal to stop
+ * going to Telegram; collection, scoring and the dashboard are unaffected.
+ * Suppressed rows keep notified_at NULL rather than being marked delivered, so
+ * the delivery record stays truthful and nothing is silently backfilled as sent.
+ * Set OU_TELEGRAM_ENABLED=1 in the droplet env to turn delivery back on.
+ */
+export function isOuTelegramEnabled(): boolean {
+  return process.env.OU_TELEGRAM_ENABLED?.trim() === "1";
+}
+
 export async function notifyOuSignals(signals: OuSignalObservation[]): Promise<number> {
+  if (!isOuTelegramEnabled()) return 0;
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
   if (!token || !chatId || !signals.length) return 0;
@@ -391,6 +404,7 @@ export function buildOuPrealertMessage(signal: OuSignalPrealert): string {
 }
 
 export async function notifyOuPrealerts(signals: OuSignalPrealert[]): Promise<number> {
+  if (!isOuTelegramEnabled()) return 0;
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
   if (!token || !chatId || !signals.length) return 0;
