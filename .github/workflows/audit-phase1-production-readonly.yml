@@ -30,7 +30,7 @@ jobs:
           timeout 180s ssh -o BatchMode=yes -o ConnectTimeout=20 \
             -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
             "$DEPLOY_USER@$DEPLOY_HOST" 'sudo -n python3 -B -' \
-            < audit/rpin2_readonly.py \
+            < audit/rpin2_batch_readonly.py \
             | openssl cms -encrypt -binary -aes-256-cbc -outform DER \
                 -out rpin2-import-evidence.cms audit/evidence-public-cert.pem
       - uses: actions/upload-artifact@v4
