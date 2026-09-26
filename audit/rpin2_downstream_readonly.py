@@ -5,11 +5,12 @@ import re
 from pathlib import Path
 
 out = {"read_only": True, "sources": [], "inventories": [], "json_files": []}
-deny = re.compile(r"password|passwd|secret|authorization|api.?key|token|chat.?id|private.key", re.I)
+deny = re.compile(r"password|passwd|secret|auth|basic|b64encode|api.?key|token|chat.?id|private.key", re.I)
 paths = [Path("/opt/crownsystem-v3/heavy_watch.py"),
          Path("/opt/crownsystem-v4/v4_common.py"),
          Path("/opt/crownsystem-v4/v4_merge.py"),
-         Path("/opt/crownsystem-v4/v4_v3schema_merge.py")]
+         Path("/opt/crownsystem-v4/v4_v3schema_merge.py"),
+         Path("/var/www/crownsystem-v3/strategy.html")]
 for root in (Path("/opt/crown-v3/src"), Path("/opt/crown-v3/data")):
     if root.is_dir():
         out["inventories"].append({"path": str(root), "entries": [
@@ -41,4 +42,15 @@ for p in paths:
                 return v
             out["json_files"].append({"path": filename, "sha256": hashlib.sha256(raw).hexdigest(),
                                        "bytes": len(raw), "data": clean(data)})
+for root in (Path("/var/www/crownsystem-v3"), Path("/var/www/crownsystem-v4")):
+    if root.is_dir():
+        out["inventories"].append({"path": str(root), "entries": [
+            {"name": p.name, "bytes": p.stat().st_size, "directory": p.is_dir()}
+            for p in sorted(root.iterdir()) if p.is_file() and not p.name.startswith(".")
+            and not deny.search(p.name)]})
+for f in (Path("/var/www/crownsystem-v4/results.json"),):
+    if f.is_file() and f.stat().st_size < 30_000_000:
+        raw = f.read_bytes()
+        out["json_files"].append({"path": str(f), "sha256": hashlib.sha256(raw).hexdigest(),
+                                 "bytes": len(raw), "data": clean(json.loads(raw))})
 print(json.dumps(out, ensure_ascii=False))
