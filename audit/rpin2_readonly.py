@@ -114,9 +114,10 @@ for directory, dirs, names in os.walk(tmp, followlinks=False):
             if re.search(r"\.(?:py|mjs|js|ts|sh|log|txt)(?:$|\.bak|\.2026)", name) and stat.st_size <= 2_000_000:
                 text = p.read_text(errors="replace")
                 lines = text.splitlines()
-                hits = [i for i, line in enumerate(lines) if PATTERN.search(line)]
+                hits = [i for i, line in enumerate(lines) if PATTERN.search(line)
+                        or re.search(r"hkjc_results_dump|Date\.now|dump\[|json\.dump", line)]
                 if hits and len(out["tmp_source_snippets"]) < 80:
-                    wanted = sorted({j for i in hits[:35] for j in range(max(0, i-5), min(len(lines), i+12))})
+                    wanted = sorted({j for i in hits[:35] for j in range(max(0, i-8), min(len(lines), i+16))})
                     out["tmp_source_snippets"].append({
                         "path": str(p), "sha256": hashlib.sha256(text.encode()).hexdigest(),
                         "mtime": stat.st_mtime, "hit_count": len(hits),
