@@ -48,7 +48,12 @@ for root in (Path("/var/www/crownsystem-v3"), Path("/var/www/crownsystem-v4")):
             {"name": p.name, "bytes": p.stat().st_size, "directory": p.is_dir()}
             for p in sorted(root.iterdir()) if p.is_file() and not p.name.startswith(".")
             and not deny.search(p.name)]})
-for f in (Path("/var/www/crownsystem-v4/results.json"),):
+for f in (Path("/var/www/crownsystem-v4/results.json"),
+          Path("/var/www/crownsystem-v3/strategy_merged.json"),
+          Path("/var/www/crownsystem-v3/ogb_fires.json"),
+          Path("/var/www/crownsystem-v3/u1_fires.json"),
+          Path("/var/www/crownsystem-v3/ad_flat_ce_fires.json"),
+          Path("/var/www/crownsystem-v3/b_ahshift_receipts.json")):
     if f.is_file() and f.stat().st_size < 30_000_000:
         raw = f.read_bytes()
         out["json_files"].append({"path": str(f), "sha256": hashlib.sha256(raw).hexdigest(),
