@@ -188,7 +188,10 @@ out["units"]=[]
 for kind in ("service","timer"):
     text=command(["systemctl","list-units","--all","--type="+kind,"--plain","--no-legend","--no-pager"],"list "+kind)
     names=[line.split()[0] for line in text.splitlines() if line.split() and RELATED.search(line.split()[0])]
-    for name in names[:25]:
+    priority=(["hkjc-result-sync.service","crown-strategy-results.service","crown-mobile-fallback.service"]
+              if kind=="service" else ["hkjc-result-sync.timer","crown-strategy-results.timer"])
+    names=list(dict.fromkeys(priority+names))
+    for name in names[:30]:
         text=command(["systemctl","show",name,"--no-pager",
                       "--property=Id,ActiveState,SubState,MainPID,FragmentPath,WorkingDirectory,Triggers,TriggeredBy"],
                      "show "+name)
@@ -199,7 +202,7 @@ for kind in ("service","timer"):
             fields["fragment_sha256"]=sha(raw)
             entries=[]
             for i,line in enumerate(raw.decode(errors="replace").splitlines()):
-                if re.match(r"(ExecStart|ExecStartPre|ExecStartPost|WorkingDirectory|OnCalendar|OnUnitActiveSec|OnBootSec)=",line):
+                if re.match(r"(ExecStart|ExecStartPre|ExecStartPost|WorkingDirectory|OnCalendar|OnUnitActiveSec|OnUnitInactiveSec|OnBootSec|Unit|Persistent|RandomizedDelaySec)=",line):
                     entries.append({"line":i+1,"text":redact(line)})
             fields["selected_unit_lines"]=entries
         out["units"].append(fields)
@@ -274,6 +277,31 @@ for root in (ROOT,Path("/opt/hkjc-result-sync")):
     if (root/".git").exists():
         head=command(["git","-C",str(root),"rev-parse","HEAD"],"git HEAD "+str(root))
         out["git_heads"].append({"path":str(root),"head":head.strip()})
+
+# Follow only exact writer/cron identities found in the first read-only pass.
+# These files are source evidence; never execute their commands or import them.
+out["focused_writer_sources"]=[]
+for path in (
+    Path("/opt/hkjc-result-sync/sync_results.py"),
+    Path("/opt/crown-strategy-results/sync_results.py"),
+    Path("/opt/crown-mobile-fallback/mobile_fallback.py"),
+    Path("/opt/crown-radar-cron/hkjc_health.sh"),
+    Path("/opt/crown-radar-cron/daily_sweep.sh"),
+    ROOT/"docker-compose.yml",
+):
+    info=file_evidence(path)
+    if info.get("exists") and info.get("bytes",0)<100000:
+        lines=path.read_text(errors="replace").splitlines()
+        info["lines"]=[{"line":i+1,"text":redact(line)} for i,line in enumerate(lines[:800])]
+    out["focused_writer_sources"].append(info)
+out["server_refresh_and_schedule_lines"]=[]
+server_lines=(ROOT/"server.js").read_text(errors="replace").splitlines()
+hits=[i for i,line in enumerate(server_lines) if re.search(
+    r"refreshScores|setInterval|collectHkjc|hkjc.*collect|scores.*refresh",line,re.I)]
+wanted={j for i in hits for j in range(max(0,i-3),min(len(server_lines),i+7))}
+wanted.update(range(385,min(515,len(server_lines))))
+out["server_refresh_and_schedule_lines"]=[
+    {"line":i+1,"text":redact(server_lines[i])} for i in sorted(wanted)]
 
 # Re-read exact reviewed file hashes to detect source change during capture.
 out["target_files_end"]=[file_evidence(p) for p in targets]
