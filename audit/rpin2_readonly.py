@@ -37,7 +37,7 @@ for root in ROOTS:
             stat = p.stat()
             if re.search(r"hkjc|result|backfill|20260912|2026-09-12", name, re.I):
                 out["raw_file_inventory"].append({"path": str(p), "bytes": stat.st_size, "mtime": stat.st_mtime})
-            if not re.search(r"\.(?:py|js|ts|sh)(?:$|\.bak|\.2026)", name) or stat.st_size > 2_000_000:
+            if not re.search(r"\.(?:py|mjs|js|ts|sh)(?:$|\.bak|\.2026)", name) or stat.st_size > 2_000_000:
                 continue
             text = p.read_text(errors="replace")
             lines = text.splitlines()
