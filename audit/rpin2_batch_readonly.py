@@ -81,7 +81,8 @@ for day, payload in dump.items():
 
 # Read source only; never execute imports, app startup, or legacy repair programs.
 out["source_files"] = []
-for name in ("server.js", "docker-compose.yml", "compose.yml", "strategy.html", "hkjc-strategy.html"):
+for name in ("server.js", "docker-compose.yml", "compose.yml", "strategy.html", "hkjc-strategy.html",
+             "rule_matcher.js", "rules_stats.js", "full_sweep.js"):
     path = ROOT / name
     if path.is_file() and path.stat().st_size <= 2_000_000:
         raw = path.read_bytes()
@@ -98,4 +99,19 @@ for base in (ROOT / "data", ROOT / "public"):
         for p in sorted(base.glob("*")):
             if p.is_file() and not p.is_symlink() and not deny.search(p.name):
                 out["data_file_inventory"].append({"path": str(p), "bytes": p.stat().st_size})
+out["derived_json"] = []
+for p in sorted((ROOT / "data").glob("*.json")):
+    if p.stat().st_size <= 2_000_000 and re.match(r"(r_pin2_|rules|hkjc_.*candidates)", p.name):
+        raw = p.read_bytes()
+        try:
+            out["derived_json"].append({"path": str(p), "sha256": hashlib.sha256(raw).hexdigest(),
+                                        "data": sanitize(json.loads(raw))})
+        except ValueError:
+            pass
+out["related_project_inventory"] = []
+for root in sorted(Path("/opt").glob("*crown*")):
+    if root.is_dir() and not root.is_symlink():
+        out["related_project_inventory"].append({"path": str(root),
+            "entries": sorted(p.name for p in root.iterdir()
+                              if not p.name.startswith(".") and not deny.search(p.name))})
 print(json.dumps(out, ensure_ascii=False, sort_keys=True))
