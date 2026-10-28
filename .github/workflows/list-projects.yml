@@ -31,7 +31,10 @@ jobs:
             service="$(systemctl show "$timer" -p Unit --value 2>/dev/null || true)"
             [ -n "$service" ] && services+=("$service")
             echo "disable --now $timer"
-            systemctl disable --now "$timer" || failures=$((failures + 1))
+            timeout 20s systemctl disable --now "$timer" || {
+              systemctl disable "$timer" 2>/dev/null || true
+              systemctl stop "$timer" 2>/dev/null || true
+            }
           done
 
           echo "=== STOP TIMER SERVICES AND FOOTBALL APIS ==="
@@ -44,7 +47,10 @@ jobs:
           for service in "${services[@]}"; do
             echo "disable/stop $service"
             systemctl disable "$service" 2>/dev/null || true
-            systemctl stop "$service" || failures=$((failures + 1))
+            timeout 20s systemctl stop "$service" || {
+              systemctl kill --kill-who=all --signal=SIGKILL "$service" 2>/dev/null || true
+              systemctl reset-failed "$service" 2>/dev/null || true
+            }
           done
 
           echo "=== DISABLE CROWN RADAR CRON ==="
@@ -61,7 +67,7 @@ jobs:
             if printf '%s\n' "$details" | grep -Eq '/opt/(odds-radar|crown-radar)'; then
               echo "stop $details"
               docker update --restart=no "$id" || failures=$((failures + 1))
-              docker stop -t 45 "$id" || failures=$((failures + 1))
+              timeout 25s docker stop -t 15 "$id" || docker kill "$id" || failures=$((failures + 1))
             fi
           done
 
