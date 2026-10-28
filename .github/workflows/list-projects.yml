@@ -61,6 +61,11 @@ jobs:
             fi
           done
 
+          echo "=== FREE MINIMUM SPACE USING APPROVED TEMP CLEANUP ==="
+          timeout 180s systemctl start crown-browser-tmp-cleanup.service 2>/dev/null || true
+          timeout 20s systemctl stop crown-browser-tmp-cleanup.service 2>/dev/null || true
+          df -h /
+
           echo "=== STOP FOOTBALL DOCKER CONTAINERS ==="
           for id in $(docker ps -aq 2>/dev/null); do
             details="$(docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}} {{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null || true)"
