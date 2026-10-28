@@ -71,10 +71,16 @@ jobs:
             details="$(docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}} {{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null || true)"
             if printf '%s\n' "$details" | grep -Eq '/opt/(odds-radar|crown-radar)'; then
               echo "stop $details"
-              docker update --restart=no "$id" || failures=$((failures + 1))
+              docker update --restart=no "$id" || true
               timeout 25s docker stop -t 15 "$id" || docker kill "$id" || failures=$((failures + 1))
             fi
           done
+          echo "=== STOP DOCKER DAEMON (INVENTORY CONFIRMED FOOTBALL-ONLY) ==="
+          systemctl disable docker.service docker.socket 2>/dev/null || true
+          timeout 45s systemctl stop docker.service docker.socket || {
+            systemctl kill --kill-who=all --signal=SIGKILL docker.service 2>/dev/null || true
+            systemctl stop docker.socket 2>/dev/null || true
+          }
 
           echo "=== DISABLE FOOTBALL NGINX SITES ==="
           rm -f /etc/nginx/sites-enabled/crown /etc/nginx/sites-enabled/footbreak
@@ -109,12 +115,19 @@ jobs:
 
           echo "=== VERIFY FOOTBALL CONTAINERS ==="
           running_football_containers=""
-          for id in $(docker ps -q 2>/dev/null); do
-            details="$(docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}} {{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null || true)"
-            if printf '%s\n' "$details" | grep -Eq '/opt/(odds-radar|crown-radar)'; then
-              running_football_containers="${running_football_containers}${details}\n"
-            fi
-          done
+          docker_state="$(systemctl is-active docker.service 2>/dev/null || true)"
+          docker_enabled="$(systemctl is-enabled docker.service 2>/dev/null || true)"
+          echo "docker.service active=$docker_state enabled=$docker_enabled"
+          [ "$docker_state" = inactive ] || [ "$docker_state" = failed ] || failures=$((failures + 1))
+          [ "$docker_enabled" = disabled ] || failures=$((failures + 1))
+          if [ "$docker_state" = active ]; then
+            for id in $(docker ps -q 2>/dev/null); do
+              details="$(docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}} {{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null || true)"
+              if printf '%s\n' "$details" | grep -Eq '/opt/(odds-radar|crown-radar)'; then
+                running_football_containers="${running_football_containers}${details}\n"
+              fi
+            done
+          fi
           printf '%b' "$running_football_containers"
           [ -z "$running_football_containers" ] || failures=$((failures + 1))
 
