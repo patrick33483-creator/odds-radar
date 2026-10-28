@@ -61,4 +61,29 @@ jobs:
           find /var/lib/footbreak /var/lib/crown-m1m6 /var/lib/crownsystem-v4 /opt/odds-radar /opt/crown-radar \
             -xdev -type f -mmin -180 -printf '%TY-%Tm-%TdT%TH:%TM:%TS %s %p\n' 2>/dev/null |
             sort | tail -200 || true
+          echo "=== LISTENING PORTS ==="
+          ss -lntup || true
+          echo "=== PROCESS COMMANDS ==="
+          ps -eo pid,ppid,user,etimes,args --sort=pid |
+            grep -Ei 'footbreak|crown|odds|titan|pinnacle|hkjc|radar|m1m6|stage|strategy|results-sync|fires-builder' || true
+          echo "=== SUSPICIOUS UNIT DEFINITIONS ==="
+          for unit in \
+            crown-dashboard-api.service crown-strategy-refresh-api.service footbreak-dashboard-api.service \
+            crown-alow-first-tg-watch.timer crown-alow-forward-v1.timer crown-browser-tmp-cleanup.timer \
+            crown-early-admission-reconcile.timer crown-first-look-reconcile.timer crown-goldpool-notify.timer \
+            crown-live-fallback.timer crown-m1m6.timer crown-mobile-fallback.timer crown-n2-first-tg-watch.timer \
+            crown-odds-monitor.timer crown-reverse-t5-drain.timer crown-round-update.timer crown-scout.timer \
+            crown-settle.timer crown-strategy-results.timer crown-strategy-search.timer crown-sweep.timer \
+            crown-tick-sentinel-monitor.timer crown-tick.timer crown-tmp-cleanup.timer crownsystem-v3-merge.timer \
+            footbreak-backtest.timer footbreak-daily-condition-report.timer footbreak-dashboard-self-heal.timer \
+            footbreak-direction-path-conditions.timer footbreak-result-reconcile.timer footbreak-server-health-monitor.timer \
+            footbreak-settle.timer footbreak-sweep.timer footbreak-tick.timer hkjc-result-sync.timer \
+            live-titan-collect.timer odds-mobile-reserve.timer pinnacle-mobile.timer \
+            stage-engine-v2-fast-results.timer stage-engine-v2-fb-tick.timer stage-engine-v2-tick.timer \
+            titan-crow-sync.timer ogb-fires-builder.timer u1-fires-builder.timer v2-results-sync.timer \
+            v2-results-sync-daily.timer strategy-merged-builder.timer direction-path-conditions.timer; do
+            systemctl cat "$unit" 2>/dev/null || true
+          done
+          echo "=== FULL NGINX ENABLED CONFIG ==="
+          nginx -T 2>/dev/null || true
           REMOTE
